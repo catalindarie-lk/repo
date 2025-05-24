@@ -1,5 +1,6 @@
 #include <winsock2.h>
 #include <stdio.h>
+#include <ws2tcpip.h>
 
 #pragma comment(lib, "Ws2_32.lib")  // Link against Winsock library
 
@@ -9,7 +10,6 @@ int main() {
     WSADATA wsaData;
     SOCKET clientSocket;
     struct sockaddr_in serverAddr;
-    char buffer[1024] = {0};
     char out_message[1024] = {0};
     int connected = 0;
     int bytesSent;
@@ -30,7 +30,12 @@ int main() {
 
     // Configure server address (loopback only)
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = inet_addr("127.0.0.1");  // Connect to localhost
+    if (InetPton(AF_INET, "127.0.0.1", &serverAddr.sin_addr) != 1) {
+        printf("Invalid address/ Address not supported\n");
+        closesocket(clientSocket);
+        WSACleanup();
+        return 1;
+    }
     serverAddr.sin_port = htons(PORT);  // Match the server's port
 
     // Connect to server
