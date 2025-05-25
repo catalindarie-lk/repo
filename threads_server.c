@@ -7,25 +7,29 @@
 #pragma comment(lib, "Ws2_32.lib")
 
 #define PORT 25000
-#define MAX_THREADS 10   // Number of worker threads
-#define MAX_QUEUE_SIZE 10  // Max pending clients in the queue
+#define MAX_THREADS 5   // Number of worker threads
+#define MAX_QUEUE_SIZE 5  // Max pending clients in the queue
+#define BUFFER_SIZE 10;
+
 
 // Mutex and condition variable for client queue
 HANDLE mutex;
 HANDLE clientSemaphore;
-
-// Struct for client context
-typedef struct {
-    SOCKET clientSocket;
-    char username[50];
-    int authenticated;
-} ClientContext;
 
 // Simple user database
 typedef struct {
     char username[50];
     char password[50];
 } User;
+
+// Struct for client context
+typedef struct {
+    SOCKET clientSocket;
+    User user; // User information
+    int authenticated;
+} ClientContext;
+
+
 
 User users[] = {
     {"user1", "password123"},
@@ -89,28 +93,28 @@ DWORD WINAPI WorkerThread(void* arg) {
         char buffer[512];
 
         // Receive username
-        int bytesReceived = recv(client, context->username, sizeof(context->username) - 1, 0);
+        int bytesReceived = recv(client, context->user.username, sizeof(context->user.username) - 1, 0);
         if (bytesReceived <= 0) {
             printf("Client disconnected before authentication.\n");
             closesocket(client);
             free(context);
             continue;
         }
-        context->username[bytesReceived] = '\0';
+        context->user.username[bytesReceived] = '\0';
 
         // Receive password
-        bytesReceived = recv(client, buffer, sizeof(buffer) - 1, 0);
+        bytesReceived = recv(client, context->user.password, sizeof(context->user.password) - 1, 0);
         if (bytesReceived <= 0) {
             printf("Client disconnected before authentication.\n");
             closesocket(client);
             free(context);
             continue;
         }
-        buffer[bytesReceived] = '\0';
+        context->user.password[bytesReceived] = '\0';
 
         // Authenticate user
-        if (!authenticate(context->username, buffer)) {
-            printf("Authentication failed for user: %s\n", context->username);
+        if (!authenticate(context->user.username, context->user.password)) {
+            printf("Authentication failed for user: %s\n", context->user.username);
             send(client, "Authentication failed\n", 22, 0);
             closesocket(client);
             free(context);
@@ -119,21 +123,34 @@ DWORD WINAPI WorkerThread(void* arg) {
 
         context->authenticated = 1;
         send(client, "Authentication successful\n", 26, 0);
-        printf("User authenticated: %s\n", context->username);
+        printf("User authenticated: %s\n", context->user.username);
 
+        int value_received = 0;
+        int nr_bytes_received = 0;
+        char bytes_buffer[5] = {0}; // Clear buffer
         // Message loop
         while (1) {
-            bytesReceived = recv(client, buffer, sizeof(buffer) - 1, 0);
-            if (bytesReceived > 0) {
-                buffer[bytesReceived] = '\0';
-                printf("%s says: %s\n", context->username, buffer);
-            } else {
-                printf("%s disconnected.\n", context->username);
+            memset(bytes_buffer, 0, sizeof(bytes_buffer)); // Clear buffer
+            // Receive message from client
+            // recv() receives data from the connected socket
+            nr_bytes_received = recv(client, bytes_buffer, sizeof(bytes_buffer), 0);
+            printf("Nr of bytes received: %d\n", nr_bytes_received);
+            if (nr_bytes_received <= 0) {
+                printf("%s disconnected.\n", context->user.username);
                 break;
             }
+            if (nr_bytes_received > 4) {
+                // Print received message
+                printf("Received too many bytes (%d) from %s", nr_bytes_received, context->user.username);
+                memset(bytes_buffer, 0, sizeof(bytes_buffer)); // Clear buffer
+                continue;
+            }
+            bytes_buffer[nr_bytes_received] = '\0'; // Null-terminate the string
+            value_received = atoi(bytes_buffer); // Convert string to integer
+            printf("Received value: %d from %s\n", value_received, context->user.username);
         }
 
-        closesocket(client);
+        closesocket(client);        
         free(context);
     }
     return 0;
@@ -166,7 +183,7 @@ DWORD WINAPI AcceptThread(void* arg) {
                     memset(context, 0, sizeof(ClientContext));
                     context->clientSocket = INVALID_SOCKET; // Initialize to invalid socket
                     context->authenticated = 0;
-                    memset(context->username,0, sizeof(context->username)); // Initialize username                  
+                    memset(context->user.username,0, sizeof(context->user.username)); // Initialize username                  
                     // Assign client socket
                     context->clientSocket = client;
                     context->authenticated = 0;
