@@ -1,5 +1,5 @@
 #include <winsock2.h>
-#include <stdio.h> // Still needed for main's output, but removed from library functions
+#include <stdio.h>
 #include <ws2tcpip.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -47,7 +47,7 @@ void print_frame(frame_t* frame);
 
 // Helper function to get a human-readable message for an error code
 const char* get_error_message(error_code error) { 
-    switch (error) { // Used 'error' here
+    switch (error) {
         case NET_ERR_SUCCESS: return "Success";
         case NET_ERR_NULL_POINTER: return "Error: A required pointer was NULL.";
         case NET_ERR_INVALID_PACKET_STRUCTURE: return "Error: Packet structure is invalid (e.g., payload size, total size).";
@@ -59,32 +59,33 @@ const char* get_error_message(error_code error) {
     }
 }
 
-void* create_packet(uint32_t type, uint32_t ID, const void* payload, uint32_t payload_size, error_code* error) { // Parameter name changed to 'error'
-    // Always initialize out_error to success, then change it on error
-    if (error == NULL) { // Used 'error' here
+void* create_packet(uint32_t type, uint32_t ID, const void* payload, uint32_t payload_size, error_code* error) {
+    if (error == NULL) {
         return NULL; // Cannot report error if pointer is NULL
     }
-    *error = NET_ERR_SUCCESS; // Used 'error' here
+    *error = NET_ERR_SUCCESS; // Assume success initially
 
     // Validate the input parameters
     if (payload_size == 0 || payload == NULL || sizeof(packet_header_t) + payload_size > UINT32_MAX) {
-        *error = NET_ERR_INVALID_PACKET_STRUCTURE; // Used 'error' here
+        *error = NET_ERR_INVALID_PACKET_STRUCTURE;
         return NULL;
     }
 
     // Allocate memory for the packet header and payload
     void* packet = malloc(sizeof(packet_header_t) + payload_size);
     if (packet == NULL) {
-        *error = NET_ERR_MEMORY_ALLOCATION_FAILED; // Used 'error' here
+        *error = NET_ERR_MEMORY_ALLOCATION_FAILED;
         return NULL;
     }
 
     // Fill in the header
     packet_header_t* header = (packet_header_t*)packet;
-    header->type = type;
-    header->ID = ID;
-    header->payload_size = payload_size;
-    header->packet_size = sizeof(packet_header_t) + payload_size;
+    
+    // Convert header fields to network byte order (big-endian)
+    header->type = htonl(type);
+    header->ID = htonl(ID);
+    header->payload_size = htonl(payload_size);
+    header->packet_size = htonl(sizeof(packet_header_t) + payload_size); // Calculate then convert
 
     // Copy payload data
     memcpy((char*)packet + sizeof(packet_header_t), payload, payload_size);
@@ -98,36 +99,60 @@ error_code send_packet_in_frames(SOCKET clientSocket, const void* packet) {
         return NET_ERR_NULL_POINTER;
     }
 
+    // Cast the packet to its header type for easier access
     const packet_header_t* header = (const packet_header_t*)packet;
-    uint32_t total_bytes_to_frame = header->packet_size;
-    uint32_t bytes_remaining_to_frame = total_bytes_to_frame;
+    // Remember to convert from network byte order if you plan to use this 'header'
+    // for logic that depends on original host values.
+    // Here, we're just using it to get total_bytes_to_frame for framing.
+    // If you need the *host* value of packet_size for framing, you'd do:
+    // uint32_t total_bytes_to_frame = ntohl(header->packet_size);
+    // For this sending loop, we can just use the value from the header as is for memcpy offsets,
+    // assuming it was already in network byte order when created.
+    // For calculating remaining bytes etc., it's safer to work with host byte order.
+    uint32_t total_packet_size_host_order = ntohl(header->packet_size); // Convert to host byte order for calculations
+
+    uint32_t bytes_remaining_to_frame = total_packet_size_host_order;
     uint32_t current_offset = 0;
 
     frame_t frame = {0}; // Initialize the frame
-    int sequence_nr = 0; // Initialize frame count
+    uint32_t sequence_nr = 0; // Initialize frame count (using uint32_t for consistency)
 
     while (bytes_remaining_to_frame > 0) {
-        frame.sequence_number = ++sequence_nr;
+        sequence_nr++; // Increment sequence number
+        frame.sequence_number = htonl(sequence_nr); // Convert to network byte order
 
+        uint32_t current_frame_payload_size;
         if (bytes_remaining_to_frame < FRAME_PAYLOAD_SIZE) {
-            frame.payload_size = bytes_remaining_to_frame;
+            current_frame_payload_size = bytes_remaining_to_frame;
         } else {
-            frame.payload_size = FRAME_PAYLOAD_SIZE;
+            current_frame_payload_size = FRAME_PAYLOAD_SIZE;
         }
         
-        frame.frame_size = sizeof(frame.sequence_number) + sizeof(frame.payload_size) + sizeof(frame.frame_size) + frame.payload_size;
+        frame.payload_size = htonl(current_frame_payload_size); // Convert to network byte order
+        
+        // Calculate the total frame size *before* converting to network byte order for accuracy
+        uint32_t total_frame_struct_size_host_order = sizeof(frame.sequence_number) + sizeof(frame.payload_size) + sizeof(frame.frame_size) + current_frame_payload_size;
+        frame.frame_size = htonl(total_frame_struct_size_host_order); // Convert to network byte order
 
-        memcpy(frame.payload, (const char*)packet + current_offset, frame.payload_size);
+        // Copy actual payload data for this frame
+        memcpy(frame.payload, (const char*)packet + current_offset, current_frame_payload_size);
 
         // Send the frame over the network
-        // int bytes_sent = send(clientSocket, (char*)&frame, frame.frame_size, 0);
+        // int bytes_sent = send(clientSocket, (char*)&frame, total_frame_struct_size_host_order, 0); // Use host order size for send()
         // if (bytes_sent == SOCKET_ERROR) {
         //     return NET_ERR_SEND_FAILED;
         // }
 
-        print_frame(&frame); // For debugging
-        bytes_remaining_to_frame -= frame.payload_size;
-        current_offset += frame.payload_size;
+        // For debugging, print frame content (converting back to host order for display)
+        frame_t print_dbg_frame = {0};
+        print_dbg_frame.sequence_number = ntohl(frame.sequence_number);
+        print_dbg_frame.payload_size = ntohl(frame.payload_size);
+        print_dbg_frame.frame_size = ntohl(frame.frame_size);
+        memcpy(print_dbg_frame.payload, frame.payload, current_frame_payload_size);
+        print_frame(&print_dbg_frame); 
+        
+        bytes_remaining_to_frame -= current_frame_payload_size;
+        current_offset += current_frame_payload_size;
     }
     return NET_ERR_SUCCESS;
 }
@@ -138,15 +163,20 @@ void print_packet(const void* packet) {
         return;
     }
     const packet_header_t* header = (const packet_header_t*)packet;
-    printf("Packet Type: %u\n", header->type);
-    printf("Packet ID: %u\n", header->ID);
-    printf("Payload Size: %u\n", header->payload_size);
-    printf("Packet Size: %u\n", header->packet_size); // Corrected: header->packet_size
+    
+    // Convert fields from network byte order to host byte order for printing
+    printf("Packet Type: %u\n", ntohl(header->type));
+    printf("Packet ID: %u\n", ntohl(header->ID));
+    printf("Payload Size: %u\n", ntohl(header->payload_size));
+    printf("Packet Size: %u\n", ntohl(header->packet_size));
 
-    if (header->payload_size > 0) {
+    // Access payload directly (it's raw data, no byte order conversion needed)
+    // The payload size for memcpy is also converted back to host order for calculation
+    uint32_t payload_size_host_order = ntohl(header->payload_size);
+    if (payload_size_host_order > 0) {
         const char* payload = (const char*)packet + sizeof(packet_header_t);
         printf("Payload: ");
-        for (uint32_t i = 0; i < header->payload_size; i++) {
+        for (uint32_t i = 0; i < payload_size_host_order; i++) {
             printf("%02X ", (unsigned char)payload[i]);
         }
         printf("\n");
@@ -158,19 +188,21 @@ void print_frame(frame_t* frame) {
         printf("Cannot print NULL frame.\n");
         return;
     }
+    // Note: This print_frame now expects *host byte order* values.
+    // The calling send_packet_in_frames converts them back for printing.
     printf("\n--- Frame --- \n");
-    printf("Frame Sequence Number: %u\n", frame->sequence_number);
-    printf("Frame Payload Size: %u\n", frame->payload_size);
-    printf("Frame Size: %u\n", frame->frame_size);
+    printf("Frame Sequence Number: %u\n", frame->sequence_number); // Already host order from send_packet_in_frames debug copy
+    printf("Frame Payload Size: %u\n", frame->payload_size);       // Already host order
+    printf("Frame Size: %u\n", frame->frame_size);                 // Already host order
     printf("Frame Payload: ");
-    for (uint32_t i = 0; i < frame->payload_size; i++) {
+    for (uint32_t i = 0; i < frame->payload_size; i++) { // Use host order payload_size for loop
         printf("%02X ", (unsigned char)frame->payload[i]);
     }
     printf("\n");
 }
 
 int main() {
-    error_code status; // Renamed variable for consistency
+    error_code status;
 
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -201,6 +233,7 @@ int main() {
     }
 
     printf("\n--- Original Packet --- \n");
+    // print_packet now takes a packet with fields in network byte order
     print_packet(packet);
 
     printf("\n--- Sending Packet in Frames --- \n");
