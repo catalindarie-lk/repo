@@ -133,17 +133,15 @@ DWORD WINAPI WorkerThread(void* arg) {
             memset(bytes_buffer, 0, sizeof(bytes_buffer)); // Clear buffer
             // Receive message from client
             // recv() receives data from the connected socket
-            nr_bytes_received = recv(client, bytes_buffer, sizeof(bytes_buffer), 0);
+            nr_bytes_received = recv(client, bytes_buffer, sizeof(bytes_buffer) - 1, 0);
             printf("Nr of bytes received: %d\n", nr_bytes_received);
             if (nr_bytes_received <= 0) {
                 printf("%s disconnected.\n", context->user.username);
                 break;
             }
-            if (nr_bytes_received > 4) {
-                // Print received message
-                printf("Received too many bytes (%d) from %s", nr_bytes_received, context->user.username);
-                memset(bytes_buffer, 0, sizeof(bytes_buffer)); // Clear buffer
-                continue;
+            if (nr_bytes_received >= sizeof(bytes_buffer)) {
+                printf("Received data too large for buffer, truncating.\n");
+                nr_bytes_received = sizeof(bytes_buffer) - 1; // Prevent overflow
             }
             bytes_buffer[nr_bytes_received] = '\0'; // Null-terminate the string
             value_received = atoi(bytes_buffer); // Convert string to integer
