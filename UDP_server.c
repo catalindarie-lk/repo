@@ -16,116 +16,17 @@
 
 // --- Constants ---
 #define SERVER_PORT         12345       // Port the server listens on
-#define MAX_PAYLOAD_SIZE    1024        // Max size of data within a frame payload (adjust as needed)
-#define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define RECV_TIMEOUT_MS     100         // Timeout for recvfrom in milliseconds in the receive thread
 #define CLIENT_TIMEOUT_SEC  3000        // Seconds after which an inactive client is considered disconnected
 #define FILE_TRANSFER_TIMEOUT_SEC 60    // Seconds after which a stalled file transfer is cleaned up
+#define SERVER_NAME "lkdc UDP Text/File Transfer Server"
 
-
-typedef enum{
-    CLIENT_DISCONNECTED = 0,
-    CLIENT_CONNECTED = 1,
-    CLIENT_REMOVED = 2
-}ClientStatus;
-
-// --- Frame Types (Enums for clarity) ---
-typedef enum {
-    FRAME_TYPE_TEXT_MESSAGE = 1,        // Single-part text message
-    FRAME_TYPE_LONG_TEXT_MESSAGE_DATA = 2,    // Fragment of a long text message
-    FRAME_TYPE_FILE_METADATA_REQUEST = 3,     // Client requests to send a file (includes filename, size, hash)
-    FRAME_TYPE_FILE_METADATA_RESPONSE = 4,    // Server grants file transfer (assigns file_id)
-    FRAME_TYPE_FILE_DATA = 5,                 // File data fragment
-    FRAME_TYPE_ACK = 6,                       // Acknowledgment for a received frame
-    FRAME_TYPE_NACK = 7,                      // Negative Acknowledgment (request retransmission)
-    FRAME_TYPE_CONNECT_REQUEST = 8,           // Client's initial contact to server
-    FRAME_TYPE_CONNECT_RESPONSE = 9,          // Server's response to client connect
-    FRAME_TYPE_DISCONNECT = 10,               // Client requests to disconnect
-    FRAME_TYPE_KEEP_ALIVE = 11,               // Client sends periodically to maintain connection status
-    FRAME_TYPE_FILE_TRANSFER_COMPLETE = 12,   // Server confirms file transfer completion and hash verification
-    FRAME_TYPE_FILE_TRANSFER_FAILED = 13      // Server informs client of failed file transfer (e.g., hash mismatch)
-} FrameType;
-
-// --- UDP Frame Structures (with Union) ---
-#pragma pack(push, 1) // Using #pragma pack to ensure no padding for network transmission
-// Common Header for all frames
-typedef struct {
-    uint16_t start_delimiter;       // Magic number (e.g., 0xAABB)
-    uint8_t  frame_type;            // Discriminator: what kind of payload is in the union
-    uint32_t seq_num;               // Global sequence number for this frame from the sender
-    uint32_t checksum;              // Checksum for this frame's header + active union member (CRC32 recommended)
-} FrameHeader;
-
-// Payload Structures for different frame types
-
-typedef struct {
-    uint32_t client_id;         // Unique identifier assigned by the client
-    uint8_t  protocol_ver;      // Version of the protocol the client supports
-    char     client_name[64];   // Optional: human-readable identifier
-} ConnectRequestPayload;
-
-typedef struct {
-    uint32_t ack_seq_num;       // Acknowledgment sequence number for the client's connect request
-    uint32_t session_id;        // Unique identifier assigned to the client
-    uint8_t  status_code;       // Success (1) or failure (0), with potential error codes
-    uint32_t session_timeout;   // Suggested timeout period for client inactivity
-} ConnectResponsePayload;
-
-typedef struct {
-    uint32_t text_len;           // Length of the text message
-    char     text_data[MAX_PAYLOAD_SIZE - sizeof(uint32_t)]; // Actual text
-} TextPayload;
-
-typedef struct {
-    uint32_t message_id;         // Unique ID for this specific long message
-    uint32_t total_message_len;  // Total length of the original message
-    uint32_t fragment_offset;    // Offset of this fragment within the long message
-    uint32_t payload_len;        // Length of actual text data in 'fragment_data'
-    char     fragment_data[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 4)]; // Adjusted size
-} LongTextPayload;
-
-typedef struct {
-    uint32_t file_id;           // Unique identifier for the file transfer session
-    uint32_t total_file_size;       // Total size of the file being transferred
-    uint8_t  file_hash[16];      // For MD5 hash (adjust size for SHA256 etc.)
-    char     filename[256];      // Max filename length
-} FileMetadataPayload;
-
-typedef struct {
-    uint32_t file_id;           // Unique identifier for the file transfer session
-    uint32_t fragment_offset;       // Offset of this fragment within the file
-    uint32_t payload_len;           // Length of actual data in 'fragment_data'
-    uint8_t  fragment_data[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 3)]; // Adjusted size
-} FileDataPayload;
-
-typedef struct {
-    uint32_t ack_seq_num;       // Acknowledged sequence number of the frame being acknowledged
-    uint32_t session_id;          // Unique identifier assigned to the client
-    uint8_t status_code;         // Success (1) or failure (0), with potential error codes
-} AckNackPayload;
-
-typedef struct {
-    uint32_t file_id;           // Unique identifier for the file transfer session
-    uint8_t  final_hash[16];     // Hash of the completely received file
-    uint8_t  success;            // 1 for success, 0 for failure
-} FileTransferStatusPayload;
-
-// Main UDP Frame Structure
-typedef struct {
-    FrameHeader header;
-    union {
-        ConnectRequestPayload request;              // Client's connect request
-        ConnectResponsePayload response;            // Server's response to client connect
-        TextPayload text_msg;                   // Single-part text message
-        LongTextPayload long_text_msg;          // Fragment of a long text message
-        FileMetadataPayload file_metadata;      // File metadata request/response
-        FileDataPayload file_data;                  // File data fragment
-        AckNackPayload ack_nack;                // Acknowledgment or Negative Acknowledgment    
-        FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
-        uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
-    } payload_data;
-} UdpFrame;
-#pragma pack(pop)
+typedef uint8_t ServerStatus;
+enum ServerStatus {
+    SERVER_BUSY = 0,
+    SERVER_READY = 1,
+    SERVER_ERR = 2
+};
 
 // --- Server Global State ---
 SOCKET server_socket;       // Global server socket for receiving and sending UDP frames
@@ -142,7 +43,7 @@ typedef struct {
     uint32_t next_send_seq;     // Next sequence number for frames sent to this client
     uint8_t protocol_ver;       // Protocol version supported by the client
     char client_name[64];       // Optional: human-readable identifier
-    Queue queue_ack;         // Queue for NACK frames to be sent to this client
+    Queue queue_ack;            // Queue for NACK frames to be sent to this client
     // In a real system, you'd add:
     // - A queue for outgoing reliable packets (with retransmission info)
     // - A receive buffer for out-of-order packets (for sliding window)
@@ -179,11 +80,9 @@ volatile uint32_t next_file_id = 1; // Global counter for unique file IDs
 void init_winsock();
 void cleanup_winsock();
 // Frame handling functions
-uint32_t calculate_crc32(const void *data, size_t len); 
-BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
+
 // UDP communication functions
-void send_frame(const UdpFrame *frame, const struct sockaddr_in *dest_addr);
-void send_connect_response(const ClientInfo *client, uint32_t ack_seq_num);
+void send_connect_response(const ClientInfo *client);
 void send_ack(const ClientInfo *client, uint32_t ack_seq_num);
 void send_nack(const ClientInfo *client, uint32_t nack_seq_num);
 void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t file_id, const uint8_t *final_hash, BOOL success);
@@ -204,20 +103,6 @@ FileTransferContext* start_new_file_transfer(const struct sockaddr_in *sender_ad
 void finalize_file_transfer(FileTransferContext *ctx);
 void remove_file_transfer(uint32_t file_id);
 
-// Validates the received frame's checksum
-BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received) {
-    // Create a temporary frame to calculate checksum without its own checksum field
-    UdpFrame temp_frame_for_checksum;
-    // Copy only the header and the part of the payload that was actually sent.
-    // This is crucial if payloads are variable length or smaller than MAX_PAYLOAD_SIZE.
-    // For simplicity, we assume fixed size for now (sizeof(UdpFrame)).
-    // In a real scenario, you'd use header.payload_len or similar.
-    memcpy(&temp_frame_for_checksum, frame, bytes_received);
-    temp_frame_for_checksum.header.checksum = 0; // Zero out checksum field for calculation
-
-    uint32_t calculated_checksum = calculate_crc32(&temp_frame_for_checksum, bytes_received);
-    return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
-}
 // --- Main Server Function ---
 int main() {
     init_winsock();
@@ -299,73 +184,28 @@ void cleanup_winsock() {
     WSACleanup();
 }
 // Sends a UDP frame to a destination address
-void send_frame(const UdpFrame *frame, const struct sockaddr_in *dest_addr) {
-    // Determine the actual size to send based on frame type if payloads are variable
-    size_t frame_size = sizeof(FrameHeader);
-    switch (frame->header.frame_type) {
-        case FRAME_TYPE_TEXT_MESSAGE:
-            frame_size += sizeof(TextPayload); // Or just header + text_len + sizeof(text_len)
-            break;
-        case FRAME_TYPE_LONG_TEXT_MESSAGE_DATA:
-            frame_size += sizeof(LongTextPayload); // Or header + payload_len + related metadata
-            break;
-        case FRAME_TYPE_FILE_METADATA_REQUEST:
-        case FRAME_TYPE_FILE_METADATA_RESPONSE:
-            frame_size += sizeof(FileMetadataPayload);
-            break;
-        case FRAME_TYPE_FILE_DATA:
-            frame_size += sizeof(FileDataPayload); // Or header + payload_len + related metadata
-            break;
-        case FRAME_TYPE_ACK:
-        case FRAME_TYPE_NACK:
-            frame_size += sizeof(AckNackPayload);
-            break;
-        case FRAME_TYPE_FILE_TRANSFER_COMPLETE:
-        case FRAME_TYPE_FILE_TRANSFER_FAILED:
-            frame_size += sizeof(FileTransferStatusPayload);
-            break;
-        case FRAME_TYPE_CONNECT_REQUEST:
-        case FRAME_TYPE_CONNECT_RESPONSE:
-        case FRAME_TYPE_DISCONNECT:
-        case FRAME_TYPE_KEEP_ALIVE:
-            frame_size = sizeof(FrameHeader); // These typically have no specific payload
-            break;
-        default:
-            frame_size = sizeof(UdpFrame); // Fallback to max size
-            break;
-    }
-
-    int bytes_sent = sendto(server_socket, (const char*)frame, frame_size, 0,
-                            (SOCKADDR*)dest_addr, sizeof(*dest_addr));
-    if (bytes_sent == SOCKET_ERROR) {
-        fprintf(stderr, "sendto failed with error: %d\n", WSAGetLastError());
-    }
-}
 // Sends an RESPONSE frame back to the sender
-void send_connect_response(const ClientInfo *client, uint32_t ack_seq_num) {
+void send_connect_response(const ClientInfo *client) {
     UdpFrame response_frame;
     // Initialize the response frame
     memset(&response_frame, 0, sizeof(response_frame));
     // Set the header fields
     response_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     response_frame.header.frame_type = FRAME_TYPE_CONNECT_RESPONSE;
-    // Server's own sequence number for its outgoing ACK (can be global for all outgoing)
-    // A robust system would have a per-client outgoing sequence number.
-    static uint32_t server_out_seq = 0;
-    response_frame.header.seq_num = htonl(server_out_seq++);
-    response_frame.payload_data.response.ack_seq_num = htonl(ack_seq_num);
+  
     response_frame.payload_data.response.session_id = htonl(client->session_id);
     response_frame.payload_data.response.session_timeout = htonl(CLIENT_TIMEOUT_SEC);
-    response_frame.payload_data.response.status_code = htonl(CLIENT_CONNECTED);
-
+    response_frame.payload_data.response.server_status = SERVER_READY; // Assuming server is ready
+    strncpy(response_frame.payload_data.response.server_name, SERVER_NAME, sizeof(response_frame.payload_data.response.server_name) - 1);
+    response_frame.payload_data.response.server_name[sizeof(response_frame.payload_data.response.server_name) - 1] = '\0'; // Ensure null-termination
     // Calculate CRC32 for the ACK frame
     response_frame.header.checksum = htonl(calculate_crc32(&response_frame, sizeof(FrameHeader) + sizeof(ConnectResponsePayload)));
     // Send the response frame
-    send_frame(&response_frame, &client->addr);
+    send_frame(&response_frame, server_socket, &client->addr);
     char dest_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client->addr.sin_addr), dest_ip, INET_ADDRSTRLEN);
-    printf("Sending RESPONSE for Seq %u to %s:%d (Session ID: %u, Session Timeout: %u)\n",
-            ack_seq_num, dest_ip, ntohs(client->addr.sin_port), 
+    printf("Sending RESPONSE to %s:%d (Session ID: %u, Session Timeout: %u)\n",
+            dest_ip, ntohs(client->addr.sin_port), 
             ntohl(response_frame.payload_data.response.session_id), 
             ntohl(response_frame.payload_data.response.session_timeout));
 }
@@ -382,7 +222,7 @@ void send_ack(const ClientInfo *client, uint32_t ack_seq_num) {
     // Calculate CRC32 for the ACK frame
     ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
     // Send the ACK frame
-    send_frame(&ack_frame,  &client->addr);
+    send_frame(&ack_frame, server_socket, &client->addr);
     return;
 }
 // Sends a NACK frame back to the sender
@@ -398,7 +238,7 @@ void send_nack(const ClientInfo *client, uint32_t nack_seq_num) {
     // Calculate CRC32 for the NACK frame
     nack_frame.header.checksum = htonl(calculate_crc32(&nack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
     // Send the NACK frame
-    send_frame(&nack_frame,  &client->addr);
+    send_frame(&nack_frame, server_socket, &client->addr);
     return;
 }
 // Sends a file transfer status frame
@@ -416,7 +256,7 @@ void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t fil
 
     status_frame.header.checksum = htonl(calculate_crc32(&status_frame, sizeof(FrameHeader) + sizeof(FileTransferStatusPayload)));
 
-    send_frame(&status_frame, dest_addr);
+    send_frame(&status_frame, server_socket, dest_addr);
     char dest_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(dest_addr->sin_addr), dest_ip, INET_ADDRSTRLEN);
     printf("Sending File Transfer Status for File ID %u to %s:%d: %s\n",
@@ -462,7 +302,7 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
                 EnterCriticalSection(&client_list_mutex);       
                 push_queue(&client->queue_ack, received_seq_num, MAX_QUEUE_SIZE);
                 LeaveCriticalSection(&client_list_mutex);
-                send_connect_response(client, received_seq_num);                      
+                send_connect_response(client);                      
             } else {
                 fprintf(stderr, "Failed to add new client from %s:%d. Max clients reached?\n", sender_ip, sender_port);
                 // Optionally send NACK indicating server full
