@@ -8,8 +8,13 @@
                 "/Zi",
                 "/EHsc",
                 "/nologo",
-                "/Fe${fileDirname}\\${fileBasenameNoExtension}.exe",
-                "${file}"
+                "/FS",
+                "${file}",
+                "/Fe${workspaceFolder}\\bin\\${fileBasenameNoExtension}.exe",
+                "/Fo${workspaceFolder}\\obj\\${fileBasenameNoExtension}.obj",
+                "/Fd${workspaceFolder}\\pdb\\${fileBasenameNoExtension}.pdb",
+                "/link",
+                "/PDB:${workspaceFolder}\\pdb\\${fileBasenameNoExtension}.pdb"
             ],
             "options": {
                 "cwd": "${fileDirname}"

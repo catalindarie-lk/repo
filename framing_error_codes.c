@@ -74,7 +74,10 @@ void log_event(event_type_t event_type, const char* event_message) {
     } else {
         event_str = "UNKNOWN";
     }
-   
+    // Print the event to stderr with UTC time
+    // Note: Using fprintf to stderr for logging, which is common for error logs
+    // Note: gmtime returns a struct tm in UTC, so we can directly use it for logging
+    // Note: The format string is adjusted to match the expected output format
     fprintf(stderr,"\n[%s] [UTC %04d-%02d-%02d %02d:%02d:%02d] - %s",
         event_str,
         utc_time->tm_year + 1900,
@@ -105,8 +108,10 @@ uint32_t crc32(const void* payload, uint32_t payload_size){
             }
         }
     }   
+    // Finalize CRC value by inverting all bits
     return ~CRC; // Final CRC value
 }
+
 
 // Helper function to get a human-readable message for an error code
 const char* get_error_message(err_code_t err_code) { 
@@ -270,41 +275,58 @@ int main() {
     void* packet = NULL;
     char out_message[1024] = {0};
 
-    log_event(LOG_INFO, "Enter your message: ");
-    fgets(out_message, sizeof(out_message), stdin);
-    out_message[strcspn(out_message, "\n")] = '\0';
-    if (strlen(out_message) == 0) {
-        log_event(LOG_ERROR, get_error_message(NET_ERR_EMPTY_MESSAGE));
-        WSACleanup();
-        return NET_ERR_EMPTY_MESSAGE;
-    }
+    while(1){
+        log_event(LOG_INFO, "Enter your message (or type 'exit' to quit): ");
+        fgets(out_message, sizeof(out_message), stdin);
+        out_message[strcspn(out_message, "\n")] = '\0'; // Remove newline character
 
-    // Pass the address of 'status' to create_packet
-    packet = create_packet(1, 1, out_message, strlen(out_message), &err_code);
+        if (strcmp(out_message, "exit") == 0) {
+            log_event(LOG_INFO, "Exiting program.");
+            break; // Exit the loop if user types 'exit'
+        }
 
-    if (err_code != NET_ERR_SUCCESS) {
-        log_event(LOG_ERROR,get_error_message(err_code));
-        WSACleanup();
-        return 1;
-    }
+        if (strlen(out_message) == 0) {
+            log_event(LOG_ERROR, get_error_message(NET_ERR_EMPTY_MESSAGE));
+            continue; // Skip to next iteration if message is empty
+        }
+    
+        if (strlen(out_message) == 0) {
+            log_event(LOG_ERROR, get_error_message(NET_ERR_EMPTY_MESSAGE));
+            WSACleanup();
+            return NET_ERR_EMPTY_MESSAGE;
+        }
 
-    log_event(LOG_INFO, "Original Packet");
-    // print_packet now takes a packet with fields in network byte order
-    print_packet(packet);
+        // Pass the address of 'status' to create_packet
+        packet = create_packet(1, 1, out_message, strlen(out_message), &err_code);
 
-    log_event(LOG_INFO, "Sending Packet in Frames");
-    err_code = send_packet_in_frames(INVALID_SOCKET, packet); // Placeholder for actual socket
+        if (err_code != NET_ERR_SUCCESS) {
+            log_event(LOG_ERROR,get_error_message(err_code));
+            WSACleanup();
+            return 1;
+        }
 
-    if (err_code != NET_ERR_SUCCESS) {
-        log_event(LOG_ERROR, get_error_message(err_code));
+        log_event(LOG_INFO, "Original Packet");
+        // print_packet now takes a packet with fields in network byte order
+        print_packet(packet);
+
+        log_event(LOG_INFO, "Sending Packet in Frames");
+        err_code = send_packet_in_frames(INVALID_SOCKET, packet); // Placeholder for actual socket
+
+        if (err_code != NET_ERR_SUCCESS) {
+            log_event(LOG_ERROR, get_error_message(err_code));
+            free(packet);
+            WSACleanup();
+            return 1;
+        }
+
+        log_event(LOG_INFO, "Packet sent in frames successfully.");
+
         free(packet);
-        WSACleanup();
-        return 1;
+
+
+        // Pass the address
     }
 
-    log_event(LOG_INFO, "Packet sent in frames successfully.");
-
-    free(packet);
     WSACleanup();
     return 0;
 }
