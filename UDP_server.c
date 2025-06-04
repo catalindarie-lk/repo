@@ -10,6 +10,8 @@
 #include <time.h>       // For time-based IDs if needed
 #include <process.h>    // For _beginthreadex (preferred over CreateThread for CRT safety)
 
+#include "UDP_lib.h"
+
 #pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
 // --- Constants ---
@@ -19,7 +21,7 @@
 #define RECV_TIMEOUT_MS     100         // Timeout for recvfrom in milliseconds in the receive thread
 #define CLIENT_TIMEOUT_SEC  3000        // Seconds after which an inactive client is considered disconnected
 #define FILE_TRANSFER_TIMEOUT_SEC 60    // Seconds after which a stalled file transfer is cleaned up
-#define MAX_QUEUE_SIZE      2048
+
 
 typedef enum{
     CLIENT_DISCONNECTED = 0,
@@ -51,7 +53,6 @@ typedef struct {
     uint16_t start_delimiter;       // Magic number (e.g., 0xAABB)
     uint8_t  frame_type;            // Discriminator: what kind of payload is in the union
     uint32_t seq_num;               // Global sequence number for this frame from the sender
-    uint32_t ack_num;               // Acknowledgment number for a packet the sender has received (piggybacked ACK)
     uint32_t checksum;              // Checksum for this frame's header + active union member (CRC32 recommended)
 } FrameHeader;
 
@@ -64,7 +65,7 @@ typedef struct {
 } ConnectRequestPayload;
 
 typedef struct {
-    uint32_t ack_seq_num;
+    uint32_t ack_seq_num;       // Acknowledgment sequence number for the client's connect request
     uint32_t session_id;        // Unique identifier assigned to the client
     uint8_t  status_code;       // Success (1) or failure (0), with potential error codes
     uint32_t session_timeout;   // Suggested timeout period for client inactivity
@@ -84,27 +85,27 @@ typedef struct {
 } LongTextPayload;
 
 typedef struct {
-    uint32_t file_id;
-    uint32_t total_file_size;
+    uint32_t file_id;           // Unique identifier for the file transfer session
+    uint32_t total_file_size;       // Total size of the file being transferred
     uint8_t  file_hash[16];      // For MD5 hash (adjust size for SHA256 etc.)
     char     filename[256];      // Max filename length
 } FileMetadataPayload;
 
 typedef struct {
-    uint32_t file_id;
-    uint32_t fragment_offset;
-    uint32_t payload_len;
+    uint32_t file_id;           // Unique identifier for the file transfer session
+    uint32_t fragment_offset;       // Offset of this fragment within the file
+    uint32_t payload_len;           // Length of actual data in 'fragment_data'
     uint8_t  fragment_data[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 3)]; // Adjusted size
 } FileDataPayload;
 
 typedef struct {
-    uint32_t ack_seq_num;
+    uint32_t ack_seq_num;       // Acknowledged sequence number of the frame being acknowledged
     uint32_t session_id;          // Unique identifier assigned to the client
     uint8_t status_code;         // Success (1) or failure (0), with potential error codes
 } AckNackPayload;
 
 typedef struct {
-    uint32_t file_id;
+    uint32_t file_id;           // Unique identifier for the file transfer session
     uint8_t  final_hash[16];     // Hash of the completely received file
     uint8_t  success;            // 1 for success, 0 for failure
 } FileTransferStatusPayload;
@@ -113,27 +114,22 @@ typedef struct {
 typedef struct {
     FrameHeader header;
     union {
-        ConnectRequestPayload request;
-        ConnectResponsePayload response;
-        TextPayload text_msg;
-        LongTextPayload long_text_msg;
-        FileMetadataPayload file_metadata;
-        FileDataPayload file_data;
-        AckNackPayload ack_nack;
-        FileTransferStatusPayload file_transfer_status;
+        ConnectRequestPayload request;              // Client's connect request
+        ConnectResponsePayload response;            // Server's response to client connect
+        TextPayload text_msg;                   // Single-part text message
+        LongTextPayload long_text_msg;          // Fragment of a long text message
+        FileMetadataPayload file_metadata;      // File metadata request/response
+        FileDataPayload file_data;                  // File data fragment
+        AckNackPayload ack_nack;                // Acknowledgment or Negative Acknowledgment    
+        FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
     } payload_data;
 } UdpFrame;
 #pragma pack(pop)
 
 // --- Server Global State ---
-SOCKET server_socket;
+SOCKET server_socket;       // Global server socket for receiving and sending UDP frames
 volatile int running = 1; // Flag to control server loops
-
-typedef struct{
-    uint32_t seq_num[MAX_QUEUE_SIZE];
-    uint32_t head, tail;
-}QueueNak;
 
 // --- Client Management ---
 #define MAX_CLIENTS 10
@@ -144,23 +140,23 @@ typedef struct {
     time_t last_activity_time;
     uint32_t last_received_seq; // Last sequence number received from this client
     uint32_t next_send_seq;     // Next sequence number for frames sent to this client
-    uint8_t protocol_ver;
-    char client_name[64];
-    QueueNak queue_nak;
+    uint8_t protocol_ver;       // Protocol version supported by the client
+    char client_name[64];       // Optional: human-readable identifier
+    Queue queue_ack;         // Queue for NACK frames to be sent to this client
     // In a real system, you'd add:
     // - A queue for outgoing reliable packets (with retransmission info)
     // - A receive buffer for out-of-order packets (for sliding window)
 } ClientInfo;
 
-ClientInfo connected_clients[MAX_CLIENTS];
-int num_connected_clients = 0;
+ClientInfo connected_clients[MAX_CLIENTS];      // Array of connected clients
+int num_connected_clients = 0;                  // Number of currently connected clients
 CRITICAL_SECTION client_list_mutex; // For thread-safe access to connected_clients
-CRITICAL_SECTION nack_list_mutex;
+
 
 // --- File Transfer Management ---
 #define MAX_FILE_TRANSFERS 5
 typedef struct {
-    uint32_t file_id;
+    uint32_t file_id;                   // Unique identifier for the file transfer session
     struct sockaddr_in client_address; // Source client address
     char filename[256];
     size_t total_size;
@@ -170,7 +166,7 @@ typedef struct {
     char temp_filepath[MAX_PATH];  // Path to the temporary file
     uint32_t last_received_fragment_seq; // Last sequence number of a file fragment received for this transfer
     // A more advanced system would use a bitmap/array to track received fragments
-    // for selective repeat and NACK generation.
+    // for selective repeat and ACK generation.
     time_t last_fragment_time; // To detect stalled transfers and clean up
 } FileTransferContext;
 
@@ -182,15 +178,18 @@ volatile uint32_t next_file_id = 1; // Global counter for unique file IDs
 // --- Function Prototypes ---
 void init_winsock();
 void cleanup_winsock();
-uint32_t calculate_crc32(const void *data, size_t len); // Changed to CRC32
+// Frame handling functions
+uint32_t calculate_crc32(const void *data, size_t len); 
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
+// UDP communication functions
 void send_frame(const UdpFrame *frame, const struct sockaddr_in *dest_addr);
 void send_connect_response(const ClientInfo *client, uint32_t ack_seq_num);
 void send_ack(const ClientInfo *client, uint32_t ack_seq_num);
-void send_nack(const struct sockaddr_in *dest_addr, uint32_t nack_seq_num, uint32_t target_id, uint32_t target_offset);
+void send_nack(const ClientInfo *client, uint32_t nack_seq_num);
 void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t file_id, const uint8_t *final_hash, BOOL success);
 void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr);
-unsigned int WINAPI receive_thread_func(LPVOID lpParam); // Changed return type for _beginthreadex
+// Thread functions
+unsigned int WINAPI receive_thread_func(LPVOID lpParam);
 unsigned int WINAPI send_ack_thread_func(LPVOID lpParam);
 
 // Client management functions
@@ -198,34 +197,12 @@ ClientInfo* find_client(const struct sockaddr_in *addr);
 ClientInfo* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *addr);
 void remove_client(const struct sockaddr_in *addr);
 void manage_clients_and_transfers();
-void push_nack_frame(ClientInfo *client, uint32_t received_seq_num);
-void pop_nack_frame(ClientInfo *client);
 
 // File transfer management functions
 FileTransferContext* find_file_transfer(uint32_t file_id);
 FileTransferContext* start_new_file_transfer(const struct sockaddr_in *sender_addr, const char *filename, uint32_t total_size, const uint8_t *file_hash);
 void finalize_file_transfer(FileTransferContext *ctx);
 void remove_file_transfer(uint32_t file_id);
-
-// --- CRC32 Implementation (Simple example, use a proper library for production) ---
-// You'd typically use a lookup table for speed. This is a basic polynomial calculation.
-uint32_t calculate_crc32(const void *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF; // Initial value
-    const uint8_t *byte_data = (const uint8_t *)data;
-    uint32_t polynomial = 0xEDB88320; // IEEE 802.3 polynomial (reversed)
-
-    for (size_t i = 0; i < len; i++) {
-        crc ^= byte_data[i];
-        for (int j = 0; j < 8; j++) {
-            if (crc & 1) {
-                crc = (crc >> 1) ^ polynomial;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    return ~crc; // Final XOR (sometimes not used depending on CRC variant)
-}
 
 // Validates the received frame's checksum
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received) {
@@ -241,12 +218,10 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received) {
     uint32_t calculated_checksum = calculate_crc32(&temp_frame_for_checksum, bytes_received);
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
-
 // --- Main Server Function ---
 int main() {
     init_winsock();
     InitializeCriticalSection(&client_list_mutex);
-    InitializeCriticalSection(&nack_list_mutex);
     InitializeCriticalSection(&file_transfer_mutex);
 
     // 1. Create Socket
@@ -307,14 +282,11 @@ int main() {
     closesocket(server_socket);
     cleanup_winsock();
     DeleteCriticalSection(&client_list_mutex);
-    DeleteCriticalSection(&nack_list_mutex);
     DeleteCriticalSection(&file_transfer_mutex);
     printf("Server shut down cleanly.\n");
     return 0;
 }
-
 // --- Helper Functions ---
-
 void init_winsock() {
     WSADATA wsaData;
     int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -372,8 +344,9 @@ void send_frame(const UdpFrame *frame, const struct sockaddr_in *dest_addr) {
 // Sends an RESPONSE frame back to the sender
 void send_connect_response(const ClientInfo *client, uint32_t ack_seq_num) {
     UdpFrame response_frame;
+    // Initialize the response frame
     memset(&response_frame, 0, sizeof(response_frame));
-
+    // Set the header fields
     response_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     response_frame.header.frame_type = FRAME_TYPE_CONNECT_RESPONSE;
     // Server's own sequence number for its outgoing ACK (can be global for all outgoing)
@@ -387,7 +360,7 @@ void send_connect_response(const ClientInfo *client, uint32_t ack_seq_num) {
 
     // Calculate CRC32 for the ACK frame
     response_frame.header.checksum = htonl(calculate_crc32(&response_frame, sizeof(FrameHeader) + sizeof(ConnectResponsePayload)));
-
+    // Send the response frame
     send_frame(&response_frame, &client->addr);
     char dest_ip[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &(client->addr.sin_addr), dest_ip, INET_ADDRSTRLEN);
@@ -399,42 +372,34 @@ void send_connect_response(const ClientInfo *client, uint32_t ack_seq_num) {
 // Sends an ACK frame back to the sender
 void send_ack(const ClientInfo *client, uint32_t ack_seq_num) {
     UdpFrame ack_frame;
+    // Initialize the ACK frame
     memset(&ack_frame, 0, sizeof(ack_frame));
-
+    // Set the header fields
     ack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     ack_frame.header.frame_type = FRAME_TYPE_ACK;
-    // Server's own sequence number for its outgoing ACK (can be global for all outgoing)
-    // A robust system would have a per-client outgoing sequence number.
-    static uint32_t server_out_seq = 0;
-    ack_frame.header.seq_num = htonl(server_out_seq++);
     ack_frame.payload_data.ack_nack.ack_seq_num = htonl(ack_seq_num);
     ack_frame.payload_data.ack_nack.session_id = htonl(client->session_id);
-
     // Calculate CRC32 for the ACK frame
     ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
+    // Send the ACK frame
     send_frame(&ack_frame,  &client->addr);
     return;
 }
 // Sends a NACK frame back to the sender
-void send_nack(const struct sockaddr_in *dest_addr, uint32_t nack_seq_num, uint32_t target_id, uint32_t target_offset) {
+void send_nack(const ClientInfo *client, uint32_t nack_seq_num) {
     UdpFrame nack_frame;
+    // Initialize the NACK frame
     memset(&nack_frame, 0, sizeof(nack_frame));
-
+    // Set the header fields
     nack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     nack_frame.header.frame_type = FRAME_TYPE_NACK;
-    static uint32_t server_out_seq_nack = 0;
-    nack_frame.header.seq_num = htonl(server_out_seq_nack++);
     nack_frame.payload_data.ack_nack.ack_seq_num = htonl(nack_seq_num);
-    // nack_frame.payload_data.ack_nack.target_id = htonl(target_id);
-    // nack_frame.payload_data.ack_nack.target_offset = htonl(target_offset);
-
+    nack_frame.payload_data.ack_nack.session_id = htonl(client->session_id);
+    // Calculate CRC32 for the NACK frame
     nack_frame.header.checksum = htonl(calculate_crc32(&nack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
-
-    send_frame(&nack_frame, dest_addr);
-    char dest_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(dest_addr->sin_addr), dest_ip, INET_ADDRSTRLEN);
-    fprintf(stderr, "Sending NACK for Seq %u to %s:%d (Target ID: %u, Offset: %u)\n",
-            nack_seq_num, dest_ip, ntohs(dest_addr->sin_port), target_id, target_offset);
+    // Send the NACK frame
+    send_frame(&nack_frame,  &client->addr);
+    return;
 }
 // Sends a file transfer status frame
 void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t file_id, const uint8_t *final_hash, BOOL success) {
@@ -457,38 +422,8 @@ void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t fil
     printf("Sending File Transfer Status for File ID %u to %s:%d: %s\n",
            file_id, dest_ip, ntohs(dest_addr->sin_port), success ? "COMPLETE" : "FAILED");
 }
-// --- Main Packet Processing Logic ---
-void push_nack_frame(ClientInfo *client, uint32_t received_seq_num){
-    int head = client->queue_nak.head;
-    int tail = client->queue_nak.tail;
-    if((++tail) % MAX_QUEUE_SIZE == head){
-        printf("Queue Full\n");
-        return;
-    }
-    EnterCriticalSection(&client_list_mutex);  
-    client->queue_nak.seq_num[client->queue_nak.tail] = received_seq_num;
-    printf("Added nack seq nr: Queue[%d] = %d for Client: %s\n",client->queue_nak.tail, 
-                                                                    client->queue_nak.seq_num[client->queue_nak.tail],  
-                                                                    client->client_name);
-    ++client->queue_nak.tail;
-    client->queue_nak.tail %= MAX_QUEUE_SIZE;
-    LeaveCriticalSection(&client_list_mutex);
-    return;
-}
 
-void pop_nack_frame(ClientInfo *client){
-    printf("Removing nack seq nr: Queue[%d] = %d for Client: %s\n", client->queue_nak.head,
-                                                                    client->queue_nak.seq_num[client->queue_nak.head], 
-                                                                    client->client_name);
-    EnterCriticalSection(&client_list_mutex);
-    client->queue_nak.seq_num[client->queue_nak.head] = 0;
-    ++client->queue_nak.head;
-    client->queue_nak.head %= MAX_QUEUE_SIZE;
-    LeaveCriticalSection(&client_list_mutex);
-    return;
-}
-
-
+// Processes a received UDP frame
 void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr) {
     // Convert header fields from network byte order to host byte order
     uint16_t received_delimiter = ntohs(frame->header.start_delimiter);
@@ -510,7 +445,7 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
     if (!is_checksum_valid(frame, bytes_received)) {
         fprintf(stderr, "Received frame from %s:%d with checksum mismatch. Discarding.\n",
                 sender_ip, sender_port);
-        // Optionally send NACK for checksum mismatch if this is part of a reliable stream
+        // Optionally send ACK for checksum mismatch if this is part of a reliable stream
         // For individual datagrams, retransmission is often handled by higher layers or ignored.
         return;
     }
@@ -523,8 +458,10 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
             client = add_client(frame, sender_addr);
             if (client) {
                 printf("New client connected from %s:%d (ID: %u , Name: %s)\n", sender_ip, sender_port, client->client_id, client->client_name);
-                // Send CONNECT_RESPONSE       
-                push_nack_frame(client, received_seq_num);
+                // Send CONNECT_RESPONSE
+                EnterCriticalSection(&client_list_mutex);       
+                push_queue(&client->queue_ack, received_seq_num, MAX_QUEUE_SIZE);
+                LeaveCriticalSection(&client_list_mutex);
                 send_connect_response(client, received_seq_num);                      
             } else {
                 fprintf(stderr, "Failed to add new client from %s:%d. Max clients reached?\n", sender_ip, sender_port);
@@ -561,7 +498,9 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
             frame->payload_data.text_msg.text_data[text_len] = '\0';
             printf("\n[TEXT from %s:%d] Seq: %u, Message: \"%s\"\n",
                     sender_ip, sender_port, received_seq_num, frame->payload_data.text_msg.text_data);
-            push_nack_frame(client, received_seq_num);
+            EnterCriticalSection(&client_list_mutex);
+            push_queue(&client->queue_ack, received_seq_num, MAX_QUEUE_SIZE);
+            LeaveCriticalSection(&client_list_mutex);
             //send_ack(client, received_seq_num); // Acknowledge receipt
             // Optional: Route message to another client if specified
             break;
@@ -579,95 +518,95 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
             send_ack(client, received_seq_num);
             break;
         }
-        case FRAME_TYPE_FILE_METADATA_REQUEST: {
-            uint32_t total_size = ntohl(frame->payload_data.file_metadata.total_file_size);
-            char *filename = frame->payload_data.file_metadata.filename;
-            uint8_t *file_hash = frame->payload_data.file_metadata.file_hash;
-            printf("\n[FILE METADATA REQ from %s:%d] Seq: %u, Filename: '%s', Size: %u bytes\n",
-                    sender_ip, sender_port, received_seq_num, filename, total_size);
+        // case FRAME_TYPE_FILE_METADATA_REQUEST: {
+        //     uint32_t total_size = ntohl(frame->payload_data.file_metadata.total_file_size);
+        //     char *filename = frame->payload_data.file_metadata.filename;
+        //     uint8_t *file_hash = frame->payload_data.file_metadata.file_hash;
+        //     printf("\n[FILE METADATA REQ from %s:%d] Seq: %u, Filename: '%s', Size: %u bytes\n",
+        //             sender_ip, sender_port, received_seq_num, filename, total_size);
 
-            EnterCriticalSection(&file_transfer_mutex);
-            FileTransferContext *ctx = start_new_file_transfer(sender_addr, filename, total_size, file_hash);
-            if (ctx) {
-                // Send FILE_METADATA_RESPONSE with the assigned file_id
-                UdpFrame resp_frame;
-                memset(&resp_frame, 0, sizeof(resp_frame));
-                resp_frame.header.start_delimiter = htons(FRAME_DELIMITER);
-                resp_frame.header.frame_type = FRAME_TYPE_FILE_METADATA_RESPONSE;
-                static uint32_t file_meta_resp_seq = 0;
-                resp_frame.header.seq_num = htonl(file_meta_resp_seq++);
-                resp_frame.payload_data.file_metadata.file_id = htonl(ctx->file_id);
-                resp_frame.payload_data.file_metadata.total_file_size = htonl(total_size);
-                strncpy(resp_frame.payload_data.file_metadata.filename, filename, sizeof(resp_frame.payload_data.file_metadata.filename) - 1);
-                resp_frame.payload_data.file_metadata.filename[sizeof(resp_frame.payload_data.file_metadata.filename) - 1] = '\0'; // Ensure null termination
-                memcpy(resp_frame.payload_data.file_metadata.file_hash, file_hash, 16);
-                resp_frame.header.checksum = htonl(calculate_crc32(&resp_frame, sizeof(FrameHeader) + sizeof(FileMetadataPayload)));
-                send_frame(&resp_frame, sender_addr);
-                printf("Assigned File ID %u for '%s'. Ready to receive.\n", ctx->file_id, filename);
-                send_ack(client, received_seq_num); // ACK the request
-            } else {
-                fprintf(stderr, "Failed to start file transfer for '%s'. Server busy?\n", filename);
-                // Send NACK to client indicating server busy or max transfers reached
-                send_nack(sender_addr, received_seq_num, 0, 0);
-            }
-            LeaveCriticalSection(&file_transfer_mutex);
-            break;
-        }
-        case FRAME_TYPE_FILE_DATA: {
-            uint32_t file_id = ntohl(frame->payload_data.file_data.file_id);
-            uint32_t offset = ntohl(frame->payload_data.file_data.fragment_offset);
-            uint32_t payload_len = ntohl(frame->payload_data.file_data.payload_len); // Changed to uint32_t
+        //     EnterCriticalSection(&file_transfer_mutex);
+        //     FileTransferContext *ctx = start_new_file_transfer(sender_addr, filename, total_size, file_hash);
+        //     if (ctx) {
+        //         // Send FILE_METADATA_RESPONSE with the assigned file_id
+        //         UdpFrame resp_frame;
+        //         memset(&resp_frame, 0, sizeof(resp_frame));
+        //         resp_frame.header.start_delimiter = htons(FRAME_DELIMITER);
+        //         resp_frame.header.frame_type = FRAME_TYPE_FILE_METADATA_RESPONSE;
+        //         static uint32_t file_meta_resp_seq = 0;
+        //         resp_frame.header.seq_num = htonl(file_meta_resp_seq++);
+        //         resp_frame.payload_data.file_metadata.file_id = htonl(ctx->file_id);
+        //         resp_frame.payload_data.file_metadata.total_file_size = htonl(total_size);
+        //         strncpy(resp_frame.payload_data.file_metadata.filename, filename, sizeof(resp_frame.payload_data.file_metadata.filename) - 1);
+        //         resp_frame.payload_data.file_metadata.filename[sizeof(resp_frame.payload_data.file_metadata.filename) - 1] = '\0'; // Ensure null termination
+        //         memcpy(resp_frame.payload_data.file_metadata.file_hash, file_hash, 16);
+        //         resp_frame.header.checksum = htonl(calculate_crc32(&resp_frame, sizeof(FrameHeader) + sizeof(FileMetadataPayload)));
+        //         send_frame(&resp_frame, sender_addr);
+        //         printf("Assigned File ID %u for '%s'. Ready to receive.\n", ctx->file_id, filename);
+        //         send_ack(client, received_seq_num); // ACK the request
+        //     } else {
+        //         fprintf(stderr, "Failed to start file transfer for '%s'. Server busy?\n", filename);
+        //         // Send NACK to client indicating server busy or max transfers reached
+        //         send_nack(client, received_seq_num);
+        //     }
+        //     LeaveCriticalSection(&file_transfer_mutex);
+        //     break;
+        // }
+        // case FRAME_TYPE_FILE_DATA: {
+        //     uint32_t file_id = ntohl(frame->payload_data.file_data.file_id);
+        //     uint32_t offset = ntohl(frame->payload_data.file_data.fragment_offset);
+        //     uint32_t payload_len = ntohl(frame->payload_data.file_data.payload_len); // Changed to uint32_t
 
-            EnterCriticalSection(&file_transfer_mutex);
-            FileTransferContext *ctx = find_file_transfer(file_id);
-            if (ctx) {
-                // Update last activity time for this transfer
-                ctx->last_fragment_time = time(NULL);
-                printf("[FILE DATA from %s:%d] Seq: %u, File ID: %u, Offset: %u, Length: %u (Total: %zu/%zu)\n",
-                        sender_ip, sender_port, received_seq_num, file_id, offset, payload_len,
-                        ctx->received_bytes + payload_len, ctx->total_size);
+        //     EnterCriticalSection(&file_transfer_mutex);
+        //     FileTransferContext *ctx = find_file_transfer(file_id);
+        //     if (ctx) {
+        //         // Update last activity time for this transfer
+        //         ctx->last_fragment_time = time(NULL);
+        //         printf("[FILE DATA from %s:%d] Seq: %u, File ID: %u, Offset: %u, Length: %u (Total: %zu/%zu)\n",
+        //                 sender_ip, sender_port, received_seq_num, file_id, offset, payload_len,
+        //                 ctx->received_bytes + payload_len, ctx->total_size);
 
-                // Write fragment to temporary file
-                if (ctx->temp_file_handle) {
-                    // Seek to the correct offset
-                    if (fseek(ctx->temp_file_handle, offset, SEEK_SET) == 0) {
-                        size_t bytes_written = fwrite(frame->payload_data.file_data.fragment_data, 1, payload_len, ctx->temp_file_handle);
-                        if (bytes_written == payload_len) {
-                            ctx->received_bytes += payload_len;
-                            // In a robust system, you'd mark this fragment as received in a bitmap for selective repeat
-                            send_ack(client, received_seq_num); // ACK this specific fragment
+        //         // Write fragment to temporary file
+        //         if (ctx->temp_file_handle) {
+        //             // Seek to the correct offset
+        //             if (fseek(ctx->temp_file_handle, offset, SEEK_SET) == 0) {
+        //                 size_t bytes_written = fwrite(frame->payload_data.file_data.fragment_data, 1, payload_len, ctx->temp_file_handle);
+        //                 if (bytes_written == payload_len) {
+        //                     ctx->received_bytes += payload_len;
+        //                     // In a robust system, you'd mark this fragment as received in a bitmap for selective repeat
+        //                     send_ack(client, received_seq_num); // ACK this specific fragment
 
-                            // Check for file completion - simplified check, needs robust fragment tracking
-                            if (ctx->received_bytes >= ctx->total_size) {
-                                // Important: This simply checks total bytes. A robust solution needs to ensure
-                                // ALL fragments (offsets) are present and then verify file hash.
-                                printf("File transfer %u for '%s' possibly complete. Received %zu of %zu bytes.\n",
-                                        file_id, ctx->filename, ctx->received_bytes, ctx->total_size);
-                                finalize_file_transfer(ctx); // Close temp file, verify hash, move file, notify client
-                                remove_file_transfer(file_id); // Remove from active transfers
-                            }
-                        } else {
-                            fprintf(stderr, "Error writing file fragment to temp file for %u. Expected %u, wrote %zu.\n", file_id, payload_len, bytes_written);
-                            // Send NACK to client to request retransmission
-                            send_nack(sender_addr, received_seq_num, file_id, offset);
-                        }
-                    } else {
-                        fprintf(stderr, "Error seeking in temp file for %u.\n", file_id);
-                        send_nack(sender_addr, received_seq_num, file_id, offset);
-                    }
-                } else {
-                    fprintf(stderr, "File handle not open for transfer %u. This indicates a server issue.\n", file_id);
-                    send_nack(sender_addr, received_seq_num, file_id, offset); // Request retransmission, hoping file handle is re-opened or transfer restarted
-                }
-            } else {
-                fprintf(stderr, "Received FILE_DATA for unknown File ID %u from %s:%d. Discarding.\n",
-                        file_id, sender_ip, sender_port);
-                // Send NACK for unknown File ID, signaling client to restart transfer or provide metadata
-                send_nack(sender_addr, 0, file_id, 0); // Seq 0, Target ID is file_id
-            }
-            LeaveCriticalSection(&file_transfer_mutex);
-            break;
-        }
+        //                     // Check for file completion - simplified check, needs robust fragment tracking
+        //                     if (ctx->received_bytes >= ctx->total_size) {
+        //                         // Important: This simply checks total bytes. A robust solution needs to ensure
+        //                         // ALL fragments (offsets) are present and then verify file hash.
+        //                         printf("File transfer %u for '%s' possibly complete. Received %zu of %zu bytes.\n",
+        //                                 file_id, ctx->filename, ctx->received_bytes, ctx->total_size);
+        //                         finalize_file_transfer(ctx); // Close temp file, verify hash, move file, notify client
+        //                         remove_file_transfer(file_id); // Remove from active transfers
+        //                     }
+        //                 } else {
+        //                     fprintf(stderr, "Error writing file fragment to temp file for %u. Expected %u, wrote %zu.\n", file_id, payload_len, bytes_written);
+        //                     // Send NACK to client to request retransmission
+        //                     send_nack(client, received_seq_num);
+        //                 }
+        //             } else {
+        //                 fprintf(stderr, "Error seeking in temp file for %u.\n", file_id);
+        //                 send_nack(client, received_seq_num);
+        //             }
+        //         } else {
+        //             fprintf(stderr, "File handle not open for transfer %u. This indicates a server issue.\n", file_id);
+        //             send_nack(client, received_seq_num); // Request retransmission, hoping file handle is re-opened or transfer restarted
+        //         }
+        //     } else {
+        //         fprintf(stderr, "Received FILE_DATA for unknown File ID %u from %s:%d. Discarding.\n",
+        //                 file_id, sender_ip, sender_port);
+        //         // Send NACK for unknown File ID, signaling client to restart transfer or provide metadata
+        //         send_nack(client, 0); // Seq 0, Target ID is file_id
+        //     }
+        //     LeaveCriticalSection(&file_transfer_mutex);
+        //     break;
+        // }
         // case FRAME_TYPE_ACK: {
         //     uint32_t acked_seq = ntohl(frame->payload_data.ack_nack.acknowledged_seq_num);
         //     uint32_t target_id = ntohl(frame->payload_data.ack_nack.target_id);
@@ -751,12 +690,12 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
         for(int i = 0; i < current_connected_clients; i++){
             client = &connected_clients[i];
             EnterCriticalSection(&client_list_mutex);
-            queue_empty = client->queue_nak.tail == client->queue_nak.head;
+            queue_empty = client->queue_ack.tail == client->queue_ack.head;
             //if queue is not empty then send acknowledge for frame sequence number
             if(!queue_empty){
-                int nack_seq_count = client->queue_nak.head;
-                send_ack(client, client->queue_nak.seq_num[nack_seq_count]);
-                pop_nack_frame(client);
+                int ack_seq_count = client->queue_ack.head;
+                send_ack(client, client->queue_ack.buffer[ack_seq_count]);
+                pop_queue(&client->queue_ack, MAX_QUEUE_SIZE);
             }
             LeaveCriticalSection(&client_list_mutex);
             client = NULL;
@@ -801,8 +740,8 @@ ClientInfo* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *add
     new_client->protocol_ver = recv_frame->payload_data.request.protocol_ver;
     strncpy(new_client->client_name, recv_frame->payload_data.request.client_name, sizeof(new_client->client_name) - 1);
     new_client->client_name[sizeof(new_client->client_name) - 1] = '\0';
-    new_client->queue_nak.head = 0;
-    new_client->queue_nak.tail = 0;
+    new_client->queue_ack.head = 0;
+    new_client->queue_ack.tail = 0;
     num_connected_clients++;
     LeaveCriticalSection(&client_list_mutex);
     return new_client;

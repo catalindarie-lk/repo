@@ -44,7 +44,6 @@ typedef struct {
     uint16_t start_delimiter;    // Magic number (e.g., 0xAABB)
     uint8_t  frame_type;         // Discriminator: what kind of payload is in the union
     uint32_t seq_num;            // Global sequence number for this frame from the sender
-    uint32_t flags;
     uint32_t checksum;           // Checksum for this frame's header + active union member (CRC32 recommended)
 } FrameHeader;
 
@@ -76,8 +75,8 @@ typedef struct {
 } LongTextPayload;
 
 typedef struct {
-    uint32_t file_id;
-    uint32_t total_file_size;
+    uint32_t file_id;           // Unique identifier for the file transfer session
+    uint32_t total_file_size;   // Total size of the file being transferred
     uint8_t  file_hash[16];      // For MD5 hash (adjust size for SHA256 etc.)
     char     filename[256];      // Max filename length
 } FileMetadataPayload;
@@ -263,7 +262,6 @@ void send_connect_request(const ClientInfo *client_info, SessionInfo* session_in
     connect_request_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     connect_request_frame.header.frame_type = FRAME_TYPE_CONNECT_REQUEST;
     connect_request_frame.header.seq_num = htonl(++(session_info->frame_count));
-    connect_request_frame.header.flags = htonl(0);
     memcpy(connect_request_frame.payload_data.request.client_name, client_info->client_name, sizeof(client_info->client_name));
     connect_request_frame.payload_data.request.client_id = htonl(client_info->client_id);
     connect_request_frame.payload_data.request.protocol_ver = client_info->protocol_ver;
@@ -295,7 +293,6 @@ void send_text_message(const char* text_data, const uint32_t length, const Clien
     text_message_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     text_message_frame.header.frame_type = FRAME_TYPE_TEXT_MESSAGE;
     text_message_frame.header.seq_num = htonl(++session_info->frame_count);
-    text_message_frame.header.flags = htonl(0);   
     text_message_frame.payload_data.text_msg.text_len = htonl(length);
     strncpy(text_message_frame.payload_data.text_msg.text_data, text_data, length);
     text_message_frame.payload_data.text_msg.text_data[length] = '\0';
