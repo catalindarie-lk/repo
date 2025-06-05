@@ -4,22 +4,25 @@
 #include <stdint.h>    // For fixed-width integer types
 #include <stdio.h>     // For printf and fprintf
 #include <string.h>    // For string manipulation functions
+#include <ws2tcpip.h>   // For modern IP address functions (inet_pton, inet_ntop)
+
+#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
 #define MAX_PAYLOAD_SIZE    1024        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
-#define MAX_QUEUE_SIZE      2048
+#define QUEUE_BUFFER_SIZE   2048        // Queue buffer size
+#define NAME_SIZE           64
 
 typedef enum{
     LOG_INFO, 
     LOG_DEBUG, 
     LOG_ERROR 
 }EventType;
-
+// Circular queue (array of uint32_t and head/tail indexes)
 typedef struct{
-    uint32_t buffer[MAX_QUEUE_SIZE];       // Sequence numbers of frames that need to be ACKed
+    uint32_t buffer[QUEUE_BUFFER_SIZE];       // Sequence numbers of frames that need to be ACKed
     uint32_t head, tail;                    // Head and tail indices for the circular queue
 }Queue;
-
 // --- Frame Types (Enums for clarity) ---
 typedef enum {
     FRAME_TYPE_TEXT_MESSAGE = 1,        // Single-part text message
@@ -36,7 +39,6 @@ typedef enum {
     FRAME_TYPE_FILE_TRANSFER_COMPLETE = 12,   // Server confirms file transfer completion and hash verification
     FRAME_TYPE_FILE_TRANSFER_FAILED = 13      // Server informs client of failed file transfer (e.g., hash mismatch)
 } FrameType;
-
 // --- UDP Frame Structures (with Union) ---
 #pragma pack(push, 1) // Using #pragma pack to ensure no padding for network transmission
 // Common Header for all frames
@@ -46,23 +48,22 @@ typedef struct {
     uint32_t seq_num;               // Global sequence number for this frame from the sender
     uint32_t checksum;              // Checksum for this frame's header + active union member (CRC32 recommended)
 } FrameHeader;
-
 // Payload Structures for different frame types
-
 typedef struct {
     uint32_t client_id;         // Unique identifier assigned by the client
-    uint8_t  protocol_ver;      // Version of the protocol the client supports
-    char     client_name[64];   // Optional: human-readable identifier
+    uint8_t  flags;             // Protocol the client supports
+    char     client_name[NAME_SIZE];   // Optional: human-readable identifier
 } ConnectRequestPayload;
 
 typedef struct {
     uint32_t session_id;        // Unique identifier assigned to the client
     uint32_t session_timeout;   // Suggested timeout period for client inactivity
     uint8_t  server_status;     // BUSY (0) READY (1) or ERR (x), etc
-    char     server_name[64];   // Optional: human-readable identifier
+    char     server_name[NAME_SIZE];   // Optional: human-readable identifier
 } ConnectResponsePayload;
 
 typedef struct {
+    uint32_t session_id;
     uint32_t text_len;           // Length of the text message
     char     text_data[MAX_PAYLOAD_SIZE - sizeof(uint32_t)]; // Actual text
 } TextPayload;
@@ -91,8 +92,7 @@ typedef struct {
 
 typedef struct {
     uint32_t ack_seq_num;       // Acknowledged sequence number of the frame being acknowledged
-    uint32_t session_id;          // Unique identifier assigned to the client
-    uint8_t status_code;         // Success (1) or failure (0), with potential error codes
+    uint8_t flags;             // For future use
 } AckNackPayload;
 
 typedef struct {
@@ -118,14 +118,18 @@ typedef struct {
 } UdpFrame;
 #pragma pack(pop)
 
-
+// ----- Function prototypes -----
 void log_event(EventType event, const char* message);
-void push_queue(Queue *queue, uint32_t value, uint32_t buffer_size);
-void pop_queue(Queue *queue, uint32_t buffer_size);
+void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr);
+void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
+void push_queue(Queue *queue, uint32_t value);
+void pop_queue(Queue *queue);
 uint32_t calculate_crc32(const void *data, size_t len);
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 void send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+void send_ack_nack(uint8_t type, uint32_t seq_num, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
+// ----- Function implementations -----
 void log_event(EventType event, const char* message){
     // Get the current UTC time
     time_t current_time;
@@ -161,37 +165,37 @@ void log_event(EventType event, const char* message){
         event_str,
         message);
 }
-
-void push_queue(Queue *queue, uint32_t value, uint32_t buffer_size){
+// Add element to queue tail
+void push_queue(Queue *queue, uint32_t value){
     // Check if the queue is full before adding a new ACK
-    if((queue->tail + 1) % buffer_size == queue->head){
+    if((queue->tail + 1) % QUEUE_BUFFER_SIZE == queue->head){
         printf("Queue Full\n");
         return;
     }
     // Add the sequence number to the ACK queue 
     queue->buffer[queue->tail] = value;
-    fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
+    // fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
     // Move the tail index forward    
     ++queue->tail;
-    queue->tail %= buffer_size;
+    queue->tail %= QUEUE_BUFFER_SIZE;
     return;
 }
-// Removes a ACK frame from the client's ACK queue
-void pop_queue(Queue *queue, uint32_t buffer_size){       
+// Removes element from queue head
+void pop_queue(Queue *queue){       
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
         printf("ACK queue is empty nothing to remove\n");
         return;
     }
-    fprintf(stdout, "Removing ACK seq nr: Queue[%d] = %d\n", queue->head, queue->buffer[queue->head]);
+    // fprintf(stdout, "Removing ACK seq nr: Queue[%d] = %d\n", queue->head, queue->buffer[queue->head]);
     // Reset the sequence number at the head of the queue
     queue->buffer[queue->head] = 0;
     // Move the head index forward
     ++queue->head;
-    queue->head %= buffer_size;
+    queue->head %= QUEUE_BUFFER_SIZE;
     return;
 }
-
+// CRC32
 uint32_t calculate_crc32(const void *data, size_t len){
     uint32_t crc = 0xFFFFFFFF; // Initial value
     const uint8_t *byte_data = (const uint8_t *)data;
@@ -209,7 +213,7 @@ uint32_t calculate_crc32(const void *data, size_t len){
     }
     return ~crc; // Final XOR (sometimes not used depending on CRC variant)
 }
-
+// Checksum validation
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     // Create a temporary frame to calculate checksum without its own checksum field
     UdpFrame temp_frame_for_checksum;
@@ -221,11 +225,9 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     temp_frame_for_checksum.header.checksum = 0; // Zero out checksum field for calculation
 
     uint32_t calculated_checksum = calculate_crc32(&temp_frame_for_checksum, bytes_received);
-    printf("Calculated Checksum: %u\n", calculated_checksum);
-    printf("Received Checksum: %u\n", ntohl(frame->header.checksum));
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
-
+// Note: The function send_frame should be called with the correct socket and destination address
 void send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
     size_t frame_size = sizeof(FrameHeader);
@@ -274,6 +276,87 @@ void send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct soc
         fprintf(stderr, "sendto failed with error: %d\n", WSAGetLastError());
     }
 }
-// Note: The function send_frame should be called with the correct socket and destination address
+// Sends an ACK/NACK frame back to the sender
+void send_ack_nack(uint8_t type, uint32_t seq_num, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+    UdpFrame ack_frame;
+    // Check frame type is valid
+    if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
+        fprintf(stderr, "Wrong frame type\n");
+        return;
+    }
+    // Initialize the ACK/NACK frame
+    memset(&ack_frame, 0, sizeof(ack_frame));
+    // Set the header fields
+    ack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
+    ack_frame.header.frame_type = type;
+    ack_frame.header.seq_num = 0;
+    ack_frame.payload_data.ack_nack.ack_seq_num = htonl(seq_num);
+    ack_frame.payload_data.ack_nack.flags = htonl(0);
+    // Calculate CRC32 for the ACK/NACK frame
+    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
+    // Send the ACK/NACK frame
+    log_sent_frame(&ack_frame, dest_addr);
+    send_frame(&ack_frame, src_socket, dest_addr);
+    return;
+}
+
+
+void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr){
+
+    char src_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
+    fprintf(stdout, "\nReceived frame from %s:%d\n", src_ip, src_addr->sin_port);
+
+    switch(frame->header.frame_type){
+
+        case FRAME_TYPE_ACK: {
+            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
+            break;
+        }
+        case FRAME_TYPE_CONNECT_REQUEST: {
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload_data.request.client_id), ntohl(frame->payload_data.request.flags), frame->payload_data.request.client_name);
+            break;
+        }
+        case FRAME_TYPE_CONNECT_RESPONSE: {
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Session ID: %d\n   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_id), ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
+
+            break;
+        }
+
+    }  
+
+}
+
+void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
+
+    char dest_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &dest_addr->sin_addr, dest_ip, INET_ADDRSTRLEN);
+    fprintf(stdout, "\nSent frame to %s:%d\n", dest_ip, dest_addr->sin_port);
+    switch(frame->header.frame_type){
+
+        case FRAME_TYPE_ACK: {
+            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
+            break;
+        }
+        case FRAME_TYPE_CONNECT_REQUEST: {
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload_data.request.client_id), ntohl(frame->payload_data.request.flags), frame->payload_data.request.client_name);
+            break;
+        }
+        case FRAME_TYPE_CONNECT_RESPONSE: {
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Session ID: %d\n   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_id), ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
+
+            break;
+        }
+
+    }  
+
+}
+
 
 #endif // _UDP_LIB_H

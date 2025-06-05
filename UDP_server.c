@@ -36,14 +36,15 @@ volatile int running = 1; // Flag to control server loops
 #define MAX_CLIENTS 10
 typedef struct {
     struct sockaddr_in addr;
-    uint32_t client_id; // Unique ID received by the client
-    uint32_t session_id; //Unique ID assigned by the server and used for communication
-    time_t last_activity_time;
-    uint32_t last_received_seq; // Last sequence number received from this client
-    uint32_t next_send_seq;     // Next sequence number for frames sent to this client
-    uint8_t protocol_ver;       // Protocol version supported by the client
+    uint32_t client_id;         // Unique ID received by the client
+    uint32_t session_id;        // Unique ID assigned by the server and used for communication
+    time_t last_activity_time;  
+    uint32_t frame_count;
+
+    uint8_t flags;       // Protocol version supported by the client
     char client_name[64];       // Optional: human-readable identifier
-    Queue queue_ack;            // Queue for NACK frames to be sent to this client
+    Queue queue_ack;            // Queue for ACK/NACK frames to be sent to this client
+
     // In a real system, you'd add:
     // - A queue for outgoing reliable packets (with retransmission info)
     // - A receive buffer for out-of-order packets (for sliding window)
@@ -82,11 +83,10 @@ void cleanup_winsock();
 // Frame handling functions
 
 // UDP communication functions
-void send_connect_response(const ClientInfo *client);
-void send_ack(const ClientInfo *client, uint32_t ack_seq_num);
-void send_nack(const ClientInfo *client, uint32_t nack_seq_num);
+void send_connect_response(ClientInfo *client);
 void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t file_id, const uint8_t *final_hash, BOOL success);
 void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr);
+
 // Thread functions
 unsigned int WINAPI receive_thread_func(LPVOID lpParam);
 unsigned int WINAPI send_ack_thread_func(LPVOID lpParam);
@@ -185,62 +185,30 @@ void cleanup_winsock() {
 }
 // Sends a UDP frame to a destination address
 // Sends an RESPONSE frame back to the sender
-void send_connect_response(const ClientInfo *client) {
+void send_connect_response(ClientInfo *client) {
     UdpFrame response_frame;
     // Initialize the response frame
     memset(&response_frame, 0, sizeof(response_frame));
     // Set the header fields
     response_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     response_frame.header.frame_type = FRAME_TYPE_CONNECT_RESPONSE;
-  
+    response_frame.header.seq_num = htonl(++(client->frame_count));
+    
     response_frame.payload_data.response.session_id = htonl(client->session_id);
     response_frame.payload_data.response.session_timeout = htonl(CLIENT_TIMEOUT_SEC);
     response_frame.payload_data.response.server_status = SERVER_READY; // Assuming server is ready
-    strncpy(response_frame.payload_data.response.server_name, SERVER_NAME, sizeof(response_frame.payload_data.response.server_name) - 1);
-    response_frame.payload_data.response.server_name[sizeof(response_frame.payload_data.response.server_name) - 1] = '\0'; // Ensure null-termination
+
+    uint32_t len = sizeof(SERVER_NAME) - 1;
+    strncpy(response_frame.payload_data.response.server_name, SERVER_NAME, len);
+    response_frame.payload_data.response.server_name[len] = '\0'; // Ensure null-termination
+
     // Calculate CRC32 for the ACK frame
     response_frame.header.checksum = htonl(calculate_crc32(&response_frame, sizeof(FrameHeader) + sizeof(ConnectResponsePayload)));
     // Send the response frame
     send_frame(&response_frame, server_socket, &client->addr);
-    char dest_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(client->addr.sin_addr), dest_ip, INET_ADDRSTRLEN);
-    printf("Sending RESPONSE to %s:%d (Session ID: %u, Session Timeout: %u)\n",
-            dest_ip, ntohs(client->addr.sin_port), 
-            ntohl(response_frame.payload_data.response.session_id), 
-            ntohl(response_frame.payload_data.response.session_timeout));
+    log_sent_frame(&response_frame, &client->addr);
 }
-// Sends an ACK frame back to the sender
-void send_ack(const ClientInfo *client, uint32_t ack_seq_num) {
-    UdpFrame ack_frame;
-    // Initialize the ACK frame
-    memset(&ack_frame, 0, sizeof(ack_frame));
-    // Set the header fields
-    ack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
-    ack_frame.header.frame_type = FRAME_TYPE_ACK;
-    ack_frame.payload_data.ack_nack.ack_seq_num = htonl(ack_seq_num);
-    ack_frame.payload_data.ack_nack.session_id = htonl(client->session_id);
-    // Calculate CRC32 for the ACK frame
-    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
-    // Send the ACK frame
-    send_frame(&ack_frame, server_socket, &client->addr);
-    return;
-}
-// Sends a NACK frame back to the sender
-void send_nack(const ClientInfo *client, uint32_t nack_seq_num) {
-    UdpFrame nack_frame;
-    // Initialize the NACK frame
-    memset(&nack_frame, 0, sizeof(nack_frame));
-    // Set the header fields
-    nack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
-    nack_frame.header.frame_type = FRAME_TYPE_NACK;
-    nack_frame.payload_data.ack_nack.ack_seq_num = htonl(nack_seq_num);
-    nack_frame.payload_data.ack_nack.session_id = htonl(client->session_id);
-    // Calculate CRC32 for the NACK frame
-    nack_frame.header.checksum = htonl(calculate_crc32(&nack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
-    // Send the NACK frame
-    send_frame(&nack_frame, server_socket, &client->addr);
-    return;
-}
+
 // Sends a file transfer status frame
 void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t file_id, const uint8_t *final_hash, BOOL success) {
     UdpFrame status_frame;
@@ -262,7 +230,6 @@ void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t fil
     printf("Sending File Transfer Status for File ID %u to %s:%d: %s\n",
            file_id, dest_ip, ntohs(dest_addr->sin_port), success ? "COMPLETE" : "FAILED");
 }
-
 // Processes a received UDP frame
 void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr) {
     // Convert header fields from network byte order to host byte order
@@ -289,7 +256,7 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
         // For individual datagrams, retransmission is often handled by higher layers or ignored.
         return;
     }
-
+    log_recv_frame(frame, sender_addr);
     // Find or add client (thread-safe access)
     ClientInfo *client = NULL;
     client = find_client(sender_addr);
@@ -297,10 +264,9 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
         if (received_frame_type == FRAME_TYPE_CONNECT_REQUEST) {
             client = add_client(frame, sender_addr);
             if (client) {
-                printf("New client connected from %s:%d (ID: %u , Name: %s)\n", sender_ip, sender_port, client->client_id, client->client_name);
                 // Send CONNECT_RESPONSE
                 EnterCriticalSection(&client_list_mutex);       
-                push_queue(&client->queue_ack, received_seq_num, MAX_QUEUE_SIZE);
+                push_queue(&client->queue_ack, received_seq_num);
                 LeaveCriticalSection(&client_list_mutex);
                 send_connect_response(client);                      
             } else {
@@ -319,12 +285,6 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
         // If the received sequence number is less than or equal to the last processed
         // sequence number, it's likely a duplicate or out-of-order old packet.
         // Re-ACK it to confirm receipt on the sender's side.
-        if (received_seq_num <= client->last_received_seq) {
-            printf("Received duplicate/old frame from %s:%d (Type: %u, Seq: %u, Last Recv: %u). Re-ACKing.\n",
-                   sender_ip, sender_port, received_frame_type, received_seq_num, client->last_received_seq);
-            send_ack(client, received_seq_num); // Re-ACK duplicates
-            return;
-        }
     }
 
     // 3. Process Payload based on Frame Type
@@ -339,7 +299,7 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
             printf("\n[TEXT from %s:%d] Seq: %u, Message: \"%s\"\n",
                     sender_ip, sender_port, received_seq_num, frame->payload_data.text_msg.text_data);
             EnterCriticalSection(&client_list_mutex);
-            push_queue(&client->queue_ack, received_seq_num, MAX_QUEUE_SIZE);
+            push_queue(&client->queue_ack, received_seq_num);
             LeaveCriticalSection(&client_list_mutex);
             //send_ack(client, received_seq_num); // Acknowledge receipt
             // Optional: Route message to another client if specified
@@ -355,7 +315,7 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
             // TODO: Implement logic to buffer and reassemble long text messages.
             // This would involve a data structure similar to FileTransferContext
             // for tracking each ongoing long message assembly, along with a reassembly buffer.
-            send_ack(client, received_seq_num);
+        //    send_ack(client, received_seq_num);
             break;
         }
         // case FRAME_TYPE_FILE_METADATA_REQUEST: {
@@ -469,13 +429,13 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
         case FRAME_TYPE_DISCONNECT: {
             printf("[DISCONNECT from %s:%d] Client disconnected.\n", sender_ip, sender_port);
             remove_client(sender_addr); // Remove client from active list
-            send_ack(client, received_seq_num); // ACK the disconnect
+        //    send_ack(client, received_seq_num); // ACK the disconnect
             break;
         }
         case FRAME_TYPE_KEEP_ALIVE: {
             printf("[KEEP_ALIVE from %s:%d] Seq: %u\n", sender_ip, sender_port, received_seq_num);
             // Client's last_activity_time already updated by find_client/add_client logic.
-            send_ack(client, received_seq_num); // Acknowledge keep-alive
+        //    send_ack(client, received_seq_num); // Acknowledge keep-alive
             break;
         }
         case FRAME_TYPE_CONNECT_REQUEST:
@@ -499,7 +459,7 @@ unsigned int WINAPI receive_thread_func(LPVOID lpParam) {
         fprintf(stderr, "receive_thread_func: setsockopt SO_RCVTIMEO failed with error: %d\n", WSAGetLastError());
         // Do not exit, but log the error
     }
-
+    
     while (running) {
         int bytes_received = recvfrom(server_socket, (char*)&received_frame, sizeof(UdpFrame), 0,
                                       (SOCKADDR*)&sender_addr, &sender_addr_len);
@@ -534,8 +494,8 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
             //if queue is not empty then send acknowledge for frame sequence number
             if(!queue_empty){
                 int ack_seq_count = client->queue_ack.head;
-                send_ack(client, client->queue_ack.buffer[ack_seq_count]);
-                pop_queue(&client->queue_ack, MAX_QUEUE_SIZE);
+                send_ack_nack(FRAME_TYPE_ACK, client->queue_ack.buffer[ack_seq_count], server_socket, &client->addr);
+                pop_queue(&client->queue_ack);
             }
             LeaveCriticalSection(&client_list_mutex);
             client = NULL;
@@ -575,11 +535,12 @@ ClientInfo* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *add
     new_client->last_activity_time = time(NULL);
     new_client->client_id = ntohl(recv_frame->payload_data.request.client_id); // Simple ID assignment
     new_client->session_id = new_client->client_id + 100;
-    new_client->last_received_seq = 0; // Initialize sequence numbers
-    new_client->next_send_seq = 0;
-    new_client->protocol_ver = recv_frame->payload_data.request.protocol_ver;
-    strncpy(new_client->client_name, recv_frame->payload_data.request.client_name, sizeof(new_client->client_name) - 1);
-    new_client->client_name[sizeof(new_client->client_name) - 1] = '\0';
+    new_client->flags = recv_frame->payload_data.request.flags;
+    new_client->frame_count = 0;
+    uint32_t len = sizeof(recv_frame->payload_data.request.client_name) - 1;
+    strncpy(new_client->client_name, recv_frame->payload_data.request.client_name, len);
+    new_client->client_name[len] = '\0';
+
     new_client->queue_ack.head = 0;
     new_client->queue_ack.tail = 0;
     num_connected_clients++;

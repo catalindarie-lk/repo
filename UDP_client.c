@@ -19,45 +19,56 @@
 #define MAX_PAYLOAD_SIZE    1024        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define RECV_TIMEOUT_MS     100         // Timeout for recvfrom in milliseconds in the receive thread
-#define CLIENT_TIMEOUT_SEC  3000        // Seconds after which an inactive client is considered disconnected
 #define FILE_TRANSFER_TIMEOUT_SEC 60    // Seconds after which a stalled file transfer is cleaned up
-#define CLIENT_ID 11 // Example client ID, can be set dynamically
-#define CLIENT_NAME "lkdc UDP Text/File Transfer Client"
+#define CLIENT_ID           11          // Example client ID, can be set dynamically
+#define CLIENT_NAME         "lkdc UDP Text/File Transfer Client"
+
+typedef enum{
+    DISCONNECTED = 0,
+    CONNECTED = 1
+}SessionStatus;
 
 typedef struct{ 
-   uint32_t connection_id;
-   uint32_t session_timeout;
-   uint32_t frame_count;
+    uint32_t session_id;        // session id received from the server after connection accepted
+    uint8_t session_status;     // 0-DISCONNECTED; 1-CONNECTED
+    uint8_t server_status;      // 0-NOK; 1-OK (connection confirmed by server)
+    uint32_t session_timeout;   // timeout received from the server; to be used to send KEEP_ALIVE frames
+    uint32_t frame_count;       // this will be sent as seq_num
+
+    char server_name[NAME_SIZE];       // Human readable server name
+    Queue queue_ack;            // Queue for frames to be ack by the server
+
 } SessionInfo;
 
 typedef struct{
-   SOCKET  client_socket;
-   struct sockaddr_in server_addr;
-   uint32_t client_id;
-   uint8_t protocol_ver;
-   char client_name[64];  
+    SOCKET client_socket;
+    struct sockaddr_in server_addr;
+    uint32_t client_id;
+    uint8_t flags;
+    char client_name[NAME_SIZE];
 } ClientInfo;
 
 ClientInfo client_info;
 SessionInfo session_info;
-volatile unsigned int running = 1;  
+const char *server_ip = "127.0.0.1"; // loopback address
+volatile unsigned int running = 1;
 
 // --- Function Prototypes ---
 void init_winsock();
 void cleanup_winsock();
-uint32_t calculate_crc32(const void *data, size_t len); // Changed to CRC32
-BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 
 int init_client_info();
 void send_connect_request(const ClientInfo *client_info, SessionInfo* session_info);
 void send_text_message(const char* text_data, const ClientInfo *client_info, SessionInfo* session_info);
 unsigned int WINAPI receive_thread_func(LPVOID lpParam);
+//void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *server_addr);
 
 int init_client_info(){
-    
-    const char *server_ip = "127.0.0.1"; // loopback address
-    strncpy(client_info.client_name, CLIENT_NAME, sizeof(CLIENT_NAME) - 1);
-    client_info.client_name[sizeof(CLIENT_NAME) - 1] = '\0'; // Ensure null termination
+
+    uint32_t len = sizeof(CLIENT_NAME) - 1;
+    strncpy(client_info.client_name, CLIENT_NAME, len);
+    client_info.client_name[len] = '\0'; // Ensure null termination
+
     client_info.client_id = CLIENT_ID;
     // Create UDP socket
     client_info.client_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -76,6 +87,9 @@ int init_client_info(){
         fprintf(stderr, "Invalid address or address not supported.\n");
         return 1;
     };
+    // Initialize session info
+    memset(&session_info, 0, sizeof(SessionInfo));
+ 
     return 0;
 }
 
@@ -106,15 +120,23 @@ int main() {
         }
     }    
     //send connection request frame to server
-    send_connect_request(&client_info, &session_info);
+//    send_connect_request(&client_info, &session_info);
 
     //send text messages to server
     while(running){
-        printf("\nMessage to send:");
-        fgets(out_message, sizeof(out_message), stdin);
-        printf("\n");
-        out_message[strcspn(out_message, "\n")] = '\0';
-        send_text_message(out_message, &client_info, &session_info);
+
+        if(session_info.session_status == DISCONNECTED){
+            send_connect_request(&client_info, &session_info);
+            printf("Attempting to connect to server...\n");
+            Sleep(1000);
+            continue;
+        }
+
+        // printf("\nMessage to send:");
+        // fgets(out_message, sizeof(out_message), stdin);
+        // printf("\n");
+        // out_message[strcspn(out_message, "\n")] = '\0';
+        // send_text_message(out_message, &client_info, &session_info);
     }
  
     if (hRecvThread) {
@@ -142,21 +164,21 @@ void send_connect_request(const ClientInfo *client_info, SessionInfo* session_in
         return;
     }
     // Initialize the connect request frame    
-    memset(&connect_request_frame, 0, sizeof(connect_request_frame));
+    memset(&connect_request_frame, 0, sizeof(UdpFrame));
     // Set the header fields
     connect_request_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     connect_request_frame.header.frame_type = FRAME_TYPE_CONNECT_REQUEST;
     connect_request_frame.header.seq_num = htonl(++(session_info->frame_count));
     connect_request_frame.payload_data.request.client_id = htonl(client_info->client_id);
-    connect_request_frame.payload_data.request.protocol_ver = client_info->protocol_ver;
+    connect_request_frame.payload_data.request.flags = client_info->flags;
+
     // Copy the client name into the payload
-    strncpy(connect_request_frame.payload_data.request.client_name, client_info->client_name, sizeof(client_info->client_name) - 1);
-    // Ensure null termination
-    connect_request_frame.payload_data.request.client_name[sizeof(client_info->client_name) - 1] = '\0';
+    uint32_t len = sizeof(client_info->client_name) - 1;
+    strncpy(connect_request_frame.payload_data.request.client_name, client_info->client_name, len);
+    connect_request_frame.payload_data.request.client_name[len] = '\0';
     // Calculate the checksum for the frame
     connect_request_frame.header.checksum = htonl(calculate_crc32(&connect_request_frame, sizeof(FrameHeader) + sizeof(ConnectRequestPayload)));
-    printf("Client Checksum: %u\n", ntohl(connect_request_frame.header.checksum));    
-    
+    log_sent_frame(&connect_request_frame, &client_info->server_addr);
     send_frame(&connect_request_frame, client_info->client_socket, &client_info->server_addr);
 };
 
@@ -171,20 +193,26 @@ void send_text_message(const char* text_data, const ClientInfo *client_info, Ses
         fprintf(stderr, "Text data exceeds maximum allowed length!\n");
         return;
     }
+    if(session_info->session_status == DISCONNECTED){
+        fprintf(stderr, "Session not yet confirmed by the served. Discarding message...");
+        return;
+    }
     // Initialize the text message frame
-    memset(&text_message_frame, 0, sizeof(text_message_frame));
+    memset(&text_message_frame, 0, sizeof(UdpFrame));
     // Set the header fields
     text_message_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     text_message_frame.header.frame_type = FRAME_TYPE_TEXT_MESSAGE;
     text_message_frame.header.seq_num = htonl(++session_info->frame_count);
+    push_queue(&session_info->queue_ack, session_info->frame_count);
+    // Set the payload fields
+    text_message_frame.payload_data.text_msg.session_id = session_info->session_id;
     text_message_frame.payload_data.text_msg.text_len = htonl(text_len);
     // Copy the text data into the payload
     strncpy(text_message_frame.payload_data.text_msg.text_data, text_data, text_len);
-    // Ensure null termination
     text_message_frame.payload_data.text_msg.text_data[text_len] = '\0';
     // Calculate the checksum for the frame
     text_message_frame.header.checksum = htonl(calculate_crc32(&text_message_frame, sizeof(FrameHeader) + sizeof(TextPayload)));
-    
+    log_sent_frame(&text_message_frame, &client_info->server_addr);
     send_frame(&text_message_frame, client_info->client_socket, &client_info->server_addr);
 };
 
@@ -198,9 +226,76 @@ void init_winsock() {
         exit(EXIT_FAILURE);
     }
 }
-
 void cleanup_winsock() {
     WSACleanup();
+}
+void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr) {
+    // Convert header fields from network byte order to host byte order
+    uint16_t received_delimiter = ntohs(frame->header.start_delimiter);
+    uint8_t  received_frame_type = frame->header.frame_type; // No byte order for uint8_t
+    uint32_t received_seq_num = ntohl(frame->header.seq_num);
+    
+    char sender_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &(sender_addr->sin_addr), sender_ip, INET_ADDRSTRLEN);
+    uint16_t sender_port = ntohs(sender_addr->sin_port);
+
+    // 1. Validate Delimiter
+    if (received_delimiter != FRAME_DELIMITER) {
+        fprintf(stderr, "Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.\n",
+                sender_ip, sender_port, received_delimiter);
+        return;
+    }
+    if(strcmp(sender_ip, server_ip) != 0){
+        fprintf(stderr, "Received frame from %s:%d: Discarding.\n", sender_ip, sender_port);
+
+    }
+    // 2. Validate Checksum
+    if (!is_checksum_valid(frame, bytes_received)) {
+        fprintf(stderr, "Received frame from %s:%d with checksum mismatch. Discarding.\n",
+                sender_ip, sender_port);
+        // Optionally send ACK for checksum mismatch if this is part of a reliable stream
+        // For individual datagrams, retransmission is often handled by higher layers or ignored.
+        return;
+    }
+    log_recv_frame(frame, sender_addr);
+    // 3. Process Payload based on Frame Type
+    switch (received_frame_type) {
+        case FRAME_TYPE_CONNECT_RESPONSE: {
+            uint32_t session_id = ntohl(frame->payload_data.response.session_id);
+            uint8_t server_status = frame->payload_data.response.server_status;
+            if(session_id == 0 || server_status == 0){
+                fprintf(stderr, "Session not established!\n");
+                session_info.session_status = DISCONNECTED;
+                break;
+            }
+            session_info.session_id = ntohl(frame->payload_data.response.session_id);
+            session_info.server_status = frame->payload_data.response.server_status;
+            session_info.session_timeout = frame->payload_data.response.session_timeout;
+            uint32_t len = sizeof(frame->payload_data.response.server_name) - 1;
+            strncpy(session_info.server_name, frame->payload_data.response.server_name, len);
+            session_info.server_name[len] = '\0';
+            session_info.session_status = CONNECTED;
+            break;
+        }
+
+        case FRAME_TYPE_ACK: {
+            uint32_t ack_seq_num = ntohl(frame->payload_data.ack_nack.ack_seq_num);
+            uint8_t flags = frame->payload_data.ack_nack.flags;
+        }
+
+        case FRAME_TYPE_DISCONNECT: {
+            break;
+        }
+        case FRAME_TYPE_KEEP_ALIVE: {
+            break;
+        }
+        case FRAME_TYPE_CONNECT_REQUEST: {
+            break;
+        }
+            
+        default:
+            break;
+    }
 }
 
 // --- Receive Thread Function ---
@@ -229,8 +324,7 @@ unsigned int WINAPI receive_thread_func(LPVOID lpParam) {
                 // For critical errors, you might set 'running = 0;' here to shut down the server.
             }
         } else if (bytes_received > 0) {
-            printf("\nbytes_received: %d\n", bytes_received);
-            //process_received_frame(&received_frame, bytes_received, &sender_addr);
+            process_received_frame(&received_frame, bytes_received, &sender_addr);
         }
     }
     printf("Receive thread exiting.\n");
