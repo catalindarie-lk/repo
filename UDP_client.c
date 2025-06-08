@@ -133,7 +133,7 @@ int main() {
 
  
     int i = 0;
-    while(i < 10 && running){
+    while(i < 1000 && running){
         
         if(session_info.session_status == DISCONNECTED){
             send_connect_request(&client_info, &session_info);
@@ -147,10 +147,11 @@ int main() {
         // fgets(out_message, sizeof(out_message), stdin);
         // printf("\n");
         // out_message[strcspn(out_message, "\n")] = '\0';
+        out_message[0] = '\0'; // Clear the buffer
         strcpy(out_message, "client message"); // Clear the buffer
         send_text_message(out_message, &client_info, &session_info);
         i++;
-        Sleep(100); // Simulate some delay between messages
+        Sleep(1); // Simulate some delay between messages
         
     }
  
@@ -251,7 +252,17 @@ void send_text_message(const char* text_data, const ClientInfo *client_info, Ses
     // Calculate the checksum for the frame
     text_message_frame.header.checksum = htonl(calculate_crc32(&text_message_frame, sizeof(FrameHeader) + sizeof(TextPayload)));
     log_sent_frame(&text_message_frame, &client_info->server_addr);
-    send_frame(&text_message_frame, client_info->client_socket, &client_info->server_addr);
+    int sent_bytes = send_frame(&text_message_frame, client_info->client_socket, &client_info->server_addr);
+    if(sent_bytes == SEND_FRAME_ERROR){
+        fprintf(stderr, "Failed to send text message frame.\n");
+        return;
+    } else if(sent_bytes != sizeof(text_message_frame)) {
+        fprintf(stderr, "Warning: Sent bytes (%d) do not match expected size (%zu) for text message frame.\n",
+                sent_bytes, sizeof(text_message_frame));
+        return;
+    }
+
+    return; // Successfully sent the text message frame
 };
 
 // --- Helper Functions ---

@@ -10,7 +10,7 @@
 
 #define MAX_PAYLOAD_SIZE    1024        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
-#define QUEUE_BUFFER_SIZE   2048        // Queue buffer size
+#define QUEUE_BUFFER_SIZE   4096        // Queue buffer size
 #define NAME_SIZE           64
 #define SEND_FRAME_ERROR    -1
 
@@ -293,6 +293,7 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
         return SEND_FRAME_ERROR;
         fprintf(stderr, "sendto failed with error: %d\n", WSAGetLastError());
     }
+    fprintf(stdout, "\nSent %d bytes to %s:%d\n", bytes_sent, inet_ntoa(dest_addr->sin_addr), ntohs(dest_addr->sin_port));
     return bytes_sent; // Indicate success
 }
 // Sends an ACK/NACK frame back to the sender

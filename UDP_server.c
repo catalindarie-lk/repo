@@ -64,9 +64,14 @@ CRITICAL_SECTION client_list_mutex;         // For thread-safe access to connect
 HANDLE send_ack_thread[MAX_CLIENTS];
 HANDLE process_frame_thread[MAX_CLIENTS];
 
+typedef struct{
+    UdpFrame frame; // The UDP frame to be sent
+    struct sockaddr_in src_addr; // Destination address for the frame
+    uint32_t bytes_received; // Number of bytes received for this frame
+}RecvFrameInfo;
 
 typedef struct {
-    UdpFrame buffer[QUEUE_BUFFER_SIZE];
+    RecvFrameInfo buffer[QUEUE_BUFFER_SIZE];
     uint32_t head;          
     uint32_t tail;
     HANDLE frame_event; // Event to signal when a new frame is available in the queue
@@ -82,12 +87,12 @@ void cleanup_winsock();
 // UDP communication functions
 int send_connect_response(StructClient *client);
 void send_file_transfer_status(const struct sockaddr_in *dest_addr, uint32_t file_id, const uint8_t *final_hash, BOOL success);
-void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr);
-void push_frame_queue(FrameQueue *queue, UdpFrame *frame, CRITICAL_SECTION *mutex);
-UdpFrame* pop_frame_queue(FrameQueue *queue, CRITICAL_SECTION *mutex);
+void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info);
+RecvFrameInfo pop_frame_queue(FrameQueue *queue);
 
 // Thread functions
-unsigned int WINAPI receive_thread_func(LPVOID lpParam);
+unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam);
+unsigned int WINAPI process_frame_thread_func(LPVOID lpParam);
 unsigned int WINAPI send_ack_thread_func(LPVOID lpParam);
 
 // Client management functions
@@ -100,9 +105,9 @@ int main() {
     InitializeCriticalSection(&client_list_mutex);
 
     // Initialize the frame queue buffer
-    InitializeCriticalSection(&frame_queue.mutex);
     frame_queue.head = 0;
     frame_queue.tail = 0;
+    InitializeCriticalSection(&frame_queue.mutex);
     frame_queue.frame_event = CreateEvent(NULL, FALSE, FALSE, NULL); // Manual reset event for frame queue
 
     // 1. Create Socket
@@ -132,11 +137,17 @@ int main() {
 
     printf("Server listening on port %d...\n", SERVER_PORT);
 
-    HANDLE hRecvThread = (HANDLE)_beginthreadex(NULL, 0, receive_thread_func, NULL, 0, NULL);
+    HANDLE hRecvThread = (HANDLE)_beginthreadex(NULL, 0, receive_frame_thread_func, &frame_queue, 0, NULL);
     if (hRecvThread == NULL) {
         fprintf(stderr, "Failed to create receive thread. Error: %d\n", GetLastError());
         running = 0; // Signal immediate shutdown
     }
+    HANDLE hProcessThread = (HANDLE)_beginthreadex(NULL, 0, process_frame_thread_func, &frame_queue, 0, NULL);
+    if (hRecvThread == NULL) {
+        fprintf(stderr, "Failed to create receive thread. Error: %d\n", GetLastError());
+        running = 0; // Signal immediate shutdown
+    }
+
 
     // Main server loop for general management, timeouts, and state updates
     while (running) {
@@ -210,103 +221,116 @@ int send_connect_response(StructClient *client) {
 }
 
 // Processes a received UDP frame
-void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *sender_addr) {
-    if (bytes_received < sizeof(FrameHeader)) {
-        fprintf(stderr, "Received frame too small from %s:%d. Discarding.\n",
-                inet_ntoa(sender_addr->sin_addr), ntohs(sender_addr->sin_port));
-        return; // Frame too small to be valid
-    }
-    // Extract header fields   
-    uint16_t received_delimiter = ntohs(frame->header.start_delimiter);
-    uint8_t  received_frame_type = frame->header.frame_type;
-    uint32_t received_seq_num = ntohl(frame->header.seq_num);
-    
-    char sender_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &(sender_addr->sin_addr), sender_ip, INET_ADDRSTRLEN);
-    uint16_t sender_port = ntohs(sender_addr->sin_port);
+unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
 
-    // 1. Validate Delimiter
-    if (received_delimiter != FRAME_DELIMITER) {
-        fprintf(stderr, "Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.\n",
-                sender_ip, sender_port, received_delimiter);
-        return;
-    }
-    // 2. Validate Checksum
-    if (!is_checksum_valid(frame, bytes_received)) {
-        fprintf(stderr, "Received frame from %s:%d with checksum mismatch. Discarding.\n",
-                sender_ip, sender_port);
-        // Optionally send ACK for checksum mismatch if this is part of a reliable stream
-        // For individual datagrams, retransmission is often handled by higher layers or ignored.
-        return;
-    }
-    // Log the received frame
-    log_recv_frame(frame, sender_addr);
-    // Find or add client (thread-safe access)
-    StructClient *client = NULL;
-    if(received_frame_type == FRAME_TYPE_CONNECT_REQUEST){
-        client = add_client(frame, sender_addr);
-        if (client == NULL) {
-            fprintf(stderr, "Failed to add new client from %s:%d. Max clients reached?\n", sender_ip, sender_port);
-            // Optionally send NACK indicating server full
-            return; // Do not process further if client addition failed
-        }
-    } else {
-        uint32_t received_session_id = ntohl(frame->header.session_id);
-        client = find_client(received_session_id);
-        if (client == NULL) {
-            fprintf(stderr, "Received frame from unknown client %s:%d (Type: %u, Seq: %u). Ignoring.\n",
-                    sender_ip, sender_port, received_frame_type, received_seq_num);
-            // Do not send ACK/NACK to unknown clients
-            return;
-        }
+    FrameQueue *frame_queue = (FrameQueue *)lpParam;
 
-    }
+    while(running){
 
-    // 3. Process Payload based on Frame Type
-    switch (received_frame_type) {
-        case FRAME_TYPE_CONNECT_REQUEST: {
-            // Send a connect response to the new client               
-            send_connect_response(client);
-            // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread    
-            push_queue(&client->queue_ack, received_seq_num, &client->queue_mutex);           
-            SetEvent(client->queue_event);    // Signal the send_ack_thread to process the ACK queue
-            break;
+        WaitForSingleObject(frame_queue->frame_event, INFINITE); // Wait for a frame to be available
+        RecvFrameInfo recv_frame_info = pop_frame_queue(frame_queue);
+
+        UdpFrame *frame = &recv_frame_info.frame;
+        struct sockaddr_in *src_addr = &recv_frame_info.src_addr;
+        uint32_t bytes_received = recv_frame_info.bytes_received;
+
+        // Extract header fields   
+        uint16_t received_delimiter = ntohs(frame->header.start_delimiter);
+        uint8_t  received_frame_type = frame->header.frame_type;
+        uint32_t received_seq_num = ntohl(frame->header.seq_num);
+
+        char src_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+        uint16_t src_port = ntohs(src_addr->sin_port);
+
+        // 1. Validate Delimiter
+        if (received_delimiter != FRAME_DELIMITER) {
+            fprintf(stderr, "Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.\n",
+                    src_ip, src_port, received_delimiter);
+            continue;
         }
-        case FRAME_TYPE_ACK: {
-            break;
-            //TODO: Handle ACK processing, e.g., update internal state or queues
+        // 2. Validate Checksum
+        if (!is_checksum_valid(frame, bytes_received)) {
+            fprintf(stderr, "Received frame from %s:%d with checksum mismatch. Discarding.\n",
+                    src_ip, src_port);
+            // Optionally send ACK for checksum mismatch if this is part of a reliable stream
+            // For individual datagrams, retransmission is often handled by higher layers or ignored.
+            continue;
         }
-        case FRAME_TYPE_TEXT_MESSAGE: {
-            uint32_t text_len = ntohl(frame->payload_data.text_msg.text_len);
-            // Ensure null termination for safe printing, cap at max payload size
-            if (text_len >= sizeof(frame->payload_data.text_msg.text_data)) {
-                text_len = sizeof(frame->payload_data.text_msg.text_data) - 1;
+        // Log the received frame
+        log_recv_frame(frame, src_addr);
+        // Find or add client (thread-safe access)
+        StructClient *client = NULL;
+        if(received_frame_type == FRAME_TYPE_CONNECT_REQUEST){
+            client = add_client(frame, src_addr);
+            if (client == NULL) {
+                fprintf(stderr, "Failed to add new client from %s:%d. Max clients reached?\n", src_ip, src_port);
+                // Optionally send NACK indicating server full
+                continue; // Do not process further if client addition failed
             }
-            frame->payload_data.text_msg.text_data[text_len] = '\0';
-            // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread
-            push_queue(&client->queue_ack, received_seq_num, &client->queue_mutex);
-            SetEvent(client->queue_event);    // Signal the send_ack_thread to process the ACK queue
-            // TODO: Route message to another client if specified
-            break;
+        } else {
+            uint32_t received_session_id = ntohl(frame->header.session_id);
+            client = find_client(received_session_id);
+            if (client == NULL) {
+                fprintf(stderr, "Received frame from unknown client %s:%d (Type: %u, Seq: %u). Ignoring.\n",
+                        src_ip, src_port, received_frame_type, received_seq_num);
+                // Do not send ACK/NACK to unknown clients
+                continue;
+            }
+
         }
-        case FRAME_TYPE_LONG_TEXT_MESSAGE_DATA: {
-            break;
+
+        // 3. Process Payload based on Frame Type
+        switch (received_frame_type) {
+            case FRAME_TYPE_CONNECT_REQUEST: {
+                // Send a connect response to the new client               
+                send_connect_response(client);
+                // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread    
+                push_queue(&client->queue_ack, received_seq_num, &client->queue_mutex);           
+                SetEvent(client->queue_event);    // Signal the send_ack_thread to process the ACK queue
+                break;
+            }
+            case FRAME_TYPE_ACK: {
+                break;
+                //TODO: Handle ACK processing, e.g., update internal state or queues
+            }
+            case FRAME_TYPE_TEXT_MESSAGE: {
+                uint32_t text_len = ntohl(frame->payload_data.text_msg.text_len);
+                // Ensure null termination for safe printing, cap at max payload size
+                if (text_len >= sizeof(frame->payload_data.text_msg.text_data)) {
+                    text_len = sizeof(frame->payload_data.text_msg.text_data) - 1;
+                }
+                frame->payload_data.text_msg.text_data[text_len] = '\0';
+                // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread
+                push_queue(&client->queue_ack, received_seq_num, &client->queue_mutex);
+                SetEvent(client->queue_event);    // Signal the send_ack_thread to process the ACK queue
+                // TODO: Route message to another client if specified
+                break;
+            }
+            case FRAME_TYPE_LONG_TEXT_MESSAGE_DATA: {
+                break;
+            }
+            case FRAME_TYPE_DISCONNECT: {
+                break;
+            }
+            case FRAME_TYPE_KEEP_ALIVE: {
+                break;
+            } 
+            default:
+                break;
         }
-        case FRAME_TYPE_DISCONNECT: {
-            break;
-        }
-        case FRAME_TYPE_KEEP_ALIVE: {
-            break;
-        } 
-        default:
-            break;
+
     }
+    return 0; // Properly exit the thread created by _beginthreadex
 }
 // --- Receive Thread Function ---
-unsigned int WINAPI receive_thread_func(LPVOID lpParam) {
+unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
+    
+    FrameQueue *frame_queue = (FrameQueue *)lpParam;
+ 
     UdpFrame received_frame;
-    struct sockaddr_in sender_addr;
-    int sender_addr_len = sizeof(sender_addr);
+    struct sockaddr_in src_addr;
+    int src_addr_len = sizeof(src_addr);
 
     // Set a receive timeout for the thread's socket.
     DWORD timeout = RECV_TIMEOUT_MS;
@@ -317,7 +341,7 @@ unsigned int WINAPI receive_thread_func(LPVOID lpParam) {
     
     while (running) {
         int bytes_received = recvfrom(server_socket, (char*)&received_frame, sizeof(UdpFrame), 0,
-                                      (SOCKADDR*)&sender_addr, &sender_addr_len);
+                                      (SOCKADDR*)&src_addr, &src_addr_len);
         if (bytes_received == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
             if (error_code != WSAETIMEDOUT) { // WSAETIMEDOUT is expected if no data for RECV_TIMEOUT_MS
@@ -325,7 +349,21 @@ unsigned int WINAPI receive_thread_func(LPVOID lpParam) {
                 // For critical errors, you might set 'running = 0;' here to shut down the server.
             }
         } else if (bytes_received > 0) {
-            process_received_frame(&received_frame, bytes_received, &sender_addr);
+            // Push the received frame to the frame queue
+            RecvFrameInfo received_frame_info;
+            memset(&received_frame_info, 0, sizeof(RecvFrameInfo));
+            memcpy(&received_frame_info.frame, &received_frame, sizeof(UdpFrame));
+            
+            memcpy(&received_frame_info.src_addr, &src_addr, sizeof(struct sockaddr_in));
+            
+            received_frame_info.bytes_received = bytes_received;
+            // printf("Received frame of type %u from %s:%d bytes received:%d\n",
+            //        received_frame.header.frame_type,
+            //        inet_ntoa(received_frame_info.src_addr.sin_addr), ntohs(received_frame_info.src_addr.sin_port), received_frame_info.bytes_received);
+            // log_recv_frame(&received_frame_info.frame, &src_addr);
+            push_frame_queue(frame_queue, &received_frame_info);
+            SetEvent(frame_queue->frame_event); // Signal that a new frame is available
+
         }
     }
     printf("Receive thread exiting.\n");
@@ -402,9 +440,9 @@ StructClient* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *a
     return new_client;
 }
 
-void push_frame_queue(FrameQueue *queue, UdpFrame *frame, CRITICAL_SECTION *mutex){
+void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info){
     // Check if the queue is initialized
-    if (queue == NULL || mutex == NULL) {
+    if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
         return;
     }
@@ -414,37 +452,41 @@ void push_frame_queue(FrameQueue *queue, UdpFrame *frame, CRITICAL_SECTION *mute
         return;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(mutex);
+    EnterCriticalSection(&queue->mutex);
     // Add the sequence number to the ACK queue 
-    memcpy(&queue->buffer[queue->tail], frame, sizeof(UdpFrame)); // Copy the frame to the queue
-    // fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
+    memcpy(&queue->buffer[queue->tail], recv_frame_info, sizeof(RecvFrameInfo)); // Copy the frame to the queue
     // Move the tail index forward    
     ++queue->tail;
     queue->tail %= QUEUE_BUFFER_SIZE;
     // Release the mutex after modifying the queue
-    LeaveCriticalSection(mutex);
+    LeaveCriticalSection(&queue->mutex);
     return;
 }
 // Removes element from queue head
-UdpFrame* pop_frame_queue(FrameQueue *queue, CRITICAL_SECTION *mutex){       
+RecvFrameInfo pop_frame_queue(FrameQueue *queue){       
     // Check if the queue is initialized
-    if (queue == NULL || mutex == NULL) {
+
+    RecvFrameInfo recv_frame_info;
+    memset(&recv_frame_info, 0, sizeof(RecvFrameInfo)); // Initialize the structure to zero
+
+    if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return NULL;
+        return recv_frame_info; // Return an empty RecvFrameInfo
     }
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
         printf("Frame queue is empty nothing to remove\n");
-        return NULL;
-    }
+        return recv_frame_info;
+    }    
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(mutex);
+    EnterCriticalSection(&queue->mutex);
     // Remove the sequence number from the ACK queue
-    UdpFrame *frame = &queue->buffer[queue->head]; // Get the frame at the head
-    memset(&queue->buffer[queue->head], 0, sizeof(UdpFrame)); // Clear the frame at the head
+      
+    memcpy(&recv_frame_info, &queue->buffer[queue->head], sizeof(RecvFrameInfo)); // Copy the frame from the queue
+    memset(&queue->buffer[queue->head], 0, sizeof(RecvFrameInfo)); // Clear the frame at the head
     // Move the head index forward
     ++queue->head;
     queue->head %= QUEUE_BUFFER_SIZE;
-    LeaveCriticalSection(mutex);
-    return frame;
+    LeaveCriticalSection(&queue->mutex);
+    return recv_frame_info;
 }
