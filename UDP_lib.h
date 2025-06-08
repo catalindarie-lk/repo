@@ -12,6 +12,7 @@
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_BUFFER_SIZE   2048        // Queue buffer size
 #define NAME_SIZE           64
+#define SEND_FRAME_ERROR    -1
 
 typedef enum{
     LOG_INFO, 
@@ -46,6 +47,7 @@ typedef struct {
     uint16_t start_delimiter;       // Magic number (e.g., 0xAABB)
     uint8_t  frame_type;            // Discriminator: what kind of payload is in the union
     uint32_t seq_num;               // Global sequence number for this frame from the sender
+    uint32_t session_id;            // Unique identifier for the session (e.g., client ID or session ID)
     uint32_t checksum;              // Checksum for this frame's header + active union member (CRC32 recommended)
 } FrameHeader;
 // Payload Structures for different frame types
@@ -56,14 +58,12 @@ typedef struct {
 } ConnectRequestPayload;
 
 typedef struct {
-    uint32_t session_id;        // Unique identifier assigned to the client
     uint32_t session_timeout;   // Suggested timeout period for client inactivity
     uint8_t  server_status;     // BUSY (0) READY (1) or ERR (x), etc
     char     server_name[NAME_SIZE];   // Optional: human-readable identifier
 } ConnectResponsePayload;
 
 typedef struct {
-    uint32_t session_id;
     uint32_t text_len;           // Length of the text message
     char     text_data[MAX_PAYLOAD_SIZE - sizeof(uint32_t)]; // Actual text
 } TextPayload;
@@ -122,12 +122,12 @@ typedef struct {
 void log_event(EventType event, const char* message);
 void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr);
 void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
-void push_queue(Queue *queue, uint32_t value);
-void pop_queue(Queue *queue);
+uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex);
+uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex);
 uint32_t calculate_crc32(const void *data, size_t len);
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
-void send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-void send_ack_nack(uint8_t type, uint32_t seq_num, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+void send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 // ----- Function implementations -----
 void log_event(EventType event, const char* message){
@@ -166,34 +166,51 @@ void log_event(EventType event, const char* message){
         message);
 }
 // Add element to queue tail
-void push_queue(Queue *queue, uint32_t value){
-    // Check if the queue is full before adding a new ACK
+uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex){
+    // Check if the queue is initialized
+    if (queue == NULL || mutex == NULL) {
+        fprintf(stderr, "Queue or mutex is not initialized.\n");
+        return -1;
+    }
+    // Check if the queue is full
     if((queue->tail + 1) % QUEUE_BUFFER_SIZE == queue->head){
         printf("Queue Full\n");
-        return;
+        return -1;
     }
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(mutex);
     // Add the sequence number to the ACK queue 
     queue->buffer[queue->tail] = value;
     // fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
     // Move the tail index forward    
     ++queue->tail;
     queue->tail %= QUEUE_BUFFER_SIZE;
-    return;
+    // Release the mutex after modifying the queue
+    LeaveCriticalSection(mutex);
+    return value;
 }
 // Removes element from queue head
-void pop_queue(Queue *queue){       
+uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex){       
+    // Check if the queue is initialized
+    if (queue == NULL || mutex == NULL) {
+        fprintf(stderr, "Queue or mutex is not initialized.\n");
+        return -1;
+    }
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
         printf("ACK queue is empty nothing to remove\n");
-        return;
+        return -1;
     }
-    // fprintf(stdout, "Removing ACK seq nr: Queue[%d] = %d\n", queue->head, queue->buffer[queue->head]);
-    // Reset the sequence number at the head of the queue
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(mutex);
+    uint32_t value = queue->buffer[queue->head];
+    // Remove the sequence number from the ACK queue
     queue->buffer[queue->head] = 0;
     // Move the head index forward
     ++queue->head;
     queue->head %= QUEUE_BUFFER_SIZE;
-    return;
+    LeaveCriticalSection(mutex);
+    return value;
 }
 // CRC32
 uint32_t calculate_crc32(const void *data, size_t len){
@@ -228,7 +245,7 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
 // Note: The function send_frame should be called with the correct socket and destination address
-void send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
     size_t frame_size = sizeof(FrameHeader);
     switch (frame->header.frame_type) {
@@ -273,11 +290,13 @@ void send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct soc
     int bytes_sent = sendto(src_socket, (const char*)frame, frame_size, 0,
                             (SOCKADDR*)dest_addr, sizeof(*dest_addr));
     if (bytes_sent == SOCKET_ERROR) {
+        return SEND_FRAME_ERROR;
         fprintf(stderr, "sendto failed with error: %d\n", WSAGetLastError());
     }
+    return bytes_sent; // Indicate success
 }
 // Sends an ACK/NACK frame back to the sender
-void send_ack_nack(uint8_t type, uint32_t seq_num, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+void send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame ack_frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
@@ -290,6 +309,7 @@ void send_ack_nack(uint8_t type, uint32_t seq_num, const SOCKET src_socket, cons
     ack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     ack_frame.header.frame_type = type;
     ack_frame.header.seq_num = 0;
+    ack_frame.header.session_id = htonl(session_id); // Use the session ID provided
     ack_frame.payload_data.ack_nack.ack_seq_num = htonl(seq_num);
     ack_frame.payload_data.ack_nack.flags = htonl(0);
     // Calculate CRC32 for the ACK/NACK frame
@@ -310,22 +330,25 @@ void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr){
     switch(frame->header.frame_type){
 
         case FRAME_TYPE_ACK: {
-            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
+            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
             break;
         }
         case FRAME_TYPE_CONNECT_REQUEST: {
-            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
             fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload_data.request.client_id), ntohl(frame->payload_data.request.flags), frame->payload_data.request.client_name);
             break;
         }
         case FRAME_TYPE_CONNECT_RESPONSE: {
-            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Session ID: %d\n   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_id), ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
-
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
             break;
         }
-
+       case FRAME_TYPE_TEXT_MESSAGE: {
+            fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload_data.text_msg.text_len), frame->payload_data.text_msg.text_data);
+            break;
+        }
     }  
 
 }
@@ -338,24 +361,26 @@ void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
     switch(frame->header.frame_type){
 
         case FRAME_TYPE_ACK: {
-            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
+            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
             break;
         }
         case FRAME_TYPE_CONNECT_REQUEST: {
-            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
             fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload_data.request.client_id), ntohl(frame->payload_data.request.flags), frame->payload_data.request.client_name);
             break;
         }
         case FRAME_TYPE_CONNECT_RESPONSE: {
-            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Session ID: %d\n   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_id), ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
-
+            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
             break;
         }
-
+        case FRAME_TYPE_TEXT_MESSAGE: {
+            fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload_data.text_msg.text_len), frame->payload_data.text_msg.text_data);
+            break;
+        }
     }  
-
 }
 
 

@@ -36,8 +36,9 @@ typedef struct{
     uint32_t frame_count;       // this will be sent as seq_num
 
     char server_name[NAME_SIZE];       // Human readable server name
-    Queue queue_ack;            // Queue for frames to be ack by the server
-
+    Queue queue_ack;            // Queue for frames to be ack by the client
+    HANDLE queue_event;
+    CRITICAL_SECTION queue_mutex; // Mutex for thread-safe access to the queue
 } SessionInfo;
 
 typedef struct{
@@ -50,6 +51,8 @@ typedef struct{
 
 ClientInfo client_info;
 SessionInfo session_info;
+
+
 const char *server_ip = "127.0.0.1"; // loopback address
 volatile unsigned int running = 1;
 
@@ -61,9 +64,16 @@ int init_client_info();
 void send_connect_request(const ClientInfo *client_info, SessionInfo* session_info);
 void send_text_message(const char* text_data, const ClientInfo *client_info, SessionInfo* session_info);
 unsigned int WINAPI receive_thread_func(LPVOID lpParam);
+unsigned int WINAPI send_ack_thread_func(LPVOID lpParam);
 //void process_received_frame(UdpFrame *frame, int bytes_received, const struct sockaddr_in *server_addr);
 
 int init_client_info(){
+  
+    memset(&client_info, 0, sizeof(ClientInfo));
+    memset(&session_info, 0, sizeof(SessionInfo));
+
+    InitializeCriticalSection(&session_info.queue_mutex);
+    session_info.queue_event = CreateEvent(NULL, FALSE, FALSE, NULL);
 
     uint32_t len = sizeof(CLIENT_NAME) - 1;
     strncpy(client_info.client_name, CLIENT_NAME, len);
@@ -76,7 +86,7 @@ int init_client_info(){
         fprintf(stderr, "Socket creation failed. Error: %d\n", WSAGetLastError());
         closesocket(client_info.client_socket);
         cleanup_winsock();
-        return 1;
+        return -1;
     }
     
     // Define server address
@@ -85,23 +95,19 @@ int init_client_info(){
     client_info.server_addr.sin_port = htons(SERVER_PORT);
     if (inet_pton(AF_INET, server_ip, &client_info.server_addr.sin_addr) <= 0){
         fprintf(stderr, "Invalid address or address not supported.\n");
-        return 1;
+        return -1;
     };
-    // Initialize session info
-    memset(&session_info, 0, sizeof(SessionInfo));
  
-    return 0;
+    return 1;
 }
 
 int main() {
     WSADATA wsaData;
 
-    int client_initialized = -1;
+    int client_initialized = 0;
     char out_message[255];
     HANDLE hRecvThread = NULL;
-
-    memset(&client_info, 0, sizeof(ClientInfo));
-    memset(&session_info, 0, sizeof(SessionInfo));
+    HANDLE hAckThread = NULL;
 
     // Initialize Winsock
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
@@ -112,40 +118,67 @@ int main() {
     //initialize client information
     client_initialized = init_client_info();
     //start frame receive thread
-    if(!client_initialized){
+    if(client_initialized){
         hRecvThread = (HANDLE)_beginthreadex(NULL, 0, receive_thread_func, &client_info, 0, NULL);
         if (hRecvThread == NULL) {
             fprintf(stderr, "Failed to create receive thread. Error: %d\n", GetLastError());
             running = 0; // Signal immediate shutdown
         }
+        hAckThread = (HANDLE)_beginthreadex(NULL, 0, send_ack_thread_func, NULL, 0, NULL);
+                if (hRecvThread == NULL) {
+            fprintf(stderr, "Failed to create ack thread. Error: %d\n", GetLastError());
+            running = 0; // Signal immediate shutdown
+        }
     }    
-    //send connection request frame to server
-//    send_connect_request(&client_info, &session_info);
 
-    //send text messages to server
-    while(running){
-
+ 
+    int i = 0;
+    while(i < 10 && running){
+        
         if(session_info.session_status == DISCONNECTED){
             send_connect_request(&client_info, &session_info);
             printf("Attempting to connect to server...\n");
             Sleep(1000);
-            continue;
+            continue; // Wait for the connection to be established
         }
+
 
         // printf("\nMessage to send:");
         // fgets(out_message, sizeof(out_message), stdin);
         // printf("\n");
         // out_message[strcspn(out_message, "\n")] = '\0';
-        // send_text_message(out_message, &client_info, &session_info);
+        strcpy(out_message, "client message"); // Clear the buffer
+        send_text_message(out_message, &client_info, &session_info);
+        i++;
+        Sleep(100); // Simulate some delay between messages
+        
     }
  
+    while(1){
+        printf("Press 'q' to quit...\n");
+        char c = getchar();
+        if (c == 'q' || c == 'Q') {
+            running = 0; // Signal threads to stop
+            break;
+        }
+    }
+
     if (hRecvThread) {
         // Signal the receive thread to stop and wait for it to finish
         running = 0;
         WaitForSingleObject(hRecvThread, INFINITE);
         CloseHandle(hRecvThread);
     }
+
+    if (hAckThread) {
+        // Signal the receive thread to stop and wait for it to finish
+        running = 0;
+        WaitForSingleObject(hRecvThread, INFINITE);
+        CloseHandle(hAckThread);
+    }
  
+    DeleteCriticalSection(&session_info.queue_mutex);
+    CloseHandle(session_info.queue_event);
     // Cleanup
     closesocket(client_info.client_socket);
     cleanup_winsock();
@@ -168,7 +201,8 @@ void send_connect_request(const ClientInfo *client_info, SessionInfo* session_in
     // Set the header fields
     connect_request_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     connect_request_frame.header.frame_type = FRAME_TYPE_CONNECT_REQUEST;
-    connect_request_frame.header.seq_num = htonl(++(session_info->frame_count));
+    connect_request_frame.header.seq_num = htonl(++session_info->frame_count);
+    connect_request_frame.header.session_id = 0;
     connect_request_frame.payload_data.request.client_id = htonl(client_info->client_id);
     connect_request_frame.payload_data.request.flags = client_info->flags;
 
@@ -194,18 +228,22 @@ void send_text_message(const char* text_data, const ClientInfo *client_info, Ses
         return;
     }
     if(session_info->session_status == DISCONNECTED){
-        fprintf(stderr, "Session not yet confirmed by the served. Discarding message...");
+        fprintf(stderr, "Session status yet confirmed by the served. Discarding message...");
         return;
     }
+    if(session_info->session_id == 0){
+        fprintf(stderr, "Session ID yet confirmed by the served. Discarding message...");
+        return;
+    }
+
     // Initialize the text message frame
     memset(&text_message_frame, 0, sizeof(UdpFrame));
     // Set the header fields
     text_message_frame.header.start_delimiter = htons(FRAME_DELIMITER);
     text_message_frame.header.frame_type = FRAME_TYPE_TEXT_MESSAGE;
     text_message_frame.header.seq_num = htonl(++session_info->frame_count);
-    push_queue(&session_info->queue_ack, session_info->frame_count);
+    text_message_frame.header.session_id = htonl(session_info->session_id);
     // Set the payload fields
-    text_message_frame.payload_data.text_msg.session_id = session_info->session_id;
     text_message_frame.payload_data.text_msg.text_len = htonl(text_len);
     // Copy the text data into the payload
     strncpy(text_message_frame.payload_data.text_msg.text_data, text_data, text_len);
@@ -261,21 +299,28 @@ void process_received_frame(UdpFrame *frame, int bytes_received, const struct so
     // 3. Process Payload based on Frame Type
     switch (received_frame_type) {
         case FRAME_TYPE_CONNECT_RESPONSE: {
-            uint32_t session_id = ntohl(frame->payload_data.response.session_id);
+            uint32_t session_id = ntohl(frame->header.session_id);
             uint8_t server_status = frame->payload_data.response.server_status;
             if(session_id == 0 || server_status == 0){
                 fprintf(stderr, "Session not established!\n");
                 session_info.session_status = DISCONNECTED;
                 break;
             }
-            session_info.session_id = ntohl(frame->payload_data.response.session_id);
+            session_info.session_id = session_id;
             session_info.server_status = frame->payload_data.response.server_status;
             session_info.session_timeout = frame->payload_data.response.session_timeout;
             uint32_t len = sizeof(frame->payload_data.response.server_name) - 1;
             strncpy(session_info.server_name, frame->payload_data.response.server_name, len);
             session_info.server_name[len] = '\0';
             session_info.session_status = CONNECTED;
-            break;
+            if(&session_info.queue_mutex == NULL){
+                fprintf(stderr, "Session queue mutex not initialized!\n");
+                return;
+            }
+            push_queue(&session_info.queue_ack, received_seq_num, &session_info.queue_mutex);
+            SetEvent(session_info.queue_event);    // Signal the send_ack_thread to process the ACK queue
+//            SetEvent(queue_event);
+            break; 
         }
 
         case FRAME_TYPE_ACK: {
@@ -327,6 +372,25 @@ unsigned int WINAPI receive_thread_func(LPVOID lpParam) {
             process_received_frame(&received_frame, bytes_received, &sender_addr);
         }
     }
+    printf("Receive thread exiting.\n");
+    _endthreadex(0); // Properly exit the thread created by _beginthreadex
+    return 0;
+}
+
+unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
+
+    while(running){
+        WaitForSingleObject(session_info.queue_event, INFINITE);
+        uint32_t ack_seq_num = session_info.queue_ack.buffer[session_info.queue_ack.head];
+        if(pop_queue(&session_info.queue_ack, &session_info.queue_mutex) == -1) {
+            fprintf(stderr,"ACK queue is empty nothing to remove\n");
+            continue; // Nothing to send, skip to next iteration
+        }
+        send_ack_nack(FRAME_TYPE_ACK, ack_seq_num, session_info.session_id, client_info.client_socket, &client_info.server_addr);
+    }
+
+
+
     printf("Receive thread exiting.\n");
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
     return 0;
