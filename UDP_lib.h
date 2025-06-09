@@ -12,18 +12,13 @@
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_BUFFER_SIZE   4096        // Queue buffer size
 #define NAME_SIZE           64
-#define SEND_FRAME_ERROR    -1
 
 typedef enum{
     LOG_INFO, 
     LOG_DEBUG, 
     LOG_ERROR 
 }EventType;
-// Circular queue (array of uint32_t and head/tail indexes)
-typedef struct{
-    uint32_t buffer[QUEUE_BUFFER_SIZE];       // Sequence numbers of frames that need to be ACKed
-    uint32_t head, tail;                    // Head and tail indices for the circular queue
-}Queue;
+
 // --- Frame Types (Enums for clarity) ---
 typedef enum {
     FRAME_TYPE_TEXT_MESSAGE = 1,        // Single-part text message
@@ -118,16 +113,43 @@ typedef struct {
 } UdpFrame;
 #pragma pack(pop)
 
+// Circular queue (array of uint32_t and head/tail indexes)
+typedef struct{
+    uint32_t buffer[QUEUE_BUFFER_SIZE];       // Sequence numbers of frames that need to be ACKed
+    uint32_t head, tail;                    // Head and tail indices for the circular queue
+    CRITICAL_SECTION mutex;                 // Mutex for thread-safe access to the queue
+}Queue;
+
+typedef struct{
+    UdpFrame frame; // The UDP frame to be sent
+    struct sockaddr_in src_addr; // Destination address for the frame
+    uint32_t bytes_received; // Number of bytes received for this frame
+}RecvFrameInfo;
+
+typedef struct {
+    RecvFrameInfo buffer[QUEUE_BUFFER_SIZE];
+    uint32_t head;          
+    uint32_t tail;
+    CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
+} FrameQueue;
+
 // ----- Function prototypes -----
+uint32_t calculate_crc32(const void *data, size_t len);
+BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
+
 void log_event(EventType event, const char* message);
 void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr);
 void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
+
 uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex);
 uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex);
-uint32_t calculate_crc32(const void *data, size_t len);
-BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
-int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-void send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+
+void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info);
+void pop_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_buffer);
+
+// UDP communication functions
+uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 // ----- Function implementations -----
 void log_event(EventType event, const char* message){
@@ -165,7 +187,7 @@ void log_event(EventType event, const char* message){
         event_str,
         message);
 }
-// Add element to queue tail
+
 uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex){
     // Check if the queue is initialized
     if (queue == NULL || mutex == NULL) {
@@ -189,7 +211,7 @@ uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex){
     LeaveCriticalSection(mutex);
     return value;
 }
-// Removes element from queue head
+
 uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex){       
     // Check if the queue is initialized
     if (queue == NULL || mutex == NULL) {
@@ -244,8 +266,8 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     uint32_t calculated_checksum = calculate_crc32(&temp_frame_for_checksum, bytes_received);
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
-// Note: The function send_frame should be called with the correct socket and destination address
-int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+
+uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
     size_t frame_size = sizeof(FrameHeader);
     switch (frame->header.frame_type) {
@@ -287,22 +309,21 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
             break;
     }
 
-    int bytes_sent = sendto(src_socket, (const char*)frame, frame_size, 0,
-                            (SOCKADDR*)dest_addr, sizeof(*dest_addr));
+    uint32_t bytes_sent = sendto(src_socket, (const char*)frame, frame_size, 0, (SOCKADDR*)dest_addr, sizeof(*dest_addr));
     if (bytes_sent == SOCKET_ERROR) {
-        return SEND_FRAME_ERROR;
-        fprintf(stderr, "sendto failed with error: %d\n", WSAGetLastError());
+        fprintf(stderr, "sendto() failed with error: %d\n", WSAGetLastError());
+        return SOCKET_ERROR;        
     }
     fprintf(stdout, "\nSent %d bytes to %s:%d\n", bytes_sent, inet_ntoa(dest_addr->sin_addr), ntohs(dest_addr->sin_port));
-    return bytes_sent; // Indicate success
+    return bytes_sent;
 }
-// Sends an ACK/NACK frame back to the sender
-void send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+
+uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame ack_frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
         fprintf(stderr, "Wrong frame type\n");
-        return;
+        return SOCKET_ERROR;
     }
     // Initialize the ACK/NACK frame
     memset(&ack_frame, 0, sizeof(ack_frame));
@@ -315,12 +336,15 @@ void send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t se
     ack_frame.payload_data.ack_nack.flags = htonl(0);
     // Calculate CRC32 for the ACK/NACK frame
     ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
-    // Send the ACK/NACK frame
+    
+    uint32_t bytes_sent = send_frame(&ack_frame, src_socket, dest_addr);
+    if(bytes_sent == SOCKET_ERROR){
+        fprintf(stderr, "send_ack_nack() failed\n");
+        return SOCKET_ERROR;
+    }
     log_sent_frame(&ack_frame, dest_addr);
-    send_frame(&ack_frame, src_socket, dest_addr);
-    return;
+    return bytes_sent;
 }
-
 
 void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr){
 
@@ -384,5 +408,56 @@ void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
     }  
 }
 
+void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info){
+    // Check if the queue is initialized
+    if (queue == NULL || &queue->mutex == NULL) {
+        fprintf(stderr, "Queue or mutex is not initialized.\n");
+        return;
+    }
+    // Check if the queue is full
+    if((queue->tail + 1) % QUEUE_BUFFER_SIZE == queue->head){
+        printf("Queue Full\n");
+        return;
+    }
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(&queue->mutex);
+    // Add the sequence number to the ACK queue 
+    memcpy(&queue->buffer[queue->tail], recv_frame_info, sizeof(RecvFrameInfo)); // Copy the frame to the queue
+    // Move the tail index forward    
+    ++queue->tail;
+    queue->tail %= QUEUE_BUFFER_SIZE;
+    // Release the mutex after modifying the queue
+    LeaveCriticalSection(&queue->mutex);
+    return;
+}
+// Removes element from queue head
+void pop_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_buffer){       
+    // Check if the queue is initialized
+
+    memset(recv_frame_buffer, 0, sizeof(RecvFrameInfo)); // Initialize the structure to zero
+
+    if (queue == NULL || &queue->mutex == NULL) {
+        fprintf(stderr, "Queue or mutex is not initialized.\n");
+        return; // Return an empty RecvFrameInfo
+    }
+    // Check if the queue is empty before removing a ACK
+    if (queue->head == queue->tail) {
+        fprintf(stderr,"Frame queue is empty nothing to remove\n");
+        return;
+    }    
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(&queue->mutex);
+    // Remove the sequence number from the ACK queue
+      
+    memcpy(recv_frame_buffer, &queue->buffer[queue->head], sizeof(RecvFrameInfo)); // Copy the frame from the queue
+    printf("copied bytes: %d\n", recv_frame_buffer->bytes_received);
+
+    memset(&queue->buffer[queue->head], 0, sizeof(RecvFrameInfo)); // Clear the frame at the head
+    // Move the head index forward
+    ++queue->head;
+    queue->head %= QUEUE_BUFFER_SIZE;
+    LeaveCriticalSection(&queue->mutex);
+    return;
+}
 
 #endif // _UDP_LIB_H
