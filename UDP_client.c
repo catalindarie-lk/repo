@@ -233,11 +233,11 @@ void send_connect_request(const uint32_t seq_nr, const uint32_t client_id, const
     frame.header.frame_type = FRAME_TYPE_CONNECT_REQUEST;
     frame.header.seq_num = htonl(seq_nr);
     frame.header.session_id = 0;
-    frame.payload_data.request.client_id = htonl(client_id);
-    frame.payload_data.request.flags = flags;
+    frame.payload.request.client_id = htonl(client_id);
+    frame.payload.request.flags = flags;
 
-    strncpy(frame.payload_data.request.client_name, client_name, NAME_SIZE - 1);
-    frame.payload_data.request.client_name[NAME_SIZE - 1] = '\0';
+    strncpy(frame.payload.request.client_name, client_name, NAME_SIZE - 1);
+    frame.payload.request.client_name[NAME_SIZE - 1] = '\0';
 
     // Calculate the checksum for the frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(ConnectRequestPayload)));
@@ -265,10 +265,10 @@ void send_text_message(const uint32_t seq_nr, const uint32_t session_id, const c
     frame.header.seq_num = htonl(seq_nr);
     frame.header.session_id = htonl(session_id);
     // Set the payload fields
-    frame.payload_data.text_msg.text_len = htonl(len);
+    frame.payload.text_msg.text_len = htonl(len);
     // Copy the text data into the payload
-    strncpy(frame.payload_data.text_msg.text_data, text, len);
-    frame.payload_data.text_msg.text_data[len] = '\0';
+    strncpy(frame.payload.text_msg.text_data, text, len);
+    frame.payload.text_msg.text_data[len] = '\0';
     // Calculate the checksum for the frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(TextPayload)));  
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
@@ -311,7 +311,10 @@ unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
             memcpy(&frame_data.frame, &received_frame, sizeof(UdpFrame));
             memcpy(&frame_data.src_addr, &src_addr, sizeof(struct sockaddr_in));          
             frame_data.bytes_received = bytes_received;
-            push_frame_queue(&client->frame_queue, &frame_data);
+            if(push_frame(&client->frame_queue, &frame_data) == -1){
+                continue;
+            };
+
         }
     }
     fprintf(stdout, "Receive frame thread exiting.\n");
@@ -331,7 +334,9 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
         }
           
         FrameData frame_data;
-        pop_frame_queue(&client->frame_queue, &frame_data);     
+        if(pop_frame(&client->frame_queue, &frame_data) == -1){
+            continue;
+        };     
 
         UdpFrame *frame = &frame_data.frame;
         struct sockaddr_in *src_addr = &frame_data.src_addr;
@@ -368,26 +373,29 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
         switch (received_frame_type) {
             case FRAME_TYPE_CONNECT_RESPONSE: {
                 uint32_t session_id = ntohl(frame->header.session_id);
-                uint8_t server_status = frame->payload_data.response.server_status;
+                uint8_t server_status = frame->payload.response.server_status;
                 if(session_id == 0 || server_status == 0){
                     fprintf(stderr, "Session not established!\n");
                     client->session_status = DISCONNECTED;
                     break;
                 }
                 client->session_id = session_id;
-                client->server_status = frame->payload_data.response.server_status;
-                client->session_timeout = frame->payload_data.response.session_timeout;
-                uint32_t len = sizeof(frame->payload_data.response.server_name) - 1;
-                strncpy(client->server_name, frame->payload_data.response.server_name, len);
+                client->server_status = frame->payload.response.server_status;
+                client->session_timeout = frame->payload.response.session_timeout;
+                uint32_t len = sizeof(frame->payload.response.server_name) - 1;
+                strncpy(client->server_name, frame->payload.response.server_name, len);
                 client->server_name[len] = '\0';
                 client->session_status = CONNECTED;
-                push_queue(&client->queue_ack, received_seq_num, &client->queue_ack.mutex); // Add the sequence number to the ACK queue
+                if(push_seq_num(&client->queue_ack, received_seq_num) == 1){
+                    break;
+                };
+                //TODO:
                 break; 
             }
 
             case FRAME_TYPE_ACK: {
-                uint32_t ack_seq_num = ntohl(frame->payload_data.ack_nack.ack_seq_num);
-                uint8_t flags = frame->payload_data.ack_nack.flags;
+                uint32_t ack_seq_num = ntohl(frame->payload.ack_nack.ack_seq_num);
+                uint8_t flags = frame->payload.ack_nack.flags;
                 break;
             }
 
@@ -418,8 +426,7 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
             continue; // Re-check the queue after waking up
         }
         uint32_t ack_seq_num = client->queue_ack.buffer[client->queue_ack.head];
-        if(pop_queue(&client->queue_ack, &client->queue_ack.mutex) == -1) {
-            fprintf(stderr,"ACK queue is empty nothing to remove\n");
+        if(pop_seq_num(&client->queue_ack) == -1) {
             continue; // Nothing to send, skip to next iteration
         }
         send_ack_nack(FRAME_TYPE_ACK, ack_seq_num, client->session_id, client->socket, &client->server_addr);

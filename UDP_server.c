@@ -207,11 +207,11 @@ void send_connect_response(const uint_least32_t seq_nr, const uint32_t session_i
     frame.header.seq_num = htonl(seq_nr);
     frame.header.session_id = htonl(session_id); // Use client's session ID
 
-    frame.payload_data.response.session_timeout = htonl(session_timeout);
-    frame.payload_data.response.server_status = server_status;
+    frame.payload.response.session_timeout = htonl(session_timeout);
+    frame.payload.response.server_status = server_status;
 
-    strncpy(frame.payload_data.response.server_name, server_name, NAME_SIZE - 1);
-    frame.payload_data.response.server_name[NAME_SIZE - 1] = '\0';
+    strncpy(frame.payload.response.server_name, server_name, NAME_SIZE - 1);
+    frame.payload.response.server_name[NAME_SIZE - 1] = '\0';
 
     // Calculate CRC32 for the ACK frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(ConnectResponsePayload)));
@@ -255,12 +255,12 @@ StructClient* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *c
     memset(new_client, 0, sizeof(StructClient));
     memcpy(&new_client->client_addr, client_addr, sizeof(struct sockaddr_in));
     new_client->last_activity_time = time(NULL);
-    new_client->client_id = ntohl(recv_frame->payload_data.request.client_id); // Simple ID assignment
+    new_client->client_id = ntohl(recv_frame->payload.request.client_id); // Simple ID assignment
     new_client->session_id = ++server.unique_session_id; // Assign a unique session ID based on current count
-    new_client->flags = recv_frame->payload_data.request.flags;
+    new_client->flags = recv_frame->payload.request.flags;
     new_client->srv_to_client_frame_count = 0;
  
-    strncpy(new_client->client_name, recv_frame->payload_data.request.client_name, sizeof(NAME_SIZE - 1));
+    strncpy(new_client->client_name, recv_frame->payload.request.client_name, sizeof(NAME_SIZE - 1));
     new_client->client_name[NAME_SIZE - 1] = '\0';
 
     printf("\n[ADDING NEW CLIENT] %s:%d Session ID:%d\n", inet_ntoa(client_addr->sin_addr), ntohs(client_addr->sin_port), new_client->session_id);
@@ -307,7 +307,9 @@ unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
             memcpy(&frame_data.frame, &received_frame, sizeof(UdpFrame));
             memcpy(&frame_data.src_addr, &src_addr, sizeof(struct sockaddr_in));
             frame_data.bytes_received = bytes_received;
-            push_frame_queue(&server->frame_queue, &frame_data);
+            if(push_frame(&server->frame_queue, &frame_data) == -1){
+                continue;
+            };
         }
     }
     printf("Exit receive_frame_thread...\n");
@@ -328,7 +330,9 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
         // Pop a frame from the queue
         FrameData frame_data;
         
-        pop_frame_queue(&server->frame_queue, &frame_data);
+        if(pop_frame(&server->frame_queue, &frame_data) == -1){
+            continue;
+        };
 
         UdpFrame *frame = &frame_data.frame;
         struct sockaddr_in *src_addr = &frame_data.src_addr;
@@ -371,7 +375,9 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
             // Send a connect response to the new client               
             send_connect_response(++client->srv_to_client_frame_count, client->session_id, server->session_timeout, server->server_status, server->server_name, server->socket, &client->client_addr);
             // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread    
-            push_queue(&client->queue_ack, received_seq_num, &client->queue_ack.mutex);    
+            if(push_seq_num(&client->queue_ack, received_seq_num) == -1){
+                continue;
+            };    
         } else {
             uint32_t received_session_id = ntohl(frame->header.session_id);
             client = find_client(received_session_id);
@@ -393,14 +399,16 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
                 //TODO: Handle ACK processing, e.g., update internal state or queues
             }
             case FRAME_TYPE_TEXT_MESSAGE: {
-                uint32_t text_len = ntohl(frame->payload_data.text_msg.text_len);
+                uint32_t text_len = ntohl(frame->payload.text_msg.text_len);
                 // Ensure null termination for safe printing, cap at max payload size
-                if (text_len >= sizeof(frame->payload_data.text_msg.text_data)) {
-                    text_len = sizeof(frame->payload_data.text_msg.text_data) - 1;
+                if (text_len >= sizeof(frame->payload.text_msg.text_data)) {
+                    text_len = sizeof(frame->payload.text_msg.text_data) - 1;
                 }
-                frame->payload_data.text_msg.text_data[text_len] = '\0';
+                frame->payload.text_msg.text_data[text_len] = '\0';
                 // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread
-                push_queue(&client->queue_ack, received_seq_num, &client->queue_ack.mutex);
+                if(push_seq_num(&client->queue_ack, received_seq_num) == -1){
+                    break;
+                };
                 // TODO: Route message to another client if specified
                 break;
             }
@@ -431,8 +439,7 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
             continue; // Re-check the queue after waking up
         }
         uint32_t ack_seq_num = client->queue_ack.buffer[client->queue_ack.head];
-        if(pop_queue(&client->queue_ack, &client->queue_ack.mutex) == -1) {
-            fprintf(stderr,"ACK queue is empty nothing to remove\n");
+        if(pop_seq_num(&client->queue_ack) == -1) {
             continue; // Nothing to send, skip to next iteration
         }
         send_ack_nack(FRAME_TYPE_ACK, ack_seq_num, client->session_id, server.socket, &client->client_addr);

@@ -10,7 +10,7 @@
 
 #define MAX_PAYLOAD_SIZE    1024        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
-#define QUEUE_BUFFER_SIZE   4096        // Queue buffer size
+#define QUEUE_SIZE          4096        // Queue buffer size
 #define NAME_SIZE           64
 
 typedef enum{
@@ -109,13 +109,13 @@ typedef struct {
         AckNackPayload ack_nack;                // Acknowledgment or Negative Acknowledgment    
         FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
-    } payload_data;
+    } payload;
 } UdpFrame;
 #pragma pack(pop)
 
 // Circular queue (array of uint32_t and head/tail indexes)
 typedef struct{
-    uint32_t buffer[QUEUE_BUFFER_SIZE];       // Sequence numbers of frames that need to be ACKed
+    uint32_t buffer[QUEUE_SIZE];       // Sequence numbers of frames that need to be ACKed
     uint32_t head, tail;                    // Head and tail indices for the circular queue
     CRITICAL_SECTION mutex;                 // Mutex for thread-safe access to the queue
 }Queue;
@@ -127,7 +127,7 @@ typedef struct{
 }FrameData;
 
 typedef struct {
-    FrameData frame_data[QUEUE_BUFFER_SIZE];
+    FrameData frame_data[QUEUE_SIZE];
     uint32_t head;          
     uint32_t tail;
     CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
@@ -141,11 +141,11 @@ void log_event(EventType event, const char* message);
 void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr);
 void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
 
-uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex);
-uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex);
+uint32_t push_seq_num(Queue *queue, uint32_t value);
+uint32_t pop_seq_num(Queue *queue);
 
-void push_frame_queue(FrameQueue *queue, FrameData *frame_data);
-void pop_frame_queue(FrameQueue *queue, FrameData *frame_Data);
+uint32_t push_frame(FrameQueue *queue, FrameData *frame_data);
+uint32_t pop_frame(FrameQueue *queue, FrameData *frame_Data);
 
 // UDP communication functions
 uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
@@ -188,33 +188,33 @@ void log_event(EventType event, const char* message){
         message);
 }
 
-uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex){
+uint32_t push_seq_num(Queue *queue, uint32_t seq_num){
     // Check if the queue is initialized
-    if (queue == NULL || mutex == NULL) {
+    if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
         return -1;
     }
     // Check if the queue is full
-    if((queue->tail + 1) % QUEUE_BUFFER_SIZE == queue->head){
+    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
         printf("Queue Full\n");
         return -1;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(mutex);
+    EnterCriticalSection(&queue->mutex);
     // Add the sequence number to the ACK queue 
-    queue->buffer[queue->tail] = value;
+    queue->buffer[queue->tail] = seq_num;
     // fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
     // Move the tail index forward    
     ++queue->tail;
-    queue->tail %= QUEUE_BUFFER_SIZE;
+    queue->tail %= QUEUE_SIZE;
     // Release the mutex after modifying the queue
-    LeaveCriticalSection(mutex);
-    return value;
+    LeaveCriticalSection(&queue->mutex);
+    return seq_num;
 }
 
-uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex){       
+uint32_t pop_seq_num(Queue *queue){       
     // Check if the queue is initialized
-    if (queue == NULL || mutex == NULL) {
+    if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
         return -1;
     }
@@ -224,15 +224,15 @@ uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex){
         return -1;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(mutex);
-    uint32_t value = queue->buffer[queue->head];
+    EnterCriticalSection(&queue->mutex);
+    uint32_t seq_num = queue->buffer[queue->head];
     // Remove the sequence number from the ACK queue
     queue->buffer[queue->head] = 0;
     // Move the head index forward
     ++queue->head;
-    queue->head %= QUEUE_BUFFER_SIZE;
-    LeaveCriticalSection(mutex);
-    return value;
+    queue->head %= QUEUE_SIZE;
+    LeaveCriticalSection(&queue->mutex);
+    return seq_num;
 }
 // CRC32
 uint32_t calculate_crc32(const void *data, size_t len){
@@ -332,8 +332,8 @@ uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_
     ack_frame.header.frame_type = type;
     ack_frame.header.seq_num = 0;
     ack_frame.header.session_id = htonl(session_id); // Use the session ID provided
-    ack_frame.payload_data.ack_nack.ack_seq_num = htonl(seq_num);
-    ack_frame.payload_data.ack_nack.flags = htonl(0);
+    ack_frame.payload.ack_nack.ack_seq_num = htonl(seq_num);
+    ack_frame.payload.ack_nack.flags = htonl(0);
     // Calculate CRC32 for the ACK/NACK frame
     ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
     
@@ -356,22 +356,22 @@ void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr){
 
         case FRAME_TYPE_ACK: {
             fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload.ack_nack.ack_seq_num), frame->payload.ack_nack.flags);
             break;
         }
         case FRAME_TYPE_CONNECT_REQUEST: {
             fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload_data.request.client_id), ntohl(frame->payload_data.request.flags), frame->payload_data.request.client_name);
+            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flags), frame->payload.request.client_name);
             break;
         }
         case FRAME_TYPE_CONNECT_RESPONSE: {
             fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
+            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload.response.session_timeout), frame->payload.response.server_status, frame->payload.response.server_name);
             break;
         }
        case FRAME_TYPE_TEXT_MESSAGE: {
             fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload_data.text_msg.text_len), frame->payload_data.text_msg.text_data);
+            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.text_len), frame->payload.text_msg.text_data);
             break;
         }
     }  
@@ -387,37 +387,37 @@ void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
 
         case FRAME_TYPE_ACK: {
             fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload_data.ack_nack.ack_seq_num), frame->payload_data.ack_nack.flags);
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload.ack_nack.ack_seq_num), frame->payload.ack_nack.flags);
             break;
         }
         case FRAME_TYPE_CONNECT_REQUEST: {
             fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload_data.request.client_id), ntohl(frame->payload_data.request.flags), frame->payload_data.request.client_name);
+            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flags), frame->payload.request.client_name);
             break;
         }
         case FRAME_TYPE_CONNECT_RESPONSE: {
             fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload_data.response.session_timeout), frame->payload_data.response.server_status, frame->payload_data.response.server_name);
+            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload.response.session_timeout), frame->payload.response.server_status, frame->payload.response.server_name);
             break;
         }
         case FRAME_TYPE_TEXT_MESSAGE: {
             fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload_data.text_msg.text_len), frame->payload_data.text_msg.text_data);
+            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.text_len), frame->payload.text_msg.text_data);
             break;
         }
     }  
 }
 
-void push_frame_queue(FrameQueue *queue, FrameData *frame_data){
+uint32_t push_frame(FrameQueue *queue, FrameData *frame_data){
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return;
+        return -1;
     }
     // Check if the queue is full
-    if((queue->tail + 1) % QUEUE_BUFFER_SIZE == queue->head){
+    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
         printf("Queue Full\n");
-        return;
+        return -1;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
     EnterCriticalSection(&queue->mutex);
@@ -425,35 +425,33 @@ void push_frame_queue(FrameQueue *queue, FrameData *frame_data){
     memcpy(&queue->frame_data[queue->tail], frame_data, sizeof(FrameData)); // Copy the frame to the queue
     // Move the tail index forward    
     ++queue->tail;
-    queue->tail %= QUEUE_BUFFER_SIZE;
+    queue->tail %= QUEUE_SIZE;
     // Release the mutex after modifying the queue
     LeaveCriticalSection(&queue->mutex);
-    return;
+    return 0;
 }
 // Removes element from queue head
-void pop_frame_queue(FrameQueue *queue, FrameData *frame_data){       
+uint32_t pop_frame(FrameQueue *queue, FrameData *frame_data){       
     // Check if the queue is initialized
-
-    memset(frame_data, 0, sizeof(FrameData)); // Initialize the structure to zero
-
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return; // Return an empty RecvFrameInfo
+        return -1; // Return an empty RecvFrameInfo
     }
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
         fprintf(stderr,"Frame queue is empty nothing to remove\n");
-        return;
-    }    
+        return -1;
+    }
+    memset(frame_data, 0, sizeof(FrameData)); // Initialize the structure to zero
     // Acquire the mutex to ensure thread-safe access to the queue
     EnterCriticalSection(&queue->mutex);
     memcpy(frame_data, &queue->frame_data[queue->head], sizeof(FrameData)); // Copy the frame from the queue
     memset(&queue->frame_data[queue->head], 0, sizeof(FrameData)); // Clear the frame at the head
     // Move the head index forward
     ++queue->head;
-    queue->head %= QUEUE_BUFFER_SIZE;
+    queue->head %= QUEUE_SIZE;
     LeaveCriticalSection(&queue->mutex);
-    return;
+    return 0;
 }
 
 #endif // _UDP_LIB_H
