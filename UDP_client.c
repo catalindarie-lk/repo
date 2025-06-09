@@ -32,7 +32,7 @@ typedef uint8_t ClientStatus;
 enum ClientStatus {
     CLIENT_STOP = 0,
     CLIENT_READY = 1,
-    CLIENT_ERROR_ = 2,
+    CLIENT_ERROR = 2,
     CLIENT_BUSY = 3
 };
 
@@ -69,8 +69,8 @@ const char *server_ip = "127.0.0.1"; // loopback address
 volatile unsigned int running = 1;
 
 // --- Function prototypes ---
-uint32_t send_connect_request(const uint32_t seq_nr, const uint32_t client_id, const uint32_t flags, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-uint32_t send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+void send_connect_request(const uint32_t seq_nr, const uint32_t client_id, const uint32_t flags, const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+void send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam);
 unsigned int WINAPI process_frame_thread_func(LPVOID lpParam);
@@ -147,21 +147,20 @@ void start_threads(StructClient *client){
 }    
 void shutdown_client(StructClient *client){
 
-   if (client->recieve_frame_thread) {
+    client->client_status = CLIENT_STOP;
+
+    if (client->recieve_frame_thread) {
         // Signal the receive thread to stop and wait for it to finish
-        running = 0;
         WaitForSingleObject(client->recieve_frame_thread, INFINITE);
         CloseHandle(client->recieve_frame_thread);
     }
     if (client->process_frame_thread) {
         // Signal the receive thread to stop and wait for it to finish
-        running = 0;
         WaitForSingleObject(client->process_frame_thread, INFINITE);
         CloseHandle(client->process_frame_thread);
     }
     if (client->send_ack_thread) {
         // Signal the receive thread to stop and wait for it to finish
-        running = 0;
         WaitForSingleObject(client->send_ack_thread, INFINITE);
         CloseHandle(client->send_ack_thread);
     }
@@ -186,11 +185,11 @@ int main() {
     start_threads(&client);
 
     int i = 0;
-    while(i < 3 && running){
+    while(i < 3 && client.client_status == CLIENT_READY){
         
         if(client.session_status == DISCONNECTED){
 
-            send_connect_request(++client.frame_count, client.client_id, client.flags, client.socket, &client.server_addr);
+            send_connect_request(++client.frame_count, client.client_id, client.flags, client.client_name, client.socket, &client.server_addr);
             printf("Attempting to connect to server...\n");
             Sleep(1000);
             continue; // Wait for the connection to be established
@@ -207,12 +206,13 @@ int main() {
         
     }
  
-    while(client.session_status == CONNECTED){
+    while (client.session_status == CONNECTED) {
+
         printf("Press 'q' to quit...\n");
         char c = getchar();
         if (c == 'q' || c == 'Q') {
-            client.session_status = DISCONNECTED; // Signal threads to stop
-            client.client_status = CLIENT_STOP;
+            client.session_status = DISCONNECTED;
+            client.client_status = CLIENT_STOP; // Signal threads to stop
             break;
         }
         Sleep(10); // Prevent busy-waiting
@@ -223,10 +223,9 @@ int main() {
 
 // --- Function implementations ---
 // --- Send connect request ---
-uint32_t send_connect_request(const uint32_t seq_nr, const uint32_t client_id, const uint32_t flags, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+void send_connect_request(const uint32_t seq_nr, const uint32_t client_id, const uint32_t flags, const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Create a connect request frame
     UdpFrame frame;
-
     // Initialize the connect request frame    
     memset(&frame, 0, sizeof(UdpFrame));
     // Set the header fields
@@ -237,26 +236,27 @@ uint32_t send_connect_request(const uint32_t seq_nr, const uint32_t client_id, c
     frame.payload_data.request.client_id = htonl(client_id);
     frame.payload_data.request.flags = flags;
 
+    strncpy(frame.payload_data.request.client_name, client_name, NAME_SIZE - 1);
+    frame.payload_data.request.client_name[NAME_SIZE - 1] = '\0';
+
     // Calculate the checksum for the frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(ConnectRequestPayload)));
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_connect_request() failed\n");
-        return SOCKET_ERROR;
+        return;
     }
     log_sent_frame(&frame, dest_addr);
-    return bytes_sent;
+    return;
 };
 // --- Send text message ---
-uint32_t send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+void send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
 
     UdpFrame frame;
-
     if(text == NULL){
         fprintf(stderr, "Invalid text!.\n");
-        return SOCKET_ERROR;
+        return;
     }
-
     // Initialize the text message frame
     memset(&frame, 0, sizeof(UdpFrame));
     // Set the header fields
@@ -274,10 +274,10 @@ uint32_t send_text_message(const uint32_t seq_nr, const uint32_t session_id, con
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_text_message() failed\n");
-        return SOCKET_ERROR;
+        return;
     }
     log_sent_frame(&frame, dest_addr);
-    return bytes_sent;
+    return;
 };
 
 // --- Receive frame ---
@@ -295,7 +295,7 @@ unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
         // Do not exit, but log the error
     }
 
-    while (client->client_status = CLIENT_READY) {
+    while (client->client_status == CLIENT_READY) {
         int bytes_received = recvfrom(client->socket, (char*)&received_frame, sizeof(UdpFrame), 0, (SOCKADDR*)&src_addr, &src_addr_len);
 
         if (bytes_received == SOCKET_ERROR) {
@@ -306,12 +306,12 @@ unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
             }
         } else if (bytes_received > 0) {
             // Push the received frame to the frame queue
-            RecvFrameInfo received_frame_info;
-            memset(&received_frame_info, 0, sizeof(RecvFrameInfo));
-            memcpy(&received_frame_info.frame, &received_frame, sizeof(UdpFrame));
-            memcpy(&received_frame_info.src_addr, &src_addr, sizeof(struct sockaddr_in));          
-            received_frame_info.bytes_received = bytes_received;
-            push_frame_queue(&client->frame_queue, &received_frame_info);
+            FrameData frame_data;
+            memset(&frame_data, 0, sizeof(FrameData));
+            memcpy(&frame_data.frame, &received_frame, sizeof(UdpFrame));
+            memcpy(&frame_data.src_addr, &src_addr, sizeof(struct sockaddr_in));          
+            frame_data.bytes_received = bytes_received;
+            push_frame_queue(&client->frame_queue, &frame_data);
         }
     }
     fprintf(stdout, "Receive frame thread exiting.\n");
@@ -323,19 +323,19 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
 
     StructClient *client = (StructClient *)lpParam;
 
-    while(client->client_status = CLIENT_READY){
+    while(client->client_status == CLIENT_READY){
 
         if(client->frame_queue.head == client->frame_queue.tail) {
             Sleep(10); // No frames to process, yield CPU
             continue; // Re-check the queue after waking up
         }
           
-        RecvFrameInfo recv_frame_info;
-        pop_frame_queue(&client->frame_queue, &recv_frame_info);     
+        FrameData frame_data;
+        pop_frame_queue(&client->frame_queue, &frame_data);     
 
-        UdpFrame *frame = &recv_frame_info.frame;
-        struct sockaddr_in *src_addr = &recv_frame_info.src_addr;
-        uint32_t bytes_received = recv_frame_info.bytes_received;
+        UdpFrame *frame = &frame_data.frame;
+        struct sockaddr_in *src_addr = &frame_data.src_addr;
+        uint32_t bytes_received = frame_data.bytes_received;
 
         // Extract header fields   
         uint16_t received_delimiter = ntohs(frame->header.start_delimiter);
@@ -404,7 +404,7 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
                 break;
         }
     }
-    fprintf(stdout, "Process frame thread exiting...");
+    fprintf(stdout, "Process frame thread exiting...\n");
     return 0; // Properly exit the thread created by _beginthreadex
 }
 // --- Send Ack ---
@@ -412,7 +412,7 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
 
     StructClient *client = (StructClient *)lpParam;
 
-    while(client->client_status = CLIENT_READY){
+    while(client->client_status == CLIENT_READY){
         if(client->queue_ack.head == client->queue_ack.tail){
             Sleep(10); // No ACKs to send, yield CPU
             continue; // Re-check the queue after waking up

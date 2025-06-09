@@ -47,9 +47,9 @@ typedef struct {
 } FrameHeader;
 // Payload Structures for different frame types
 typedef struct {
-    uint32_t client_id;         // Unique identifier assigned by the client
-    uint8_t  flags;             // Protocol the client supports
-    char     client_name[NAME_SIZE];   // Optional: human-readable identifier
+    uint32_t client_id;             // Unique identifier of the sender
+    uint8_t  flags;                 // Protocol the client supports
+    char     client_name[NAME_SIZE];// Optional: human-readable identifier
 } ConnectRequestPayload;
 
 typedef struct {
@@ -124,10 +124,10 @@ typedef struct{
     UdpFrame frame; // The UDP frame to be sent
     struct sockaddr_in src_addr; // Destination address for the frame
     uint32_t bytes_received; // Number of bytes received for this frame
-}RecvFrameInfo;
+}FrameData;
 
 typedef struct {
-    RecvFrameInfo buffer[QUEUE_BUFFER_SIZE];
+    FrameData frame_data[QUEUE_BUFFER_SIZE];
     uint32_t head;          
     uint32_t tail;
     CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
@@ -144,8 +144,8 @@ void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
 uint32_t push_queue(Queue *queue, uint32_t value, CRITICAL_SECTION *mutex);
 uint32_t pop_queue(Queue *queue, CRITICAL_SECTION *mutex);
 
-void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info);
-void pop_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_buffer);
+void push_frame_queue(FrameQueue *queue, FrameData *frame_data);
+void pop_frame_queue(FrameQueue *queue, FrameData *frame_Data);
 
 // UDP communication functions
 uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
@@ -408,7 +408,7 @@ void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
     }  
 }
 
-void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info){
+void push_frame_queue(FrameQueue *queue, FrameData *frame_data){
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
@@ -422,7 +422,7 @@ void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info){
     // Acquire the mutex to ensure thread-safe access to the queue
     EnterCriticalSection(&queue->mutex);
     // Add the sequence number to the ACK queue 
-    memcpy(&queue->buffer[queue->tail], recv_frame_info, sizeof(RecvFrameInfo)); // Copy the frame to the queue
+    memcpy(&queue->frame_data[queue->tail], frame_data, sizeof(FrameData)); // Copy the frame to the queue
     // Move the tail index forward    
     ++queue->tail;
     queue->tail %= QUEUE_BUFFER_SIZE;
@@ -431,10 +431,10 @@ void push_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_info){
     return;
 }
 // Removes element from queue head
-void pop_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_buffer){       
+void pop_frame_queue(FrameQueue *queue, FrameData *frame_data){       
     // Check if the queue is initialized
 
-    memset(recv_frame_buffer, 0, sizeof(RecvFrameInfo)); // Initialize the structure to zero
+    memset(frame_data, 0, sizeof(FrameData)); // Initialize the structure to zero
 
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
@@ -447,12 +447,8 @@ void pop_frame_queue(FrameQueue *queue, RecvFrameInfo *recv_frame_buffer){
     }    
     // Acquire the mutex to ensure thread-safe access to the queue
     EnterCriticalSection(&queue->mutex);
-    // Remove the sequence number from the ACK queue
-      
-    memcpy(recv_frame_buffer, &queue->buffer[queue->head], sizeof(RecvFrameInfo)); // Copy the frame from the queue
-    printf("copied bytes: %d\n", recv_frame_buffer->bytes_received);
-
-    memset(&queue->buffer[queue->head], 0, sizeof(RecvFrameInfo)); // Clear the frame at the head
+    memcpy(frame_data, &queue->frame_data[queue->head], sizeof(FrameData)); // Copy the frame from the queue
+    memset(&queue->frame_data[queue->head], 0, sizeof(FrameData)); // Clear the frame at the head
     // Move the head index forward
     ++queue->head;
     queue->head %= QUEUE_BUFFER_SIZE;
