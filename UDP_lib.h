@@ -1,10 +1,16 @@
 #ifndef _UDP_LIB_H
 #define _UDP_LIB_H
-#include <time.h>       // For time functions
+
+//#define _WINSOCK_DEPRECATED_NO_WARNINGS
+
 #include <stdint.h>    // For fixed-width integer types
 #include <stdio.h>     // For printf and fprintf
 #include <string.h>    // For string manipulation functions
+#include <time.h>       // For time functions
+#include <winsock2.h>   // Primary Winsock header
 #include <ws2tcpip.h>   // For modern IP address functions (inet_pton, inet_ntop)
+#include <process.h>    // For _beginthreadex (preferred over CreateThread for CRT safety)
+#include <windows.h>    // For Windows-specific functions like CreateThread, Sleep
 
 #pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
@@ -12,31 +18,43 @@
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_SIZE          4096        // Queue buffer size
 #define NAME_SIZE           64
+#define SILENT_FRAMES       0
 
-typedef enum{
+typedef uint32_t EventType;
+enum EventType{
     LOG_INFO, 
     LOG_DEBUG, 
     LOG_ERROR 
-}EventType;
+};
 
-// --- Frame Types (Enums for clarity) ---
-typedef enum {
-    FRAME_TYPE_TEXT_MESSAGE = 1,        // Single-part text message
-    FRAME_TYPE_LONG_TEXT_MESSAGE_DATA = 2,    // Fragment of a long text message
-    FRAME_TYPE_FILE_METADATA_REQUEST = 3,     // Client requests to send a file (includes filename, size, hash)
-    FRAME_TYPE_FILE_METADATA_RESPONSE = 4,    // Server grants file transfer (assigns file_id)
-    FRAME_TYPE_FILE_DATA = 5,                 // File data fragment
-    FRAME_TYPE_ACK = 6,                       // Acknowledgment for a received frame
-    FRAME_TYPE_NACK = 7,                      // Negative Acknowledgment (request retransmission)
-    FRAME_TYPE_CONNECT_REQUEST = 8,           // Client's initial contact to server
-    FRAME_TYPE_CONNECT_RESPONSE = 9,          // Server's response to client connect
-    FRAME_TYPE_DISCONNECT = 10,               // Client requests to disconnect
-    FRAME_TYPE_KEEP_ALIVE = 11,               // Client sends periodically to maintain connection status
-    FRAME_TYPE_FILE_TRANSFER_COMPLETE = 12,   // Server confirms file transfer completion and hash verification
-    FRAME_TYPE_FILE_TRANSFER_FAILED = 13      // Server informs client of failed file transfer (e.g., hash mismatch)
-} FrameType;
-// --- UDP Frame Structures (with Union) ---
-#pragma pack(push, 1) // Using #pragma pack to ensure no padding for network transmission
+typedef uint8_t DisconnectCode;
+enum DisconnectCode{
+    DISCONNECT_REQUEST = 1,
+    DISCONNECT_TIMEOUT = 11,
+};
+
+// --- Frame Types ---
+typedef uint8_t FrameType;
+enum FrameType{
+    FRAME_TYPE_TEXT_MESSAGE = 1,                // Single-part text message
+    FRAME_TYPE_LONG_TEXT_MESSAGE_DATA = 2,      // Fragment of a long text message
+    FRAME_TYPE_FILE_METADATA_REQUEST = 3,       // Client requests to send a file (includes filename, size, hash)
+    FRAME_TYPE_FILE_METADATA_RESPONSE = 4,      // Server grants file transfer (assigns file_id)
+    FRAME_TYPE_FILE_DATA = 5,                   // File data fragment
+    FRAME_TYPE_ACK = 6,                         // Acknowledgment for a received frame
+    FRAME_TYPE_NACK = 7,                        // Negative Acknowledgment (request retransmission)
+    FRAME_TYPE_CONNECT_REQUEST = 8,             // Client's initial contact to server
+    FRAME_TYPE_CONNECT_RESPONSE = 9,            // Server's response to client connect
+    FRAME_TYPE_DISCONNECT = 10,                 // Client requests to disconnect
+
+    FRAME_TYPE_PING = 20,                       // Client sends periodically to maintain connection status
+    FRAME_TYPE_PONG = 21,
+    FRAME_TYPE_FILE_TRANSFER_COMPLETE = 30,     // Server confirms file transfer completion and hash verification
+    FRAME_TYPE_FILE_TRANSFER_FAILED = 31,       // Server informs client of failed file transfer (e.g., hash mismatch)
+};
+
+//---------------------------------------------------------------------------------------------
+#pragma pack(push, 1) 
 // Common Header for all frames
 typedef struct {
     uint16_t start_delimiter;       // Magic number (e.g., 0xAABB)
@@ -48,7 +66,7 @@ typedef struct {
 // Payload Structures for different frame types
 typedef struct {
     uint32_t client_id;             // Unique identifier of the sender
-    uint8_t  flags;                 // Protocol the client supports
+    uint8_t  flag;                 // Protocol the client supports
     char     client_name[NAME_SIZE];// Optional: human-readable identifier
 } ConnectRequestPayload;
 
@@ -59,8 +77,8 @@ typedef struct {
 } ConnectResponsePayload;
 
 typedef struct {
-    uint32_t text_len;           // Length of the text message
-    char     text_data[MAX_PAYLOAD_SIZE - sizeof(uint32_t)]; // Actual text
+    uint32_t len;           // Length of the text message
+    char     text[MAX_PAYLOAD_SIZE - sizeof(uint32_t)]; // Actual text
 } TextPayload;
 
 typedef struct {
@@ -86,9 +104,18 @@ typedef struct {
 } FileDataPayload;
 
 typedef struct {
-    uint32_t ack_seq_num;       // Acknowledged sequence number of the frame being acknowledged
-    uint8_t flags;             // For future use
-} AckNackPayload;
+    uint32_t seq_num;       // Acknowledged sequence number of the frame being acknowledged
+    uint8_t flag;             // For future use
+} AckNakPayload;
+
+typedef struct {
+    uint8_t flag;
+}DisconnectPayload;
+
+typedef struct{
+    uint32_t ack_num;
+    uint8_t flag;
+}PingPongPayload;
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
@@ -106,19 +133,20 @@ typedef struct {
         LongTextPayload long_text_msg;          // Fragment of a long text message
         FileMetadataPayload file_metadata;      // File metadata request/response
         FileDataPayload file_data;                  // File data fragment
-        AckNackPayload ack_nack;                // Acknowledgment or Negative Acknowledgment    
+        AckNakPayload ack_nak;                // Acknowledgment or Negative Acknowledgment    
+        DisconnectPayload disconnect;
+        PingPongPayload ping_pong;
         FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
     } payload;
 } UdpFrame;
 #pragma pack(pop)
-
-// Circular queue (array of uint32_t and head/tail indexes)
+//---------------------------------------------------------------------------------------------
 typedef struct{
-    uint32_t buffer[QUEUE_SIZE];       // Sequence numbers of frames that need to be ACKed
+    uint32_t seq_num[QUEUE_SIZE];       // Sequence numbers of frames that need to be ACKed
     uint32_t head, tail;                    // Head and tail indices for the circular queue
     CRITICAL_SECTION mutex;                 // Mutex for thread-safe access to the queue
-}Queue;
+}QueueAck;
 
 typedef struct{
     UdpFrame frame; // The UDP frame to be sent
@@ -131,27 +159,31 @@ typedef struct {
     uint32_t head;          
     uint32_t tail;
     CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
-} FrameQueue;
+}QueueFrame;
 
-// ----- Function prototypes -----
+// Helper functions
 uint32_t calculate_crc32(const void *data, size_t len);
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 
+// Logging functions for debug
 void log_event(EventType event, const char* message);
 void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr);
 void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
 
-uint32_t push_seq_num(Queue *queue, uint32_t value);
-uint32_t pop_seq_num(Queue *queue);
-
-uint32_t push_frame(FrameQueue *queue, FrameData *frame_data);
-uint32_t pop_frame(FrameQueue *queue, FrameData *frame_Data);
+// Queue buffers
+uint32_t push_seq_num(QueueAck *queue, uint32_t seq_num);
+uint32_t pop_seq_num(QueueAck *queue);
+uint32_t push_frame(QueueFrame *queue, FrameData *frame_data);
+uint32_t pop_frame(QueueFrame *queue, FrameData *frame_Data);
 
 // UDP communication functions
 uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+uint32_t send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+uint32_t send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 // ----- Function implementations -----
+// Log Events
 void log_event(EventType event, const char* message){
     // Get the current UTC time
     time_t current_time;
@@ -171,70 +203,17 @@ void log_event(EventType event, const char* message){
     }
     // Print the event to stdout with UTC time
     // Note: Using fprintf to stdout for logging, which is common for informational logs
-//     fprintf(stdout,"\n[%s] [UTC %04d-%02d-%02d %02d:%02d:%02d] - %s",
-//         event_str,
-//         utc_time->tm_year + 1900,
-//         utc_time->tm_mon + 1,
-//         utc_time->tm_mday,
-//         utc_time->tm_hour,
-//         utc_time->tm_min,
-//         utc_time->tm_sec,
-//         event_message);
-// }
-
-// Note: The format string is adjusted to match the expected output format
-    fprintf(stdout,"\n[%s] - %s",
+    fprintf(stdout,"\n[%s] [UTC %04d-%02d-%02d %02d:%02d:%02d] - %s",
         event_str,
+        utc_time->tm_year + 1900,
+        utc_time->tm_mon + 1,
+        utc_time->tm_mday,
+        utc_time->tm_hour,
+        utc_time->tm_min,
+        utc_time->tm_sec,
         message);
 }
-
-uint32_t push_seq_num(Queue *queue, uint32_t seq_num){
-    // Check if the queue is initialized
-    if (queue == NULL || &queue->mutex == NULL) {
-        fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return -1;
-    }
-    // Check if the queue is full
-    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
-        printf("Queue Full\n");
-        return -1;
-    }
-    // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(&queue->mutex);
-    // Add the sequence number to the ACK queue 
-    queue->buffer[queue->tail] = seq_num;
-    // fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
-    // Move the tail index forward    
-    ++queue->tail;
-    queue->tail %= QUEUE_SIZE;
-    // Release the mutex after modifying the queue
-    LeaveCriticalSection(&queue->mutex);
-    return seq_num;
-}
-
-uint32_t pop_seq_num(Queue *queue){       
-    // Check if the queue is initialized
-    if (queue == NULL || &queue->mutex == NULL) {
-        fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return -1;
-    }
-    // Check if the queue is empty before removing a ACK
-    if (queue->head == queue->tail) {
-        printf("ACK queue is empty nothing to remove\n");
-        return -1;
-    }
-    // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(&queue->mutex);
-    uint32_t seq_num = queue->buffer[queue->head];
-    // Remove the sequence number from the ACK queue
-    queue->buffer[queue->head] = 0;
-    // Move the head index forward
-    ++queue->head;
-    queue->head %= QUEUE_SIZE;
-    LeaveCriticalSection(&queue->mutex);
-    return seq_num;
-}
-// CRC32
+// CRC32 calculation
 uint32_t calculate_crc32(const void *data, size_t len){
     uint32_t crc = 0xFFFFFFFF; // Initial value
     const uint8_t *byte_data = (const uint8_t *)data;
@@ -266,7 +245,7 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     uint32_t calculated_checksum = calculate_crc32(&temp_frame_for_checksum, bytes_received);
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
-
+// Send frame function
 uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
     size_t frame_size = sizeof(FrameHeader);
@@ -285,10 +264,10 @@ uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct
             frame_size += sizeof(FileDataPayload); // Or header + payload_len + related metadata
             break;
         case FRAME_TYPE_ACK:
-            frame_size += sizeof(AckNackPayload); // Acknowledgment frame
+            frame_size += sizeof(AckNakPayload); // Acknowledgment frame
             break;
         case FRAME_TYPE_NACK:
-            frame_size += sizeof(AckNackPayload);
+            frame_size += sizeof(AckNakPayload);
             break;
         case FRAME_TYPE_FILE_TRANSFER_COMPLETE:
         case FRAME_TYPE_FILE_TRANSFER_FAILED:
@@ -301,8 +280,11 @@ uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct
             frame_size += sizeof(ConnectResponsePayload); // Assuming ConnectResponse is similar
             break;
         case FRAME_TYPE_DISCONNECT:
-        case FRAME_TYPE_KEEP_ALIVE:
-            frame_size = sizeof(FrameHeader); // These typically have no specific payload
+            frame_size += sizeof(DisconnectPayload);
+            break;
+        case FRAME_TYPE_PING:
+        case FRAME_TYPE_PONG:
+            frame_size += sizeof(PingPongPayload); // These typically have no specific payload
             break;
         default:
             frame_size = sizeof(UdpFrame); // Fallback to max size
@@ -314,10 +296,13 @@ uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct
         fprintf(stderr, "sendto() failed with error: %d\n", WSAGetLastError());
         return SOCKET_ERROR;        
     }
-    fprintf(stdout, "\nSent %d bytes to %s:%d\n", bytes_sent, inet_ntoa(dest_addr->sin_addr), ntohs(dest_addr->sin_port));
+    char addr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &dest_addr->sin_addr, addr, INET_ADDRSTRLEN);
+    uint16_t port = ntohs(dest_addr->sin_port);
+//    fprintf(stdout, "\nSent %d bytes to %s:%d\n", bytes_sent, addr, port);
     return bytes_sent;
 }
-
+// Send Ack/Nak type frame
 uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame ack_frame;
     // Check frame type is valid
@@ -332,10 +317,10 @@ uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_
     ack_frame.header.frame_type = type;
     ack_frame.header.seq_num = 0;
     ack_frame.header.session_id = htonl(session_id); // Use the session ID provided
-    ack_frame.payload.ack_nack.ack_seq_num = htonl(seq_num);
-    ack_frame.payload.ack_nack.flags = htonl(0);
+    ack_frame.payload.ack_nak.seq_num = htonl(seq_num);
+    ack_frame.payload.ack_nak.flag = 0;
     // Calculate CRC32 for the ACK/NACK frame
-    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNackPayload)));
+    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNakPayload)));
     
     uint32_t bytes_sent = send_frame(&ack_frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
@@ -345,70 +330,189 @@ uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_
     log_sent_frame(&ack_frame, dest_addr);
     return bytes_sent;
 }
-
+// Send Disconnect type frame
+uint32_t send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+    UdpFrame frame;
+    
+    memset(&frame, 0, sizeof(frame));
+    // Set the header fields
+    frame.header.start_delimiter = htons(FRAME_DELIMITER);
+    frame.header.frame_type = FRAME_TYPE_DISCONNECT;
+    frame.header.seq_num = 0;
+    frame.header.session_id = htonl(session_id); // Use the session ID provided
+    frame.payload.disconnect.flag = flag;   
+    // Calculate CRC32 for the ACK/NACK frame
+    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(DisconnectPayload)));
+    
+    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
+    if(bytes_sent == SOCKET_ERROR){
+        fprintf(stderr, "send_disconnect() failed\n");
+        return SOCKET_ERROR;
+    }
+    log_sent_frame(&frame, dest_addr);
+    return bytes_sent;
+}
+// Send Ping-Pong type frame
+uint32_t send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+    UdpFrame frame;
+    // Check frame type is valid
+    if((type != FRAME_TYPE_PING) && (type != FRAME_TYPE_PONG)){
+        fprintf(stderr, "Wrong frame type\n");
+        return SOCKET_ERROR;
+    }
+    // Initialize the ACK/NACK frame
+    memset(&frame, 0, sizeof(frame));
+    // Set the header fields
+    frame.header.start_delimiter = htons(FRAME_DELIMITER);
+    frame.header.frame_type = type;
+    frame.header.seq_num = 0;
+    frame.header.session_id = htonl(session_id); // Use the session ID provided
+    frame.payload.ping_pong.ack_num = htonl(ack_num);   
+    frame.payload.ping_pong.flag = 0;
+    // Calculate CRC32 for the ACK/NACK frame
+    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(PingPongPayload)));
+    
+    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
+    if(bytes_sent == SOCKET_ERROR){
+        fprintf(stderr, "send_ping_pong() failed\n");
+        return SOCKET_ERROR;
+    }
+    log_sent_frame(&frame, dest_addr);
+    return bytes_sent;
+}
+// Log received frame
 void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr){
 
-    char src_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
-    fprintf(stdout, "\nReceived frame from %s:%d\n", src_ip, src_addr->sin_port);
-
+    char addr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &src_addr->sin_addr, addr, INET_ADDRSTRLEN);
+    uint16_t port = ntohs(src_addr->sin_port);
+    fprintf(stdout, "Received frame from %s:%d\n", addr, port);
     switch(frame->header.frame_type){
-
-        case FRAME_TYPE_ACK: {
+        case FRAME_TYPE_ACK:
             fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload.ack_nack.ack_seq_num), frame->payload.ack_nack.flags);
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload.ack_nak.seq_num), frame->payload.ack_nak.flag);
             break;
-        }
-        case FRAME_TYPE_CONNECT_REQUEST: {
+        case FRAME_TYPE_CONNECT_REQUEST:
             fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flags), frame->payload.request.client_name);
+            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flag), frame->payload.request.client_name);
             break;
-        }
-        case FRAME_TYPE_CONNECT_RESPONSE: {
+        case FRAME_TYPE_CONNECT_RESPONSE:
             fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
             fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload.response.session_timeout), frame->payload.response.server_status, frame->payload.response.server_name);
             break;
-        }
-       case FRAME_TYPE_TEXT_MESSAGE: {
+        case FRAME_TYPE_TEXT_MESSAGE:
             fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.text_len), frame->payload.text_msg.text_data);
+            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.len), frame->payload.text_msg.text);
             break;
-        }
-    }  
-
+        case FRAME_TYPE_DISCONNECT:
+            fprintf(stdout, "   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Disconnect flag: %d\n", frame->payload.disconnect.flag);
+            break;
+        // case FRAME_TYPE_PING:
+        //     fprintf(stdout, "   FRAME_TYPE_PING\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+        //     fprintf(stdout, "   Ack Ping Seq: %d\n   Flags: %d\n", ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flags);
+        //     break;
+        // case FRAME_TYPE_PONG:
+        //     fprintf(stdout, "   FRAME_TYPE_PONG\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+        //     fprintf(stdout, "   Ack Pong Seq: %d\n   Flags: %d\n", ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flags);
+        //     break;
+        default:
+//                fprintf(stdout, "   FRAME_TYPE_INVALID\n");
+            break;
+    }    
+    return;
 }
-
+// Log sent frame
 void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
 
-    char dest_ip[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &dest_addr->sin_addr, dest_ip, INET_ADDRSTRLEN);
-    fprintf(stdout, "\nSent frame to %s:%d\n", dest_ip, dest_addr->sin_port);
+    char addr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &dest_addr->sin_addr, addr, INET_ADDRSTRLEN);
+    uint16_t port = ntohs(dest_addr->sin_port);
+    fprintf(stdout, "Sent frame to %s:%d\n", addr, port);
     switch(frame->header.frame_type){
-
-        case FRAME_TYPE_ACK: {
+        case FRAME_TYPE_ACK:
             fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload.ack_nack.ack_seq_num), frame->payload.ack_nack.flags);
+            fprintf(stdout, "   Ack Seq Nr: %d\n   Flags: %d\n", ntohl(frame->payload.ack_nak.seq_num), frame->payload.ack_nak.flag);
             break;
-        }
-        case FRAME_TYPE_CONNECT_REQUEST: {
+        case FRAME_TYPE_CONNECT_REQUEST:
             fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flags), frame->payload.request.client_name);
+            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flag), frame->payload.request.client_name);
             break;
-        }
-        case FRAME_TYPE_CONNECT_RESPONSE: {
+        case FRAME_TYPE_CONNECT_RESPONSE:
             fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
             fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload.response.session_timeout), frame->payload.response.server_status, frame->payload.response.server_name);
             break;
-        }
-        case FRAME_TYPE_TEXT_MESSAGE: {
+        case FRAME_TYPE_TEXT_MESSAGE:
             fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.text_len), frame->payload.text_msg.text_data);
+            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.len), frame->payload.text_msg.text);
             break;
-        }
-    }  
+        case FRAME_TYPE_DISCONNECT:
+            fprintf(stdout, "   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+            fprintf(stdout, "   Disconnect Flag: %d\n", frame->payload.disconnect.flag);
+            break;
+        // case FRAME_TYPE_PING:
+        //     fprintf(stdout, "   FRAME_TYPE_PING\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+        //     fprintf(stdout, "   Ack Ping Seq: %d\n   Flags: %d\n", ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flags);
+        //     break;
+        // case FRAME_TYPE_PONG:
+        //     fprintf(stdout, "   FRAME_TYPE_PONG\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.session_id), ntohl(frame->header.checksum));
+        //     fprintf(stdout, "   Ack Pong Seq: %d\n   Flags: %d\n", ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flags);
+        //     break;
+        default:
+//                fprintf(stdout, "   FRAME_TYPE_INVALID\n");
+            break;
+    }
+    return;  
 }
-
-uint32_t push_frame(FrameQueue *queue, FrameData *frame_data){
+// Push sequence number to queue - used for received frames (seq_num) that need to be acked
+uint32_t push_seq_num(QueueAck *queue, uint32_t seq_num){
+    // Check if the queue is initialized
+    if (queue == NULL || &queue->mutex == NULL) {
+        fprintf(stderr, "Queue or mutex is not initialized.\n");
+        return -1;
+    }
+    // Check if the queue is full
+    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
+        printf("Queue Full\n");
+        return -1;
+    }
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(&queue->mutex);
+    // Add the sequence number to the ACK queue 
+    queue->seq_num[queue->tail] = seq_num;
+    // fprintf(stdout, "Added ACK seq nr: Queue[%d] = %d\n", queue->tail, queue->buffer[queue->tail]);
+    // Move the tail index forward    
+    ++queue->tail;
+    queue->tail %= QUEUE_SIZE;
+    // Release the mutex after modifying the queue
+    LeaveCriticalSection(&queue->mutex);
+    return seq_num;
+}
+// Pop sequence number from queue - after the ack frame was sent remove the seq from the queue
+uint32_t pop_seq_num(QueueAck *queue){       
+    // Check if the queue is initialized
+    if (queue == NULL || &queue->mutex == NULL) {
+        fprintf(stderr, "Queue or mutex is not initialized.\n");
+        return -1;
+    }
+    // Check if the queue is empty before removing a ACK
+    if (queue->head == queue->tail) {
+        printf("ACK queue is empty nothing to remove\n");
+        return -1;
+    }
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(&queue->mutex);
+    uint32_t seq_num = queue->seq_num[queue->head];
+    // Remove the sequence number from the ACK queue
+    queue->seq_num[queue->head] = 0;
+    // Move the head index forward
+    ++queue->head;
+    queue->head %= QUEUE_SIZE;
+    LeaveCriticalSection(&queue->mutex);
+    return seq_num;
+}
+// Push frame data to queue - received frames are buffered to a queue before processing; receive thread pushes the frame to the queue
+uint32_t push_frame(QueueFrame *queue, FrameData *frame_data){
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
@@ -430,8 +534,8 @@ uint32_t push_frame(FrameQueue *queue, FrameData *frame_data){
     LeaveCriticalSection(&queue->mutex);
     return 0;
 }
-// Removes element from queue head
-uint32_t pop_frame(FrameQueue *queue, FrameData *frame_data){       
+// Pop frame data from queue - frames are poped from the queue by the frame processing thread
+uint32_t pop_frame(QueueFrame *queue, FrameData *frame_data){       
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");

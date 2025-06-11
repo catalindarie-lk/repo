@@ -6,6 +6,7 @@
         "windows.h": "c",
         "ws2tcpip.h": "c",
         "stdlib.h": "c",
-        "stdio.h": "c"
+        "stdio.h": "c",
+        "process.h": "c"
     }
 }
