@@ -12,13 +12,16 @@
 #include <process.h>    // For _beginthreadex (preferred over CreateThread for CRT safety)
 #include <windows.h>    // For Windows-specific functions like CreateThread, Sleep
 
-#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+//#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
 #define MAX_PAYLOAD_SIZE    1024        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_SIZE          4096        // Queue buffer size
 #define NAME_SIZE           64
 #define SILENT_FRAMES       0
+
+#define RET_VAL_ERROR       -1
+#define RET_VAL_SUCCESS     0
 
 typedef uint32_t EventType;
 enum EventType{
@@ -161,8 +164,20 @@ typedef struct {
     CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
 }QueueFrame;
 
+typedef struct{
+    uint32_t sqn;   // The sequence number of the frame that require ack/nak
+    uint32_t ses_id;   // Session ID of the frame (used to identify the connected client)
+}SeqNumData;
+
+typedef struct {
+    SeqNumData sqn_dat[QUEUE_SIZE];
+    uint32_t head;          
+    uint32_t tail;
+    CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
+}QueueSeqNum;
+
 // Helper functions
-uint32_t calculate_crc32(const void *data, size_t len);
+int calculate_crc32(const void *data, size_t len);
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 
 // Logging functions for debug
@@ -171,16 +186,18 @@ void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr);
 void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
 
 // Queue buffers
-uint32_t push_seq_num(QueueAck *queue, uint32_t seq_num);
-uint32_t pop_seq_num(QueueAck *queue);
-uint32_t push_frame(QueueFrame *queue, FrameData *frame_data);
-uint32_t pop_frame(QueueFrame *queue, FrameData *frame_Data);
+int push_seq_num(QueueAck *queue, uint32_t seq_num);
+int pop_seq_num(QueueAck *queue);
+int push_frame(QueueFrame *queue, FrameData *frame_data);
+int pop_frame(QueueFrame *queue, FrameData *frame_data);
+int push_sqn(QueueSeqNum *queue, SeqNumData *sqn_dat);
+int pop_sqn(QueueSeqNum *queue, SeqNumData *sqn_dat);
 
 // UDP communication functions
-uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-uint32_t send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-uint32_t send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 // ----- Function implementations -----
 // Log Events
@@ -214,7 +231,7 @@ void log_event(EventType event, const char* message){
         message);
 }
 // CRC32 calculation
-uint32_t calculate_crc32(const void *data, size_t len){
+int calculate_crc32(const void *data, size_t len){
     uint32_t crc = 0xFFFFFFFF; // Initial value
     const uint8_t *byte_data = (const uint8_t *)data;
     uint32_t polynomial = 0xEDB88320; // IEEE 802.3 polynomial (reversed)
@@ -246,7 +263,7 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
 // Send frame function
-uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
     size_t frame_size = sizeof(FrameHeader);
     switch (frame->header.frame_type) {
@@ -303,7 +320,7 @@ uint32_t send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct
     return bytes_sent;
 }
 // Send Ack/Nak type frame
-uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame ack_frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
@@ -331,7 +348,7 @@ uint32_t send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_
     return bytes_sent;
 }
 // Send Disconnect type frame
-uint32_t send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame frame;
     
     memset(&frame, 0, sizeof(frame));
@@ -353,7 +370,7 @@ uint32_t send_disconnect(const uint8_t flag, const uint32_t session_id, const SO
     return bytes_sent;
 }
 // Send Ping-Pong type frame
-uint32_t send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_PING) && (type != FRAME_TYPE_PONG)){
@@ -465,7 +482,7 @@ void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
     return;  
 }
 // Push sequence number to queue - used for received frames (seq_num) that need to be acked
-uint32_t push_seq_num(QueueAck *queue, uint32_t seq_num){
+int push_seq_num(QueueAck *queue, uint32_t seq_num){
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
@@ -489,19 +506,18 @@ uint32_t push_seq_num(QueueAck *queue, uint32_t seq_num){
     return seq_num;
 }
 // Pop sequence number from queue - after the ack frame was sent remove the seq from the queue
-uint32_t pop_seq_num(QueueAck *queue){       
+int pop_seq_num(QueueAck *queue){       
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
         return -1;
     }
+    EnterCriticalSection(&queue->mutex);
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
-        printf("ACK queue is empty nothing to remove\n");
+        LeaveCriticalSection(&queue->mutex);
         return -1;
     }
-    // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(&queue->mutex);
     uint32_t seq_num = queue->seq_num[queue->head];
     // Remove the sequence number from the ACK queue
     queue->seq_num[queue->head] = 0;
@@ -511,17 +527,19 @@ uint32_t pop_seq_num(QueueAck *queue){
     LeaveCriticalSection(&queue->mutex);
     return seq_num;
 }
+
+// ---------------------- QUEUE FOR BUFFERING RECEIVED FRAMES ----------------------
 // Push frame data to queue - received frames are buffered to a queue before processing; receive thread pushes the frame to the queue
-uint32_t push_frame(QueueFrame *queue, FrameData *frame_data){
+int push_frame(QueueFrame *queue, FrameData *frame_data){
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return -1;
+        return RET_VAL_ERROR;
     }
     // Check if the queue is full
     if((queue->tail + 1) % QUEUE_SIZE == queue->head){
         printf("Queue Full\n");
-        return -1;
+        return RET_VAL_ERROR;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
     EnterCriticalSection(&queue->mutex);
@@ -532,30 +550,75 @@ uint32_t push_frame(QueueFrame *queue, FrameData *frame_data){
     queue->tail %= QUEUE_SIZE;
     // Release the mutex after modifying the queue
     LeaveCriticalSection(&queue->mutex);
-    return 0;
+    return RET_VAL_SUCCESS;
 }
 // Pop frame data from queue - frames are poped from the queue by the frame processing thread
-uint32_t pop_frame(QueueFrame *queue, FrameData *frame_data){       
+int pop_frame(QueueFrame *queue, FrameData *frame_data){       
     // Check if the queue is initialized
+    memset(frame_data, 0, sizeof(FrameData)); // Initialize the structure to zero
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
-        return -1; // Return an empty RecvFrameInfo
+        return RET_VAL_ERROR; // Return an empty RecvFrameInfo
     }
+    EnterCriticalSection(&queue->mutex);
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
-        fprintf(stderr,"Frame queue is empty nothing to remove\n");
-        return -1;
+        LeaveCriticalSection(&queue->mutex);
+        return RET_VAL_ERROR;
     }
-    memset(frame_data, 0, sizeof(FrameData)); // Initialize the structure to zero
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(&queue->mutex);
     memcpy(frame_data, &queue->frame_data[queue->head], sizeof(FrameData)); // Copy the frame from the queue
     memset(&queue->frame_data[queue->head], 0, sizeof(FrameData)); // Clear the frame at the head
     // Move the head index forward
     ++queue->head;
     queue->head %= QUEUE_SIZE;
     LeaveCriticalSection(&queue->mutex);
-    return 0;
+    return RET_VAL_SUCCESS;
+}
+
+// ---------------------- QUEUE FOR ACK/NAK FRAMES ----------------------
+// Push sequence num data to queue - frames that need ack/nak are buffered in a circular queue
+int push_sqn(QueueSeqNum *queue, SeqNumData *sqn_dat){
+    // Check if the queue is initialized
+    if (queue == NULL || &queue->mutex == NULL) {
+        return RET_VAL_ERROR;
+    }
+    // Check if the queue is full
+    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
+        return RET_VAL_ERROR;
+    }
+    // Acquire the mutex to ensure thread-safe access to the queue
+    EnterCriticalSection(&queue->mutex);
+    // Add the sequence number to the ACK queue 
+    memcpy(&queue->sqn_dat[queue->tail], sqn_dat, sizeof(SeqNumData));
+    // Move the tail index forward    
+    ++queue->tail;
+    queue->tail %= QUEUE_SIZE;
+    // Release the mutex after modifying the queue
+    LeaveCriticalSection(&queue->mutex);
+    return RET_VAL_SUCCESS;
+}
+// Pop sequence num data from queue -> send ack/nak (separate thread)
+int pop_sqn(QueueSeqNum *queue, SeqNumData *sqn_dat){       
+    // Check if the queue is initialized
+    memset(sqn_dat, 0, sizeof(SeqNumData));
+    if (queue == NULL || &queue->mutex == NULL) {
+        return RET_VAL_ERROR; // Return an empty RecvFrameInfo
+    }
+    EnterCriticalSection(&queue->mutex);
+    // Check if the queue is empty before removing a ACK
+    if (queue->head == queue->tail) {
+        LeaveCriticalSection(&queue->mutex);
+        return RET_VAL_ERROR;
+    }
+    // Acquire the mutex to ensure thread-safe access to the queue
+    memcpy(sqn_dat, &queue->sqn_dat[queue->head], sizeof(FrameData));
+    memset(&queue->sqn_dat[queue->head], 0, sizeof(FrameData));
+    // Move the head index forward
+    ++queue->head;
+    queue->head %= QUEUE_SIZE;
+    LeaveCriticalSection(&queue->mutex);
+    return RET_VAL_SUCCESS;
 }
 
 #endif // _UDP_LIB_H

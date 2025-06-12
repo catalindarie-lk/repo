@@ -2,7 +2,7 @@
 
 #include "UDP_lib.h"
 
-#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+//#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
 // --- Constants ---
 #define SERVER_PORT         12345       // Port the server listens on
@@ -37,8 +37,8 @@ typedef struct{
     char client_name[NAME_SIZE];
     ClientStatus client_status;         
     SessionStatus session_status;     // 0-DISCONNECTED; 1-CONNECTED
-    uint32_t frame_seq_num;       // this will be sent as seq_num
-
+    uint32_t frame_count;       // this will be sent as seq_num
+    CRITICAL_SECTION frame_count_mutex;
 
     uint32_t session_id;        // session id received from the server after connection accepted
     uint8_t server_status;      // 0-NOK; 1-OK (connection confirmed by server)
@@ -68,8 +68,8 @@ StructClient client;
 const char *server_ip = "127.0.0.1"; // loopback address
 
 // --- Function prototypes ---
-void send_connect_request(const uint32_t client_id, const uint32_t flag, const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-void send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_connect_request(const uint32_t client_id, const uint32_t flag, const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 unsigned int WINAPI command_thread_func(LPVOID lpParam);
 unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam);
@@ -115,19 +115,19 @@ void init_client(StructClient *client){
     client->queue_ack.head = 0;
     client->queue_ack.tail = 0;
     InitializeCriticalSection(&client->queue_ack.mutex);
-
-       // Initialize the frame queue buffer
+    
     client->queue_frame.head = 0;
     client->queue_frame.tail = 0;
     InitializeCriticalSection(&client->queue_frame.mutex);
-
+    
+    client->frame_count = 0;    
     uint32_t len = sizeof(CLIENT_NAME) - 1;
     strncpy(client->client_name, CLIENT_NAME, len);
     client->client_name[len] = '\0'; // Ensure null termination
     client->client_id = CLIENT_ID;
- 
     client->client_status = CLIENT_READY;
     client->session_status = SESSION_DISCONNECTED;
+    InitializeCriticalSection(&client->frame_count_mutex);
     return;
 }
 
@@ -196,7 +196,9 @@ int main() {
 
     while(client.client_status == CLIENT_BUSY || client.client_status == CLIENT_READY){
         if(client.session_status == SESSION_DISCONNECTED){
-            client.frame_seq_num = 0;       // this will be sent as seq_num
+            EnterCriticalSection(&client.frame_count_mutex);
+            client.frame_count = 0;       // this will be sent as seq_num
+            LeaveCriticalSection(&client.frame_count_mutex);
             client.session_id = 0;
             client.server_status = 0;
             client.session_timeout = 0;
@@ -209,7 +211,7 @@ int main() {
 
 // --- Function implementations ---
 // --- Send connect request ---
-void send_connect_request(const uint32_t client_id, const uint32_t flag, const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_connect_request(const uint32_t client_id, const uint32_t flag, const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Create a connect request frame
     UdpFrame frame;
     // Initialize the connect request frame    
@@ -230,18 +232,18 @@ void send_connect_request(const uint32_t client_id, const uint32_t flag, const c
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_connect_request() failed\n");
-        return;
+        return SOCKET_ERROR;
     }
     log_sent_frame(&frame, dest_addr);
-    return;
+    return bytes_sent;
 };
 // --- Send text message ---
-void send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
 
     UdpFrame frame;
     if(text == NULL){
         fprintf(stderr, "Invalid text!.\n");
-        return;
+        return SOCKET_ERROR;
     }
     // Initialize the text message frame
     memset(&frame, 0, sizeof(UdpFrame));
@@ -260,10 +262,10 @@ void send_text_message(const uint32_t seq_nr, const uint32_t session_id, const c
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_text_message() failed\n");
-        return;
+        return SOCKET_ERROR;
     }
     log_sent_frame(&frame, dest_addr);
-    return;
+    return bytes_sent;
 };
 
 // --- Receive frame ---
@@ -301,6 +303,7 @@ unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
             memcpy(&frame_data.src_addr, &src_addr, sizeof(struct sockaddr_in));          
             frame_data.bytes_received = bytes_received;
             if(push_frame(&client->queue_frame, &frame_data) == -1){
+                fprintf(stderr, "Pushing frame error!!!\n");
                 continue;
             };
 
@@ -317,15 +320,11 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
 
     while(client->client_status == CLIENT_READY){
 
-        if(client->queue_frame.head == client->queue_frame.tail) {
+        FrameData frame_data;
+        if(pop_frame(&client->queue_frame, &frame_data) == -1) {
             Sleep(10); // No frames to process, yield CPU
             continue; // Re-check the queue after waking up
-        }
-          
-        FrameData frame_data;
-        if(pop_frame(&client->queue_frame, &frame_data) == -1){
-            continue;
-        };     
+        }        
 
         UdpFrame *frame = &frame_data.frame;
         struct sockaddr_in *src_addr = &frame_data.src_addr;
@@ -387,7 +386,7 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
                 if (client->ping_pong_thread == NULL) {
                     fprintf(stderr, "Failed to create ping pong thread. Error: %d\n", GetLastError());
                     client->session_status = SESSION_DISCONNECTED;
-                    client->ping_pong_thread = CLIENT_STOP; // Signal immediate shutdown
+                    client->client_status = CLIENT_STOP; // Signal immediate shutdown
                 }
                 //TODO:
                 break; 
@@ -434,12 +433,9 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
     StructClient *client = (StructClient *)lpParam;
 
     while(client->client_status == CLIENT_READY){
-        if(client->queue_ack.head == client->queue_ack.tail){
-            Sleep(10); // No ACKs to send, yield CPU
-            continue; // Re-check the queue after waking up
-        }
-        uint32_t ack_seq_num = client->queue_ack.seq_num[client->queue_ack.head];
-        if(pop_seq_num(&client->queue_ack) == -1) {
+        uint32_t ack_seq_num = pop_seq_num(&client->queue_ack);
+        if(ack_seq_num == -1) {
+            Sleep(10);
             continue; // Nothing to send, skip to next iteration
         }
         send_ack_nack(FRAME_TYPE_ACK, ack_seq_num, client->session_id, client->socket, &client->server_addr);
@@ -463,7 +459,7 @@ unsigned int WINAPI ping_pong_thread_func(LPVOID lpParam){
         if(time(NULL) > (time_t)(client->last_server_active_time + client->session_timeout * 2)){
             client->session_status = SESSION_DISCONNECTED;
         }
-        Sleep(1000);
+        Sleep(500);
     }
     fprintf(stdout, "Send ping-pong thread exiting...\n");
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
@@ -480,7 +476,6 @@ unsigned int WINAPI command_thread_func(LPVOID lpParam) {
     while(client->client_status == CLIENT_READY){
 
             fprintf(stdout,"Waiting for command...\n");
-//            char c = getchar();
             command_str[0] = '\0';
             command_num = 0;
             fgets(command_str, sizeof(command_str), stdin);
@@ -538,7 +533,10 @@ unsigned int WINAPI command_thread_func(LPVOID lpParam) {
                     char text_buffer[255] = {0};
                     fgets(text_buffer, sizeof(text_buffer), stdin);
                     text_buffer[strcspn(text_buffer, "\n")] = '\0';
-                    send_text_message(++client->frame_seq_num, client->session_id, text_buffer, strlen(text_buffer), client->socket, &client->server_addr);
+                    EnterCriticalSection(&client->frame_count_mutex);
+                    uint32_t seq_num = ++client->frame_count;
+                    LeaveCriticalSection(&client->frame_count_mutex);
+                    send_text_message(seq_num, client->session_id, text_buffer, strlen(text_buffer), client->socket, &client->server_addr);
                     break;
 
                 default:

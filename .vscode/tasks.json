@@ -5,19 +5,20 @@
             "label": "C/C++: cl.exe build active file",
             "command": "cl.exe",
             "args": [
-                "/Zi",
-                "/EHsc",
-                "/nologo",
-                "/FS",
+                "/Zi",      // Generate debugging information (.pdb)
+                "/EHsc",    // Enable exception handling (C++ standard)
+                "/favor:AMD64",
                 "${file}",
                 "/Fe${workspaceFolder}\\bin\\${fileBasenameNoExtension}.exe",
                 "/Fo${workspaceFolder}\\obj\\${fileBasenameNoExtension}.obj",
-                "/Fd${workspaceFolder}\\pdb\\${fileBasenameNoExtension}.pdb",
+                "/Fd${workspaceFolder}\\bin\\${fileBasenameNoExtension}.pdb",
                 "/link",
-                "/PDB:${workspaceFolder}\\pdb\\${fileBasenameNoExtension}.pdb"
+                "/MACHINE:X64",
+                "Ws2_32.lib"
+
             ],
             "options": {
-                "cwd": "${fileDirname}"
+                "cwd": "${workspaceFolder}"
             },
             "problemMatcher": [
                 "$msCompile"

@@ -1,12 +1,6 @@
 {
-    "C_Cpp.errorSquiggles": "disabled",
     "files.associations": {
-        "stdint.h": "c",
-        "winsock2.h": "c",
-        "windows.h": "c",
-        "ws2tcpip.h": "c",
         "stdlib.h": "c",
-        "stdio.h": "c",
         "process.h": "c"
     }
 }

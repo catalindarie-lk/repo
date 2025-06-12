@@ -2,7 +2,7 @@
 
 #include "UDP_lib.h"
 
-#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+//#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
 // --- Constants ---
 #define SERVER_PORT 12345       // Port the server listens on
@@ -45,7 +45,7 @@ typedef struct {
     time_t last_activity_time;              // Last time the client sent a frame (for timeout checks)
     uint32_t srv_to_client_frame_count;     // Frame count sent by the server to the client               
 
-    QueueAck queue_ack;                      // Queue for frames received from the client that the server needs to ACK   
+    QueueAck queue_ack;                      // Queue for frames received from the client that the server needs to ACK
 
     uint32_t slot_num;
     ClientSlotStatus slot_status;            //0->FREE; 1->BUSY
@@ -60,7 +60,6 @@ typedef struct{
     struct sockaddr_in server_addr;            // Server address structure
     ServerStatus server_status;                // Status of the server (e.g., busy, ready, error)
     uint32_t session_timeout;           // Timeout period for client inactivity
-    uint32_t clients_count;             // Number of currently connected clients
     uint32_t unique_session_id;         // Global counter for unique session IDs
     char server_name[NAME_SIZE];        // Human-readable server name
 
@@ -71,17 +70,20 @@ typedef struct{
     
     QueueFrame queue_frame;
 
-    StructClient client[MAX_CLIENTS];      // Array of connected clients 
+    uint32_t client_count;             // Number of currently connected clients
+    StructClient client[MAX_CLIENTS];      // Array of connected clients
     CRITICAL_SECTION client_mutex;         // For thread-safe access to connected_clients
 
     HANDLE server_command_thread;
 
 }StructServer;
 
+QueueSeqNum queue_sqn;
+
 StructServer server;
 
 // UDP communication functions
-void send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t server_status, const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t server_status, const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 // Thread functions
 unsigned int WINAPI server_command_thread_func(LPVOID lpParam);
@@ -93,7 +95,7 @@ unsigned int WINAPI client_timeout_thread_func(LPVOID lpParam);
 // Client management functions
 StructClient* find_client(StructServer *server, const uint32_t session_id);
 StructClient* add_client(StructServer *server, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
-uint32_t remove_client(StructServer *server, const uint32_t session_id);
+int remove_client(StructServer *server, const uint32_t session_id);
 
 void init_winsock() {
     WSADATA wsaData;
@@ -132,19 +134,18 @@ void init_server(StructServer *server){
         cleanup_winsock();
         return;
     }
-    // 4. Initialize server status
-    server->session_timeout = CLIENT_SESSION_TIMEOUT_SEC;
-    server->clients_count = 0;
-    server->unique_session_id = 0xFF; // Start with 0 or a random value
-    strncpy(server->server_name, SERVER_NAME, NAME_SIZE - 1);
-    server->server_name[NAME_SIZE - 1] = '\0'; // Ensure null-termination
-    server->server_status = SERVER_READY; // Set initial status to ready
-
-    InitializeCriticalSection(&server->client_mutex);
 
     server->queue_frame.head = 0;
     server->queue_frame.tail = 0;
     InitializeCriticalSection(&server->queue_frame.mutex);
+    
+    server->session_timeout = CLIENT_SESSION_TIMEOUT_SEC;
+    server->client_count = 0;
+    server->unique_session_id = 0xFF; // Start with 0 or a random value
+    strncpy(server->server_name, SERVER_NAME, NAME_SIZE - 1);
+    server->server_name[NAME_SIZE - 1] = '\0'; // Ensure null-termination
+    server->server_status = SERVER_READY; // Set initial status to ready
+    InitializeCriticalSection(&server->client_mutex);
 
     printf("Server listening on port %d...\n", SERVER_PORT);
     return; // Indicate success
@@ -229,7 +230,7 @@ int main() {
 }
 
 // --- Send connect response ---
-void send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t server_status, const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr) {
+int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t server_status, const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr) {
     UdpFrame frame;
     // Initialize the response frame
     memset(&frame, 0, sizeof(UdpFrame));
@@ -252,16 +253,16 @@ void send_connect_response(const uint32_t session_id, const uint32_t session_tim
     int bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if (bytes_sent == SOCKET_ERROR) {
         fprintf(stderr, "send_connect_respose() failed\n");
-        return;
+        return SOCKET_ERROR;
     }
     log_sent_frame(&frame, dest_addr);
-    return;
+    return bytes_sent;
 }
 // Find client by session ID
 StructClient* find_client(StructServer *server, const uint32_t session_id) {
         
     // Search for the client with the given session ID
-    if (server->clients_count == 0) {
+    if (server->client_count == 0) {
         return NULL; // No clients connected
     }
     for (int slot = 0; slot < MAX_CLIENTS; slot++) {
@@ -270,6 +271,7 @@ StructClient* find_client(StructServer *server, const uint32_t session_id) {
             return &server->client[slot];
         }
     }
+
     return NULL;
 }
 // Add a new client
@@ -319,19 +321,19 @@ StructClient* add_client(StructServer *server, const UdpFrame *recv_frame, const
         fprintf(stderr, "Failed to create ack thread. Error: %d\n", GetLastError());
         return NULL;
     }
-    server->clients_count++;
+    server->client_count++;
     return &server->client[free_slot];
 }
 // Remove a client
-uint32_t remove_client(StructServer *server, const uint32_t slot) {
+int remove_client(StructServer *server, const uint32_t slot) {
     // Search for the client with the given session ID
-    if (slot < 0 && slot >= MAX_CLIENTS) {
+    if (slot < 0 || slot >= MAX_CLIENTS) {
         return -1; 
     }
     memset(&server->client[slot], 0, sizeof(StructClient));
     server->client[slot].connection = CLIENT_DISCONNECTED;
-    server->clients_count--;
-    return 1;
+    server->client_count--;
+    return 0;
 }
 
 // --- Process server command ---
@@ -374,6 +376,7 @@ unsigned int WINAPI receive_frame_thread_func(LPVOID lpParam) {
             memcpy(&frame_data.src_addr, &src_addr, sizeof(struct sockaddr_in));
             frame_data.bytes_received = bytes_received;
             if(push_frame(&server->queue_frame, &frame_data) == -1){
+                fprintf(stderr, "Pushing frame error!!!\n");
                 continue;
             };
         }
@@ -388,18 +391,12 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
     StructServer *server = (StructServer *)lpParam;
 
     while(server->server_status == SERVER_READY) {
-
-        if(server->queue_frame.head == server->queue_frame.tail) {
-            Sleep(10); // No frames to process, yield CPU
-            continue; // Re-check the queue after waking up
-        }
         // Pop a frame from the queue
         FrameData frame_data;
-        
         if(pop_frame(&server->queue_frame, &frame_data) == -1){
+            Sleep(10); // No frames to process, yield CPU
             continue;
         };
-
         UdpFrame *frame = &frame_data.frame;
         struct sockaddr_in *src_addr = &frame_data.src_addr;
         uint32_t bytes_received = frame_data.bytes_received;
@@ -414,7 +411,7 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
         inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
         uint16_t src_port = ntohs(src_addr->sin_port);
 
-        // 1. Validate Delimiter
+        //1. Validate Delimiter
         if (received_delimiter != FRAME_DELIMITER) {
             fprintf(stderr, "Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.\n", src_ip, src_port, received_delimiter);
             continue;
@@ -430,8 +427,8 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
         log_recv_frame(frame, src_addr);
         // Find or add client (thread-safe access)
         StructClient *client = NULL;
-        EnterCriticalSection(&server->client_mutex);
 
+        EnterCriticalSection(&server->client_mutex);
         if(received_frame_type == FRAME_TYPE_CONNECT_REQUEST){
             client = find_client(server, received_session_id);
             if(client != NULL){
@@ -457,17 +454,21 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
         LeaveCriticalSection(&server->client_mutex);
         // 3. Process Payload based on Frame Type
         switch (received_frame_type) {
-            case FRAME_TYPE_CONNECT_REQUEST: 
+            case FRAME_TYPE_CONNECT_REQUEST:                
                 send_connect_response(client->session_id, server->session_timeout, server->server_status, server->server_name, server->socket, &client->client_addr);
+                EnterCriticalSection(&server->client_mutex);
+                client->last_activity_time = time(NULL);
+                LeaveCriticalSection(&server->client_mutex);
                 break;
             
-            case FRAME_TYPE_ACK: 
+            case FRAME_TYPE_ACK:
+                EnterCriticalSection(&server->client_mutex);
                 client->last_activity_time = time(NULL);
+                LeaveCriticalSection(&server->client_mutex);
                 break;
                 //TODO: Handle ACK processing, e.g., update internal state or queues
             
-            case FRAME_TYPE_TEXT_MESSAGE: 
-                client->last_activity_time = time(NULL);
+            case FRAME_TYPE_TEXT_MESSAGE:                
                 uint32_t len = ntohl(frame->payload.text_msg.len);
                 // Ensure null termination for safe printing, cap at max payload size
                 if (len >= sizeof(frame->payload.text_msg.text)) {
@@ -476,9 +477,13 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
                 frame->payload.text_msg.text[len] = '\0';
                 // push received sequence number to ACK queue so it can be acknowledged by the send_ack_thread
                 if(push_seq_num(&client->queue_ack, received_seq_num) == -1){
+                    fprintf(stderr, "Pushing seq_num error!!!\n");
                     break;
                 };
                 // TODO: Route message to another client if specified
+                EnterCriticalSection(&server->client_mutex);
+                client->last_activity_time = time(NULL);
+                LeaveCriticalSection(&server->client_mutex);
                 break;
             
             case FRAME_TYPE_LONG_TEXT_MESSAGE_DATA: 
@@ -490,11 +495,13 @@ unsigned int WINAPI process_frame_thread_func(LPVOID lpParam) {
                 LeaveCriticalSection(&server->client_mutex);
                 break;
 
-            case FRAME_TYPE_PING:
-                client->last_activity_time = time(NULL);
+            case FRAME_TYPE_PING:                
                 uint32_t ping_ack_num = ntohl(frame->payload.ping_pong.ack_num);
                 uint8_t ping_flag = frame->payload.ping_pong.flag;
                 send_ping_pong(FRAME_TYPE_PONG, ping_ack_num, client->session_id, server->socket, &client->client_addr);
+                EnterCriticalSection(&server->client_mutex);
+                client->last_activity_time = time(NULL);
+                LeaveCriticalSection(&server->client_mutex);
                 break;
             default:
                 break;
@@ -509,12 +516,9 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
     StructClient *client = (StructClient *)lpParam;
 
     while(client->connection == CLIENT_CONNECTED) {
-        if(client->queue_ack.head == client->queue_ack.tail) {
-            Sleep(10); // No ACKs to send, yield CPU
-            continue; // Re-check the queue after waking up
-        }
-        uint32_t ack_seq_num = client->queue_ack.seq_num[client->queue_ack.head];
-        if(pop_seq_num(&client->queue_ack) == -1) {
+        uint32_t ack_seq_num = pop_seq_num(&client->queue_ack);
+        if(ack_seq_num == -1) {
+            Sleep(10);
             continue; // Nothing to send, skip to next iteration
         }
         send_ack_nack(FRAME_TYPE_ACK, ack_seq_num, client->session_id, client->server_socket, &client->client_addr);
@@ -529,19 +533,24 @@ unsigned int WINAPI client_timeout_thread_func(LPVOID lpParam){
     StructServer *server = (StructServer *)lpParam;
 
     while(server->server_status == SERVER_READY) {
-        EnterCriticalSection(&server->client_mutex);
-        for(int slot = 0; slot < MAX_CLIENTS; slot++){           
-            if(server->client[slot].slot_status == SLOT_FREE) 
+        
+        for(int slot = 0; slot < MAX_CLIENTS; slot++){  
+            EnterCriticalSection(&server->client_mutex);         
+            if(server->client[slot].slot_status == SLOT_FREE){
+                LeaveCriticalSection(&server->client_mutex);
                 continue;
-            if(time(NULL) - (time_t)server->client[slot].last_activity_time < (time_t)server->session_timeout)
+            }                
+            if(time(NULL) - (time_t)server->client[slot].last_activity_time < (time_t)server->session_timeout){
+                LeaveCriticalSection(&server->client_mutex);
                 continue;
+            }
             fprintf(stdout, "\nClient with Session ID: %d disconnected due to timeout\n", server->client[slot].session_id);
             send_disconnect(DISCONNECT_TIMEOUT, server->client[slot].session_id, server->socket, &server->client[slot].client_addr);         
             remove_client(server, slot);
-            fprintf(stdout, "Remaining connected clients: %d\n", server->clients_count);            
+            LeaveCriticalSection(&server->client_mutex);
+            fprintf(stdout, "Remaining connected clients: %d\n", server->client_count);            
         }
-        LeaveCriticalSection(&server->client_mutex);
-        Sleep(1000);
+        Sleep(500);
     } 
     fprintf(stdout, "Exit client_timeout_thread...\n");
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
