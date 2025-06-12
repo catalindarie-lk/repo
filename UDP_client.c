@@ -438,7 +438,7 @@ unsigned int WINAPI send_ack_thread_func(LPVOID lpParam){
             Sleep(10);
             continue; // Nothing to send, skip to next iteration
         }
-        send_ack_nack(FRAME_TYPE_ACK, ack_seq_num, client->session_id, client->socket, &client->server_addr);
+        send_ack_nak(FRAME_TYPE_ACK, ack_seq_num, client->session_id, client->socket, &client->server_addr);
         client->last_client_active_time = time(NULL);
     }
     fprintf(stdout, "Send ack thread exiting...\n");

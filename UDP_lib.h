@@ -166,7 +166,8 @@ typedef struct {
 
 typedef struct{
     uint32_t sqn;   // The sequence number of the frame that require ack/nak
-    uint32_t ses_id;   // Session ID of the frame (used to identify the connected client)
+    FrameType ack_nak;
+    uint32_t session_id;   // Session ID of the frame (used to identify the connected client)
 }SeqNumData;
 
 typedef struct {
@@ -195,7 +196,7 @@ int pop_sqn(QueueSeqNum *queue, SeqNumData *sqn_dat);
 
 // UDP communication functions
 int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
@@ -320,7 +321,7 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
     return bytes_sent;
 }
 // Send Ack/Nak type frame
-int send_ack_nack(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     UdpFrame ack_frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
@@ -612,8 +613,8 @@ int pop_sqn(QueueSeqNum *queue, SeqNumData *sqn_dat){
         return RET_VAL_ERROR;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
-    memcpy(sqn_dat, &queue->sqn_dat[queue->head], sizeof(FrameData));
-    memset(&queue->sqn_dat[queue->head], 0, sizeof(FrameData));
+    memcpy(sqn_dat, &queue->sqn_dat[queue->head], sizeof(SeqNumData));
+    memset(&queue->sqn_dat[queue->head], 0, sizeof(SeqNumData));
     // Move the head index forward
     ++queue->head;
     queue->head %= QUEUE_SIZE;
