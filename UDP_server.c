@@ -577,6 +577,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                                 size_t bytes_written = 0;
                                 file_ptr = fopen(final_path, "w");
                                 bytes_written = fwrite(client->long_msg_buff[slot].text, 1, payload_total_text_len, file_ptr);
+                                free(client_folder_path);
                                 free(final_path);
                                 fclose(file_ptr);
 

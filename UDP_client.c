@@ -557,8 +557,13 @@ unsigned int WINAPI command_thread_func(void* ptr) {
             switch(command_num) {
                 case 1:
                     send_connect_request(client.session_id, client.client_id, client.flags, client.client_name, client.socket, &client.server_addr);
+                    client.session_status = SESSION_DISCONNECTED;
+                    client.last_client_active_time = time(NULL);                   
+                    if (recieve_frame_thread) {
+                        WaitForSingleObject(recieve_frame_thread, INFINITE);
+                        CloseHandle(recieve_frame_thread);
+                    }
                     client.session_status = SESSION_CONNECTING;
-                    client.last_client_active_time = time(NULL);
                     printf("Attempting to connect to server...\n");
                     recieve_frame_thread = (HANDLE)_beginthreadex(NULL, 0, receive_frame_thread_func, NULL, 0, NULL);
                     if (recieve_frame_thread == NULL) {
