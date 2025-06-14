@@ -65,6 +65,8 @@ typedef struct {
 
     LongMessageBufferEntry long_msg_buff[MAX_LONG_MESSAGE_BUFFER];
 
+    char log_frames_path[255];
+
     // In a real system, you'd add:
     // - A queue for outgoing reliable packets (with retransmission info)
     // - A receive buffer for out-of-order packets (for sliding window)
@@ -320,6 +322,38 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
     fprintf(stdout, "[ADDING NEW CLIENT] %s:%d Session ID:%d\n", addr, port, new_client->session_id);
 
     list->count++;
+
+
+
+
+            char* log_folder = "f:\\frame_logs\\";
+            char client_folder[64];
+            snprintf(client_folder, 64, "%d", new_client->session_id);
+            char *log_file = "\\out.txt";
+
+            strncpy(new_client->log_frames_path, log_folder, strlen(log_folder));
+            strncpy(new_client->log_frames_path + strlen(log_folder), client_folder, strlen(client_folder));
+            new_client->log_frames_path[strlen(log_folder) + strlen(client_folder) + 1] = '\0';
+
+            // First, let's make sure the folder exists for the purpose of this test
+            // (In a real scenario, this folder might pre-exist from a previous run or user action)
+            if (CreateDirectoryA(new_client->log_frames_path, NULL)) {
+                printf("Initially created folder '%s' for testing purposes.\n", new_client->log_frames_path);
+            } else {
+                DWORD folder_create_error = GetLastError();
+                if (folder_create_error == ERROR_ALREADY_EXISTS) {
+                    //printf("Folder '%s' already existed from a previous run. Good for testing.\n", client_folder_path);
+                } else {
+                    fprintf(stderr, "Error creating initial folder: %lu\n", folder_create_error);
+                    return NULL; // Exit if we can't even set up the test
+                }
+            }
+
+            strncpy(new_client->log_frames_path + strlen(log_folder) + strlen(client_folder), log_file, strlen(log_file));
+            new_client->log_frames_path[strlen(log_folder) + strlen(client_folder) + strlen(log_file) + 1] = '\0';
+
+            fprintf(stdout, "final path: %s\n", new_client->log_frames_path);
+
     return &list->client[free_slot];
 }
 // Remove a client
@@ -418,9 +452,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             continue;
         }
         // Log the received frame
-        log_recv_frame(frame, src_addr);
-        // Find or add client (thread-safe access)
-
+        
         ClientData *client = NULL;
 
         EnterCriticalSection(&list.mutex);
@@ -451,7 +483,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
         LeaveCriticalSection(&list.mutex);
         // 3. Process Payload based on Frame Type
         switch (header_frame_type) {
-            case FRAME_TYPE_CONNECT_REQUEST:                
+            case FRAME_TYPE_CONNECT_REQUEST:
                 send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr);
                 EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
@@ -487,11 +519,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     len = sizeof(frame->payload.text_msg.text) - 1;
                 }
                 frame->payload.text_msg.text[len] = '\0';
-
-                
-                
                 // TODO: Route message to another client if specified
- 
                 break;
             
             case FRAME_TYPE_LONG_TEXT_MESSAGE:
@@ -530,61 +558,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                         memcpy(dest, src, payload_fragment_text_len);
                         client->long_msg_buff[slot].bytes_received += payload_fragment_text_len;
                         if(client->long_msg_buff[slot].bytes_received == payload_total_text_len){
-                            client->long_msg_buff[slot].text[payload_total_text_len] = '\0';
-                                                         
- 
-                            
-
-
-
-                                char* folder_path = "f:\\vscode\\";
-                                char client_folder[64];
-                                snprintf(client_folder, 64, "%d", client->session_id);
-
-                                char *client_folder_path = malloc(strlen(client_folder) + strlen(folder_path) + 1);
-                                strncpy(client_folder_path, folder_path, strlen(folder_path));
-                                strncpy(client_folder_path + strlen(folder_path), client_folder, strlen(client_folder));
-                                client_folder_path[strlen(client_folder) + strlen(folder_path) + 1] = '\0';
-
-                                fprintf(stdout, "Client Folder path: %s\n", client_folder_path);
-
-                                // First, let's make sure the folder exists for the purpose of this test
-                                // (In a real scenario, this folder might pre-exist from a previous run or user action)
-                                if (CreateDirectoryA(client_folder_path, NULL)) {
-                                    printf("Initially created folder '%s' for testing purposes.\n", client_folder_path);
-                                } else {
-                                    DWORD folder_create_error = GetLastError();
-                                    if (folder_create_error == ERROR_ALREADY_EXISTS) {
-                                        //printf("Folder '%s' already existed from a previous run. Good for testing.\n", client_folder_path);
-                                    } else {
-                                        fprintf(stderr, "Error creating initial folder: %lu\n", folder_create_error);
-                                        return 1; // Exit if we can't even set up the test
-                                    }
-                                }
-
-                                char* client_file_name = "\\out.txt";
-                                char *final_path;
-                                final_path = malloc(strlen(client_folder_path) + strlen(client_file_name) + 1);
-                                strncpy(final_path, client_folder_path, strlen(client_folder_path));
-                                strncpy(final_path + strlen(client_folder_path), client_file_name, strlen(client_file_name));
-                                final_path[strlen(client_folder_path) + strlen(client_file_name) + 1] = '\0';
-
-                                fprintf(stdout, "Final path: %s\n", final_path);
-
-                                fprintf(stdout, "Full Text: %s\n", client->long_msg_buff[slot].text);
-                                
-                                FILE *file_ptr = NULL; // Initialize file pointer to NULL for safety
-                                size_t bytes_written = 0;
-                                file_ptr = fopen(final_path, "w");
-                                bytes_written = fwrite(client->long_msg_buff[slot].text, 1, payload_total_text_len, file_ptr);
-                                free(client_folder_path);
-                                free(final_path);
-                                fclose(file_ptr);
-
-
-
-
-                            
+                            client->long_msg_buff[slot].text[payload_total_text_len] = '\0';                      
                             free(client->long_msg_buff[slot].text);
                             client->long_msg_buff[slot].message_id = 0;
                             client->long_msg_buff[slot].bytes_received = 0;
@@ -606,6 +580,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 EnterCriticalSection(&list.mutex);
                 remove_client(&list, client->slot_num);
                 LeaveCriticalSection(&list.mutex);
+                client = NULL;
                 break;
 
             case FRAME_TYPE_PING:
@@ -620,6 +595,10 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             default:
                 break;
         }
+        if(client != NULL){
+            log_recv_frame(frame, src_addr, client->log_frames_path);
+        }
+          
     }
     printf("Exit process_frame_thread...\n");
     return 0; // Properly exit the thread created by _beginthreadex

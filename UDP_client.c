@@ -427,7 +427,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             continue;
         }
         // Log the received frame
-        log_recv_frame(frame, src_addr);
+//        log_recv_frame(frame, src_addr);
         // Find or add client (thread-safe access)
 
         // 3. Process Payload based on Frame Type
@@ -565,6 +565,7 @@ unsigned int WINAPI command_thread_func(void* ptr) {
                     }
                     client.session_status = SESSION_CONNECTING;
                     printf("Attempting to connect to server...\n");
+                    Sleep(100);
                     recieve_frame_thread = (HANDLE)_beginthreadex(NULL, 0, receive_frame_thread_func, NULL, 0, NULL);
                     if (recieve_frame_thread == NULL) {
                         fprintf(stderr, "Failed to create receive frame thread. Error: %d\n", GetLastError());
