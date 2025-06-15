@@ -14,26 +14,25 @@
 
 //#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 
-#define MAX_PAYLOAD_SIZE    40        // Max size of data within a frame payload (adjust as needed)
+#define MAX_PAYLOAD_SIZE    1500        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_SIZE          1048576        // Queue buffer size
 #define NAME_SIZE           64
-#define SILENT_FRAMES       0
+//#define ENABLE_LOGGING    1
 
 #define RET_VAL_ERROR       -1
 #define RET_VAL_SUCCESS     0
 
-typedef uint32_t EventType;
-enum EventType{
-    LOG_INFO, 
-    LOG_DEBUG, 
-    LOG_ERROR 
+typedef uint8_t LogType;
+enum LogType{
+    LOG_FRAME_RECV = 1,
+    LOG_FRAME_SENT = 2
 };
 
 typedef uint8_t DisconnectCode;
 enum DisconnectCode{
     DISCONNECT_REQUEST = 1,
-    DISCONNECT_TIMEOUT = 11,
+    DISCONNECT_TIMEOUT = 11
 };
 
 // --- Frame Types ---
@@ -158,8 +157,6 @@ typedef struct{
 
 #pragma pack(pop)
 //---------------------------------------------------------------------------------------------
-
-
 typedef struct {
     FrameEntry frame_entry[QUEUE_SIZE];
     uint32_t head;          
@@ -178,10 +175,11 @@ typedef struct {
 int calculate_crc32(const void *data, size_t len);
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 
+#ifdef ENABLE_LOGGING
 // Logging functions for debug
-void log_event(EventType event, const char* message);
-void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr, const char *file_path);
-void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr);
+void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path);
+void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]);
+#endif
 
 // Queue buffers
 int push_frame(QueueFrame *queue, FrameEntry *frame_entry);
@@ -191,41 +189,14 @@ int pop_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry);
 
 // UDP communication functions
 int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, 
+                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
+int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, 
+                        const struct sockaddr_in *dest_addr, const char *log_file_path);
+int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, 
+                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
 
 // ----- Function implementations -----
-// Log Events
-void log_event(EventType event, const char* message){
-    // Get the current UTC time
-    time_t current_time;
-    time(&current_time);
-    struct tm* utc_time = gmtime(&current_time);
-
-    const char* event_str = NULL;
-    // Determine the event type string based on the event_type
-    if (event == LOG_INFO){
-        event_str = "INFO";
-    } else if(event == LOG_DEBUG){
-        event_str = "DEBUG";
-    } else if(event == LOG_ERROR){
-        event_str = "ERROR";
-    } else {
-        event_str = "UNKNOWN";
-    }
-    // Print the event to stdout with UTC time
-    // Note: Using fprintf to stdout for logging, which is common for informational logs
-    fprintf(stdout,"\n[%s] [UTC %04d-%02d-%02d %02d:%02d:%02d] - %s",
-        event_str,
-        utc_time->tm_year + 1900,
-        utc_time->tm_mon + 1,
-        utc_time->tm_mday,
-        utc_time->tm_hour,
-        utc_time->tm_min,
-        utc_time->tm_sec,
-        message);
-}
 // CRC32 calculation
 int calculate_crc32(const void *data, size_t len){
     uint32_t crc = 0xFFFFFFFF; // Initial value
@@ -316,7 +287,7 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
     return bytes_sent;
 }
 // Send Ack/Nak type frame
-int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame ack_frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
@@ -339,11 +310,16 @@ int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t sess
         fprintf(stderr, "send_ack_nack() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&ack_frame, dest_addr);
+    #ifdef ENABLE_LOGGING 
+        if(strlen(log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &ack_frame, dest_addr, log_file_path);
+        }
+    #endif
     return bytes_sent;
 }
 // Send Disconnect type frame
-int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, 
+                        const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame frame;
     
     memset(&frame, 0, sizeof(frame));
@@ -361,11 +337,16 @@ int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET 
         fprintf(stderr, "send_disconnect() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&frame, dest_addr);
+    #ifdef ENABLE_LOGGING
+        if(strlen(log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
+        }
+    #endif
     return bytes_sent;
 }
 // Send Ping-Pong type frame
-int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, 
+                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame frame;
     // Check frame type is valid
     if((type != FRAME_TYPE_PING) && (type != FRAME_TYPE_PONG)){
@@ -389,152 +370,156 @@ int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t se
         fprintf(stderr, "send_ping_pong() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&frame, dest_addr);
+    #ifdef ENABLE_LOGGING
+        if(strlen(log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
+        }
+    #endif
     return bytes_sent;
 }
-// Log received frame
-void log_recv_frame(UdpFrame *frame, const struct sockaddr_in *src_addr, const char *file_path){
 
-    char addr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &src_addr->sin_addr, addr, INET_ADDRSTRLEN);
-    uint16_t port = ntohs(src_addr->sin_port);
+void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]){
 
-    FILE *file = fopen(file_path, "a");
+    if(buffer == NULL){
+        fprintf(stdout, "Invalid buffer!\n");
+    }
 
-    // file_ptr = fopen(final_path, "w");
-    // bytes_written = fwrite(client->long_msg_buff[slot].text, 1, payload_total_text_len, file_ptr);
+    char* log_folder = "G:\\logs\\";
+    char file_name[64] = {0};
+    if(type == 0){
+        snprintf(file_name, 64, "srv_%d.txt", session_id);
+    } else {
+        snprintf(file_name, 64, "cli_%d.txt", session_id);
+    } 
+    
+    if (CreateDirectory(log_folder, NULL)) {
+        printf("Created folder '%s' for logs: \n", buffer);
+    } else {
+        DWORD folder_create_error = GetLastError();
+        if (folder_create_error == ERROR_ALREADY_EXISTS) {
+            //printf("Folder '%s' already existed from a previous run. Good for testing.\n", client_folder_path);
+        } else {
+            fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
+            return; // Exit if we can't even set up the test
+        }
+    }
 
-    fprintf(file, "Received frame from %s:%d\n", addr, port);
+    strncpy(buffer, log_folder, strlen(log_folder));
+    strncpy(buffer + strlen(log_folder), file_name, strlen(file_name));
+    buffer[strlen(log_folder) + strlen(file_name) + 1] = '\0';
 
+    fprintf(stdout, "Session log file: %s\n", buffer);
+
+    FILE *file = fopen(buffer, "wb");
+    fclose(file);
+
+    return;
+
+}
+// Log frame
+void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path){
+
+    char str_addr[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &addr->sin_addr, str_addr, INET_ADDRSTRLEN);
+    uint16_t port = ntohs(addr->sin_port);
+
+    FILE *file = fopen(file_path, "ab");
+
+    time_t current_time;
+    time(&current_time);
+    struct tm* utc_time = gmtime(&current_time);
+
+    char buffer[100];
+
+    if (log_type == LOG_FRAME_RECV){
+        snprintf(buffer, sizeof(buffer), "Received frame from %s:%d - [UTC %04d-%02d-%02d %02d:%02d:%02d]\0", 
+                        str_addr, port, utc_time->tm_year + 1900, utc_time->tm_mon + 1, utc_time->tm_mday,
+                        utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec);
+    } else {
+        snprintf(buffer, sizeof(buffer), "Sent frame to %s:%d - [UTC %04d-%02d-%02d %02d:%02d:%02d]\0", 
+                        str_addr, port, utc_time->tm_year + 1900, utc_time->tm_mon + 1, utc_time->tm_mday,
+                        utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec);       
+    }
+   
     switch(frame->header.frame_type){
+ 
         case FRAME_TYPE_ACK:
-            fprintf(file, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file,"%s\n   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Flags: %d\n",
+                                                    buffer,                                           
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Flags: %d\n", frame->payload.ack_nak.flag);
+                                                    ntohl(frame->header.checksum),
+                                                    frame->payload.ack_nak.flag);
             break;
         case FRAME_TYPE_CONNECT_REQUEST:
-            fprintf(file, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", 
+                                                    buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", 
+                                                    ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.request.client_id), 
                                                     ntohl(frame->payload.request.flag), frame->payload.request.client_name);
             break;
         case FRAME_TYPE_CONNECT_RESPONSE:
-            fprintf(file, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", 
+                                                    buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", 
+                                                    ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.response.session_timeout), 
                                                     frame->payload.response.server_status, 
                                                     frame->payload.response.server_name);
             break;
         case FRAME_TYPE_TEXT_MESSAGE:
-            fprintf(file, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Text Length: %d\n   Text: %s\n", 
+                                                    buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Text Length: %d\n   Text: %s\n", 
+                                                    ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.text_msg.len), frame->payload.text_msg.text);
             break;
         case FRAME_TYPE_LONG_TEXT_MESSAGE:
-            fprintf(file, "   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
+                                                    buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
+                                                    ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.long_text_msg.message_id), 
                                                     ntohl(frame->payload.long_text_msg.total_text_len),
                                                     ntohl(frame->payload.long_text_msg.fragment_len),
                                                     ntohl(frame->payload.long_text_msg.fragment_offset), 
-                                                    frame->payload.long_text_msg.fragment_text); 
+                                                    frame->payload.long_text_msg.fragment_text);
             break;
 
         case FRAME_TYPE_DISCONNECT:
-            fprintf(file, "   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Disconnect flag: %d\n", 
+                                                    buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Disconnect flag: %d\n", frame->payload.disconnect.flag);
+                                                    ntohl(frame->header.checksum),
+                                                    frame->payload.disconnect.flag);
             break;
         case FRAME_TYPE_PING:
-            fprintf(file, "   FRAME_TYPE_PING\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_PING\n   Session ID: %d\n   Checksum: %d\n   Ack Ping Seq: %d\n   Flags: %d\n", 
+                                                    buffer,
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Ack Ping Seq: %d\n   Flags: %d\n", 
-                                                    ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flag);
+                                                    ntohl(frame->header.checksum),
+                                                    ntohl(frame->payload.ping_pong.ack_num), 
+                                                    frame->payload.ping_pong.flag);
             break;
         case FRAME_TYPE_PONG:
-            fprintf(file, "   FRAME_TYPE_PONG\n   Session ID: %d\n   Checksum: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_PONG\n   Session ID: %d\n   Checksum: %d\n   Ack Pong Seq: %d\n   Flags: %d\n", 
+                                                    buffer,
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum));
-            fprintf(file, "   Ack Pong Seq: %d\n   Flags: %d\n", 
+                                                    ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.ping_pong.ack_num), 
                                                     frame->payload.ping_pong.flag);
             break;
         default:
-//                fprintf(stdout, "   FRAME_TYPE_INVALID\n");
             break;
     }
-    fclose(file); // Close the file
-   
+    fclose(file); // Close the file  
     return;
-}
-// Log sent frame
-void log_sent_frame(UdpFrame *frame, const struct sockaddr_in *dest_addr){
-
-    char addr[INET_ADDRSTRLEN];
-    inet_ntop(AF_INET, &dest_addr->sin_addr, addr, INET_ADDRSTRLEN);
-    uint16_t port = ntohs(dest_addr->sin_port);
-    fprintf(stdout, "Sent frame to %s:%d\n", addr, port);
-    switch(frame->header.frame_type){
-        case FRAME_TYPE_ACK:
-            fprintf(stdout, "   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Flags: %d\n", frame->payload.ack_nak.flag);
-            break;
-        case FRAME_TYPE_CONNECT_REQUEST:
-            fprintf(stdout, "   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", ntohl(frame->payload.request.client_id), ntohl(frame->payload.request.flag), frame->payload.request.client_name);
-            break;
-        case FRAME_TYPE_CONNECT_RESPONSE:
-            fprintf(stdout, "   FRAME_TYPE_CONNECT_RESPONSE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Session Timeout: %d\n   Sever Status: %d\n   Server Name: %s\n", ntohl(frame->payload.response.session_timeout), frame->payload.response.server_status, frame->payload.response.server_name);
-            break;
-        case FRAME_TYPE_TEXT_MESSAGE:
-            fprintf(stdout, "   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Text Length: %d\n   Text: %s\n", ntohl(frame->payload.text_msg.len), frame->payload.text_msg.text);
-            break;
-        case FRAME_TYPE_DISCONNECT:
-            fprintf(stdout, "   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Disconnect Flag: %d\n", frame->payload.disconnect.flag);
-            break;
-        case FRAME_TYPE_LONG_TEXT_MESSAGE:
-            fprintf(stdout, "   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.seq_num), ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-            fprintf(stdout, "   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
-                                                    ntohl(frame->payload.long_text_msg.message_id), 
-                                                    ntohl(frame->payload.long_text_msg.total_text_len),
-                                                    ntohl(frame->payload.long_text_msg.fragment_len),
-                                                    ntohl(frame->payload.long_text_msg.fragment_offset), 
-                                                    frame->payload.long_text_msg.fragment_text); 
-            break;
-
-        // case FRAME_TYPE_PING:
-        //     fprintf(stdout, "   FRAME_TYPE_PING\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-        //     fprintf(stdout, "   Ack Ping Seq: %d\n   Flags: %d\n", ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flags);
-        //     break;
-        // case FRAME_TYPE_PONG:
-        //     fprintf(stdout, "   FRAME_TYPE_PONG\n   Session ID: %d\n   Checksum: %d\n", ntohl(frame->header.session_id), ntohl(frame->header.checksum));
-        //     fprintf(stdout, "   Ack Pong Seq: %d\n   Flags: %d\n", ntohl(frame->payload.ping_pong.ack_num), frame->payload.ping_pong.flags);
-        //     break;
-        default:
-//                fprintf(stdout, "   FRAME_TYPE_INVALID\n");
-            break;
-    }
-    return;  
 }
 // Push sequence number to queue - used for received frames (seq_num) that need to be acked
 

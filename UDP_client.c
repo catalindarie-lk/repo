@@ -29,6 +29,7 @@ enum ClientStatus {
 
 typedef struct{
     SOCKET socket;
+    struct sockaddr_in client_addr;
     struct sockaddr_in server_addr;
 
     uint32_t client_id;
@@ -48,6 +49,8 @@ typedef struct{
     uint32_t last_pong_ack_num;
     time_t last_server_active_time;
     time_t last_client_active_time;
+
+    char log_file_path[255];
  
 } ClientData;
 
@@ -62,7 +65,8 @@ HANDLE ack_nak_thread;
 HANDLE ping_pong_thread;
 HANDLE command_thread;
 
-const char *server_ip = "127.0.0.1"; // loopback address
+const char *server_ip = "10.10.10.1"; // loopback address
+const char *client_ip = "10.10.10.2";
 
 // --- Function prototypes ---
 int send_connect_request(const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
@@ -134,7 +138,6 @@ void init_client(){
 
     client.client_status = CLIENT_BUSY;
 
-    // Create UDP socket
     client.socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (client.socket == INVALID_SOCKET) {
         fprintf(stderr, "Socket creation failed. Error: %d\n", WSAGetLastError());
@@ -142,6 +145,17 @@ void init_client(){
         cleanup_winsock();
         return;
     }
+    client.client_addr.sin_family = AF_INET;
+    client.client_addr.sin_port = htons(0); // Let OS choose port
+    client.client_addr.sin_addr.s_addr = inet_addr(client_ip);
+
+    if (bind(client.socket, (struct sockaddr *)&client.client_addr, sizeof(client.client_addr)) == SOCKET_ERROR) {
+        printf("Bind failed: %d\n", WSAGetLastError());
+        return;
+    }
+
+    // Create UDP socket
+    
     
     // Define server address
     memset(&client.server_addr, 0, sizeof(client.server_addr));
@@ -167,6 +181,7 @@ void init_client(){
     client.client_id = CLIENT_ID;
     client.client_status = CLIENT_READY;
     client.session_status = SESSION_DISCONNECTED;
+    client.log_file_path[0] = '\0';
     InitializeCriticalSection(&client.frame_count_mutex);
     return;
 }
@@ -238,6 +253,7 @@ int main() {
             EnterCriticalSection(&client.frame_count_mutex);
             client.frame_count = 0;       // this will be sent as seq_num
             LeaveCriticalSection(&client.frame_count_mutex);
+            client.log_file_path[0] = '\0'; 
             client.session_id = 0;
             client.server_status = 0;
             client.session_timeout = 0;
@@ -274,8 +290,12 @@ int send_connect_request(const uint32_t session_id, const uint32_t client_id, co
         fprintf(stderr, "send_connect_request() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&frame, dest_addr);
-    return bytes_sent;
+    #ifdef ENABLE_LOGGING
+        if(&client != NULL && strlen(client.log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_file_path);
+        }
+    #endif
+    return bytes_sent; 
 };
 // --- Send text message ---
 int send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, 
@@ -305,7 +325,11 @@ int send_text_message(const uint32_t seq_nr, const uint32_t session_id, const ch
         fprintf(stderr, "send_text_message() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&frame, dest_addr);
+    #ifdef ENABLE_LOGGING
+        if(&client != NULL && strlen(client.log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_file_path);
+        }
+    #endif
     return bytes_sent;
 };
 // --- Send long text message fragment ---
@@ -343,7 +367,11 @@ int send_long_text_fragment(const uint32_t seq_nr, const uint32_t session_id, co
         fprintf(stderr, "send_text_message() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&frame, dest_addr);
+    #ifdef ENABLE_LOGGING
+        if(&client != NULL && strlen(client.log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_file_path);
+        }
+    #endif
     return bytes_sent;
 }
 
@@ -426,10 +454,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             // For individual datagrams, retransmission is often handled by higher layers or ignored.
             continue;
         }
-        // Log the received frame
-//        log_recv_frame(frame, src_addr);
         // Find or add client (thread-safe access)
-
         // 3. Process Payload based on Frame Type
         switch (received_frame_type) {
             case FRAME_TYPE_CONNECT_RESPONSE: {
@@ -463,7 +488,9 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     client.session_status = SESSION_DISCONNECTED;
                     client.client_status = CLIENT_STOP; // Signal immediate shutdown
                 }
-                //TODO:
+                #ifdef ENABLE_LOGGING
+                    create_log_frame_file(1, client.session_id, client.log_file_path);
+                #endif
                 break; 
             }
 
@@ -476,10 +503,10 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             case FRAME_TYPE_DISCONNECT: {
                 uint8_t flag = frame->payload.disconnect.flag;
                 if(flag == DISCONNECT_TIMEOUT){
-                    printf("Server closed the session due to incativity...\n");
+                    fprintf(stdout, "Server closed the session due to incativity...\n");
                 } 
                 client.session_status = SESSION_DISCONNECTED;
-                printf("Session closed...\n");
+                fprintf(stdout, "Session closed...\n");
                 break;
             }
             case FRAME_TYPE_PING:
@@ -497,6 +524,11 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             default:
                 break;
         }
+        #ifdef ENABLE_LOGGING
+            if(&client != NULL && strlen(client.log_file_path) > 0){
+                log_frame(LOG_FRAME_RECV, frame, src_addr, client.log_file_path);
+            }
+        #endif
     }
     fprintf(stdout, "Process frame thread exiting...\n");
     return 0; // Properly exit the thread created by _beginthreadex
@@ -508,7 +540,7 @@ unsigned int WINAPI ping_pong_thread_func(void* ptr){
         if(time(NULL) < (time_t)(client.last_server_active_time + client.session_timeout / 3)){
             continue;
         }
-        send_ping_pong(FRAME_TYPE_PING, ++client.last_ping_ack_num ,client.session_id, client.socket, &client.server_addr);
+        send_ping_pong(FRAME_TYPE_PING, ++client.last_ping_ack_num ,client.session_id, client.socket, &client.server_addr, client.log_file_path);
         client.last_client_active_time = time(NULL);
         if(time(NULL) > (time_t)(client.last_server_active_time + client.session_timeout * 2)){
             client.session_status = SESSION_DISCONNECTED;
@@ -529,7 +561,7 @@ unsigned int WINAPI ack_nak_thread_func(void* ptr){
             Sleep(10);
             continue;
         }
-        send_ack_nak(seq_num_entry.type, seq_num_entry.seq_num, client.session_id, client.socket, &seq_num_entry.addr);
+        send_ack_nak(seq_num_entry.type, seq_num_entry.seq_num, client.session_id, client.socket, &seq_num_entry.addr, client.log_file_path);
         client.last_client_active_time = time(NULL);
     }
     fprintf(stdout, "Exit ack/nak thread...\n");
@@ -556,6 +588,10 @@ unsigned int WINAPI command_thread_func(void* ptr) {
             if(strcmp(command_str, "f") == 0 || strcmp(command_str, "F") == 0) command_num = 5;
             switch(command_num) {
                 case 1:
+                    // if(client.session_status == SESSION_CONNECTED){
+                    //     fprintf(stdout, "Already connected to server...\n");
+                    //     break;
+                    // }
                     send_connect_request(client.session_id, client.client_id, client.flags, client.client_name, client.socket, &client.server_addr);
                     client.session_status = SESSION_DISCONNECTED;
                     client.last_client_active_time = time(NULL);                   
@@ -574,12 +610,15 @@ unsigned int WINAPI command_thread_func(void* ptr) {
                     }
                     Sleep(1000);
                     if(client.session_status != SESSION_CONNECTED){
+                        fprintf(stdout, "Connection to server failed...\n");
                         client.session_status = SESSION_DISCONNECTED;
-                    }
+                    } else {
+                        fprintf(stdout, "Connection to server success...\n");
+                    }                    
                     break;
 
                 case 2:
-                    send_disconnect(DISCONNECT_REQUEST, client.session_id, client.socket, &client.server_addr);
+                    send_disconnect(DISCONNECT_REQUEST, client.session_id, client.socket, &client.server_addr, client.log_file_path);
                     client.session_status = SESSION_DISCONNECTED;
                     printf("Disconnecting from server...\n");
                     break;
@@ -603,7 +642,6 @@ unsigned int WINAPI command_thread_func(void* ptr) {
                     long text_size = get_text_file_size(file_path);
                     char *text = (char *)malloc(text_size + 1);
                     read_text_file(file_path, text, text_size);
-//                    printf("text size: %d\n", text_size);
 
                     uint32_t max_fragment_size = MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 4);
                     uint32_t fragment_offset = 0;

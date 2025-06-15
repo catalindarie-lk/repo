@@ -1,16 +1,18 @@
 #define _CRT_SECURE_NO_WARNINGS // Suppress warnings for strcpy, strncpy, etc.
 
 #include "UDP_lib.h"
+#include <iphlpapi.h>
 
 //#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+#pragma comment(lib, "iphlpapi.lib")
 
 // --- Constants ---
 #define SERVER_PORT 12345       // Port the server listens on
 #define RECVFROM_TIMEOUT_MS 100         // Timeout for recvfrom in milliseconds in the receive thread
-#define CLIENT_SESSION_TIMEOUT_SEC 30        // Seconds after which an inactive client is considered disconnected
+#define CLIENT_SESSION_TIMEOUT_SEC 90        // Seconds after which an inactive client is considered disconnected
 #define SERVER_NAME "lkdc UDP Text/File Transfer Server"
 #define MAX_CLIENTS 20
-#define MAX_LONG_MESSAGE_BUFFER 255
+#define MAX_CONCURRENT_LONG_MESSAGES_PER_CLIENT 255
 
 typedef uint8_t ServerStatus;
 enum ServerStatus {
@@ -63,9 +65,9 @@ typedef struct {
     uint32_t slot_num;
     ClientSlotStatus slot_status;            //0->FREE; 1->BUSY
 
-    LongMessageBufferEntry long_msg_buff[MAX_LONG_MESSAGE_BUFFER];
+    LongMessageBufferEntry long_msg_buff[MAX_CONCURRENT_LONG_MESSAGES_PER_CLIENT];
 
-    char log_frames_path[255];
+    char log_file_path[255];
 
     // In a real system, you'd add:
     // - A queue for outgoing reliable packets (with retransmission info)
@@ -89,8 +91,11 @@ HANDLE process_frame_thread;
 HANDLE client_timeout_thread;
 HANDLE server_command_thread;
 
+const char *server_ip = "10.10.10.1"; // IPv4 example
+
 // UDP communication functions
-int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr);
+int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
+                                const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
 
 // Thread functions
 unsigned int WINAPI receive_frame_thread_func(void* ptr);
@@ -104,6 +109,32 @@ ClientData* find_client(ClientList *list, const uint32_t session_id);
 ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
 int remove_client(ClientList *list, const uint32_t session_id);
 
+
+void get_network_config() {
+    DWORD bufferSize = 0;
+    IP_ADAPTER_ADDRESSES *adapterAddresses = NULL, *adapter = NULL;
+
+    // Get required buffer size
+    GetAdaptersAddresses(AF_INET, 0, NULL, adapterAddresses, &bufferSize);
+    adapterAddresses = (IP_ADAPTER_ADDRESSES *)malloc(bufferSize);
+
+    if (GetAdaptersAddresses(AF_INET, 0, NULL, adapterAddresses, &bufferSize) == NO_ERROR) {
+        for (adapter = adapterAddresses; adapter; adapter = adapter->Next) {
+            fprintf(stdout, "Adapter: %ls\n", adapter->FriendlyName);
+            IP_ADAPTER_UNICAST_ADDRESS *address = adapter->FirstUnicastAddress;
+            while (address) {
+                SOCKADDR_IN *sockaddr = (SOCKADDR_IN *)address->Address.lpSockaddr;
+                printf("IP Address: %s\n", inet_ntoa(sockaddr->sin_addr));
+                address = address->Next;
+            }
+        }
+    } else {
+        printf("Failed to retrieve adapter information.\n");
+    }
+
+    free(adapterAddresses);
+    return;
+}
 void init_winsock() {
     WSADATA wsaData;
     int iResult = WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -123,7 +154,6 @@ void init_server(){
     server.status = SERVER_BUSY;
     // 1. Create Socket
     server.socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    const char *server_ip = "127.0.0.1"; // IPv4 example
     if (server.socket == INVALID_SOCKET) {
         fprintf(stderr, "socket failed with error: %d\n", WSAGetLastError());
         cleanup_winsock();
@@ -218,6 +248,7 @@ void shutdown_server() {
 }
 // --- Main server function ---
 int main() {
+//    get_network_config();
     init_winsock();
     init_server();
     start_threads();
@@ -239,7 +270,8 @@ int main() {
 }
 
 // --- Send connect response ---
-int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr) {
+int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
+                                const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path) {
     UdpFrame frame;
     // Initialize the response frame
     memset(&frame, 0, sizeof(UdpFrame));
@@ -264,7 +296,11 @@ int send_connect_response(const uint32_t session_id, const uint32_t session_time
         fprintf(stderr, "send_connect_respose() failed\n");
         return SOCKET_ERROR;
     }
-    log_sent_frame(&frame, dest_addr);
+    #ifdef ENABLE_LOGGING
+        if(strlen(log_file_path) > 0){
+            log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
+        }
+    #endif
     return bytes_sent;
 }
 // Find client by session ID
@@ -321,39 +357,12 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
     uint16_t port = ntohs(client_addr->sin_port);
     fprintf(stdout, "[ADDING NEW CLIENT] %s:%d Session ID:%d\n", addr, port, new_client->session_id);
 
+    new_client->log_file_path[0] = '\0';
+
     list->count++;
-
-
-
-
-            char* log_folder = "f:\\frame_logs\\";
-            char client_folder[64];
-            snprintf(client_folder, 64, "%d", new_client->session_id);
-            char *log_file = "\\out.txt";
-
-            strncpy(new_client->log_frames_path, log_folder, strlen(log_folder));
-            strncpy(new_client->log_frames_path + strlen(log_folder), client_folder, strlen(client_folder));
-            new_client->log_frames_path[strlen(log_folder) + strlen(client_folder) + 1] = '\0';
-
-            // First, let's make sure the folder exists for the purpose of this test
-            // (In a real scenario, this folder might pre-exist from a previous run or user action)
-            if (CreateDirectoryA(new_client->log_frames_path, NULL)) {
-                printf("Initially created folder '%s' for testing purposes.\n", new_client->log_frames_path);
-            } else {
-                DWORD folder_create_error = GetLastError();
-                if (folder_create_error == ERROR_ALREADY_EXISTS) {
-                    //printf("Folder '%s' already existed from a previous run. Good for testing.\n", client_folder_path);
-                } else {
-                    fprintf(stderr, "Error creating initial folder: %lu\n", folder_create_error);
-                    return NULL; // Exit if we can't even set up the test
-                }
-            }
-
-            strncpy(new_client->log_frames_path + strlen(log_folder) + strlen(client_folder), log_file, strlen(log_file));
-            new_client->log_frames_path[strlen(log_folder) + strlen(client_folder) + strlen(log_file) + 1] = '\0';
-
-            fprintf(stdout, "final path: %s\n", new_client->log_frames_path);
-
+    #ifdef ENABLE_LOGGING
+        create_log_frame_file(0, new_client->session_id, new_client->log_file_path);
+    #endif
     return &list->client[free_slot];
 }
 // Remove a client
@@ -367,7 +376,6 @@ int remove_client(ClientList *list, const uint32_t slot) {
     list->count--;
     return 0;
 }
-
 // --- Process server command ---
 unsigned int WINAPI server_command_thread_func(void* ptr){
 
@@ -460,7 +468,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             client = find_client(&list, header_session_id);
             if(client != NULL){
                 fprintf(stdout, "Client already connected\n");
-                send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr);
+                send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
                 continue;
@@ -484,10 +492,10 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
         // 3. Process Payload based on Frame Type
         switch (header_frame_type) {
             case FRAME_TYPE_CONNECT_REQUEST:
-                send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr);
                 EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
+                send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
                 break;
             
             case FRAME_TYPE_ACK:
@@ -514,11 +522,13 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
                 // Extract text message
                 uint32_t len = ntohl(frame->payload.text_msg.len);
-                // Ensure null termination for safe printing, cap at max payload size
+
                 if (len >= sizeof(frame->payload.text_msg.text)) {
                     len = sizeof(frame->payload.text_msg.text) - 1;
                 }
                 frame->payload.text_msg.text[len] = '\0';
+
+                fprintf(stdout, "Received text msg from %s:%d\n%s\n", src_ip, src_port, frame->payload.text_msg.text);
                 // TODO: Route message to another client if specified
                 break;
             
@@ -547,18 +557,24 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 uint32_t slot = 0;
                 uint32_t free_slot = 0;
 
-                for(slot = 0; slot < MAX_LONG_MESSAGE_BUFFER; slot++){
+                for(slot = 0; slot < MAX_CONCURRENT_LONG_MESSAGES_PER_CLIENT; slot++){
                     if(client->long_msg_buff[slot].message_id == 0) {
                         free_slot = slot;
                     }
                     if(client->long_msg_buff[slot].message_id == payload_message_id){
                         message_id_found = TRUE;
                         char *dest = client->long_msg_buff[slot].text + payload_fragment_text_offset;
-                        char *src = frame->payload.long_text_msg.fragment_text;                       
+                        char *src = frame->payload.long_text_msg.fragment_text;                                              
                         memcpy(dest, src, payload_fragment_text_len);
                         client->long_msg_buff[slot].bytes_received += payload_fragment_text_len;
-                        if(client->long_msg_buff[slot].bytes_received == payload_total_text_len){
-                            client->long_msg_buff[slot].text[payload_total_text_len] = '\0';                      
+                        if(client->long_msg_buff[slot].bytes_received >= payload_total_text_len){                                                      
+                            client->long_msg_buff[slot].text[payload_total_text_len] = '\0';
+                            
+                            FILE *new_file = fopen("G:\\out.txt", "wb");
+                            fprintf(new_file, "%s", client->long_msg_buff[slot].text);                   
+                            fclose(new_file);                                                      
+                            // fprintf(stdout, "Received long text msg from %s:%d\n%s\n", src_ip, src_port, client->long_msg_buff[slot].text);                   
+ 
                             free(client->long_msg_buff[slot].text);
                             client->long_msg_buff[slot].message_id = 0;
                             client->long_msg_buff[slot].bytes_received = 0;
@@ -570,10 +586,24 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     break;
                 client->long_msg_buff[free_slot].message_id = payload_message_id;
                 client->long_msg_buff[free_slot].text = malloc(payload_total_text_len);
+                fprintf(stdout, "Text length: %d", payload_total_text_len);
                 char *dest = client->long_msg_buff[free_slot].text + payload_fragment_text_offset;
                 char *src = frame->payload.long_text_msg.fragment_text;
-                memcpy(dest, src, payload_fragment_text_len);
+                memcpy(dest, src, payload_fragment_text_len);               
                 client->long_msg_buff[free_slot].bytes_received = payload_fragment_text_len;
+
+                if(client->long_msg_buff[free_slot].bytes_received >= payload_total_text_len){
+                    client->long_msg_buff[free_slot].text[payload_total_text_len] = '\0';
+
+                    FILE *new_file = fopen("G:\\out.txt", "wb");
+                    fprintf(new_file, "%s", client->long_msg_buff[free_slot].text);                   
+                    fclose(new_file);                                                      
+                    // fprintf(stdout, "Received long text msg from %s:%d\n%s\n", src_ip, src_port, client->long_msg_buff[free_slot].text);                   
+  
+                    free(client->long_msg_buff[free_slot].text);
+                    client->long_msg_buff[free_slot].message_id = 0;
+                    client->long_msg_buff[free_slot].bytes_received = 0;
+                }
                 break;
             
             case FRAME_TYPE_DISCONNECT:
@@ -590,15 +620,16 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
                 uint32_t ping_ack_num = ntohl(frame->payload.ping_pong.ack_num);
                 uint8_t ping_flag = frame->payload.ping_pong.flag;
-                send_ping_pong(FRAME_TYPE_PONG, ping_ack_num, client->session_id, server.socket, &client->addr);
+                send_ping_pong(FRAME_TYPE_PONG, ping_ack_num, client->session_id, server.socket, &client->addr, client->log_file_path);
                 break;
             default:
                 break;
         }
-        if(client != NULL){
-            log_recv_frame(frame, src_addr, client->log_frames_path);
-        }
-          
+        #ifdef ENABLE_LOGGING
+            if(client != NULL && strlen(client->log_file_path) > 0){
+                log_frame(LOG_FRAME_RECV, frame, src_addr, client->log_file_path);
+            }
+        #endif      
     }
     printf("Exit process_frame_thread...\n");
     return 0; // Properly exit the thread created by _beginthreadex
@@ -619,7 +650,7 @@ unsigned int WINAPI client_timeout_thread_func(void* ptr){
                 continue;
             }
             fprintf(stdout, "\nClient with Session ID: %d disconnected due to timeout\n", list.client[slot].session_id);
-            send_disconnect(DISCONNECT_TIMEOUT, list.client[slot].session_id, server.socket, &list.client[slot].addr);         
+            send_disconnect(DISCONNECT_TIMEOUT, list.client[slot].session_id, server.socket, &list.client[slot].addr, list.client[slot].log_file_path);         
             remove_client(&list, slot);
             LeaveCriticalSection(&list.mutex);
             fprintf(stdout, "Remaining connected clients: %d\n", list.count);            
@@ -649,9 +680,10 @@ unsigned int WINAPI ack_nak_thread_func(void* ptr){
             Sleep(10);
             continue; // Nothing to send, skip to next iteration
         }
-        send_ack_nak(seq_num_entry.type, seq_num_entry.seq_num, seq_num_entry.session_id, server.socket, &seq_num_entry.addr);
+        send_ack_nak(seq_num_entry.type, seq_num_entry.seq_num, seq_num_entry.session_id, server.socket, &seq_num_entry.addr, client->log_file_path);
     }
     fprintf(stdout, "Exit ack/nak thread...\n");
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
     return 0;
 }
+
