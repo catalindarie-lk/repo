@@ -18,7 +18,7 @@
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_SIZE          1048576        // Queue buffer size
 #define NAME_SIZE           64
-//#define ENABLE_LOGGING    1
+#define ENABLE_LOGGING    1
 
 #define RET_VAL_ERROR       -1
 #define RET_VAL_SUCCESS     0
@@ -406,7 +406,7 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
 
     strncpy(buffer, log_folder, strlen(log_folder));
     strncpy(buffer + strlen(log_folder), file_name, strlen(file_name));
-    buffer[strlen(log_folder) + strlen(file_name) + 1] = '\0';
+    buffer[strlen(log_folder) + strlen(file_name)] = '\0';
 
     fprintf(stdout, "Session log file: %s\n", buffer);
 
