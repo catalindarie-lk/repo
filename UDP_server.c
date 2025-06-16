@@ -1,10 +1,6 @@
 #define _CRT_SECURE_NO_WARNINGS // Suppress warnings for strcpy, strncpy, etc.
 
 #include "UDP_lib.h"
-#include <iphlpapi.h>
-
-//#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
-#pragma comment(lib, "iphlpapi.lib")
 
 // --- Constants ---
 #define SERVER_PORT 12345       // Port the server listens on
@@ -349,7 +345,7 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
     new_client->flag = recv_frame->payload.request.flag;
     new_client->srv_to_client_frame_count = 0;
  
-    strncpy(new_client->name, recv_frame->payload.request.client_name, sizeof(NAME_SIZE - 1));
+    strncpy(new_client->name, recv_frame->payload.request.client_name, NAME_SIZE);
     new_client->name[NAME_SIZE - 1] = '\0';
 
     char addr[INET_ADDRSTRLEN];
@@ -504,34 +500,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 LeaveCriticalSection(&list.mutex);
                 break;
                 //TODO: Handle ACK processing, e.g., update internal state or queues
-            
-            case FRAME_TYPE_TEXT_MESSAGE:
-                // Update client activity time
-                EnterCriticalSection(&list.mutex);
-                client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
-
-                // Push sequence number to queue to send ACK
-                seq_num_entry.seq_num = header_seq_num;
-                seq_num_entry.type = FRAME_TYPE_ACK;
-                seq_num_entry.session_id = header_session_id;
-                memcpy(&seq_num_entry.addr, src_addr, sizeof(struct sockaddr_in));
-                if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
-                    fprintf(stderr, "Pushing seq_num error!!!\n");
-                };
-
-                // Extract text message
-                uint32_t len = ntohl(frame->payload.text_msg.len);
-
-                if (len >= sizeof(frame->payload.text_msg.text)) {
-                    len = sizeof(frame->payload.text_msg.text) - 1;
-                }
-                frame->payload.text_msg.text[len] = '\0';
-
-                fprintf(stdout, "Received text msg from %s:%d\n%s\n", src_ip, src_port, frame->payload.text_msg.text);
-                // TODO: Route message to another client if specified
-                break;
-            
+                       
             case FRAME_TYPE_LONG_TEXT_MESSAGE:
                 // Update client activity time
                 EnterCriticalSection(&list.mutex);
@@ -567,13 +536,17 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                         char *src = frame->payload.long_text_msg.fragment_text;                                              
                         memcpy(dest, src, payload_fragment_text_len);
                         client->long_msg_buff[slot].bytes_received += payload_fragment_text_len;
+                        
+                        fprintf(stdout, "Bytes Received: %d Out of: %d\n", client->long_msg_buff[slot].bytes_received, ntohl(frame->payload.long_text_msg.total_text_len));
+
                         if(client->long_msg_buff[slot].bytes_received >= payload_total_text_len){                                                      
                             client->long_msg_buff[slot].text[payload_total_text_len] = '\0';
                             
-                            FILE *new_file = fopen("G:\\out.txt", "wb");
+                            FILE *new_file = fopen("E:\\out.txt", "ab");
                             fprintf(new_file, "%s", client->long_msg_buff[slot].text);                   
                             fclose(new_file);                                                      
-                            // fprintf(stdout, "Received long text msg from %s:%d\n%s\n", src_ip, src_port, client->long_msg_buff[slot].text);                   
+                            fprintf(stdout, "Received long text msg from %s:%d - Bytes: %d - ID: %d\n", src_ip, src_port, payload_total_text_len, payload_message_id);                   
+                            //fprintf(stdout, "Message: %s\n", client->long_msg_buff[slot].text);                   
  
                             free(client->long_msg_buff[slot].text);
                             client->long_msg_buff[slot].message_id = 0;
@@ -586,7 +559,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     break;
                 client->long_msg_buff[free_slot].message_id = payload_message_id;
                 client->long_msg_buff[free_slot].text = malloc(payload_total_text_len);
-                fprintf(stdout, "Text length: %d", payload_total_text_len);
+
                 char *dest = client->long_msg_buff[free_slot].text + payload_fragment_text_offset;
                 char *src = frame->payload.long_text_msg.fragment_text;
                 memcpy(dest, src, payload_fragment_text_len);               
@@ -595,10 +568,11 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 if(client->long_msg_buff[free_slot].bytes_received >= payload_total_text_len){
                     client->long_msg_buff[free_slot].text[payload_total_text_len] = '\0';
 
-                    FILE *new_file = fopen("G:\\out.txt", "wb");
+                    FILE *new_file = fopen("E:\\out.txt", "wb");
                     fprintf(new_file, "%s", client->long_msg_buff[free_slot].text);                   
-                    fclose(new_file);                                                      
-                    // fprintf(stdout, "Received long text msg from %s:%d\n%s\n", src_ip, src_port, client->long_msg_buff[free_slot].text);                   
+                    fclose(new_file);
+                    fprintf(stdout, "Received long text msg from %s:%d - Bytes: %d - ID:%d\n", src_ip, src_port, payload_total_text_len, payload_message_id);                   
+                    //fprintf(stdout, "Message: %s\n", client->long_msg_buff[free_slot].text);                   
   
                     free(client->long_msg_buff[free_slot].text);
                     client->long_msg_buff[free_slot].message_id = 0;

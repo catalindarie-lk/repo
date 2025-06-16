@@ -1,8 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS // Suppress warnings for strcpy, strncpy, etc.
 
 #include "UDP_lib.h"
-
-//#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+#include "ack_hash.h"
 
 // --- Constants ---
 #define SERVER_PORT         12345       // Port the server listens on
@@ -11,6 +10,8 @@
 #define FILE_TRANSFER_TIMEOUT_SEC 60    // Seconds after which a stalled file transfer is cleaned up
 #define CLIENT_ID           0xAA        // Example client ID, can be set dynamically
 #define CLIENT_NAME         "lkdc UDP Text/File Transfer Client"
+#define FRAGMENT_SIZE       (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 4)
+#define CHUNK_SIZE          (FRAGMENT_SIZE * 8)
 
 typedef uint8_t SessionStatus;
 enum SessionStatus{
@@ -38,6 +39,7 @@ typedef struct{
     ClientStatus client_status;         
     SessionStatus session_status;     // 0-DISCONNECTED; 1-CONNECTED
     uint32_t frame_count;       // this will be sent as seq_num
+    uint32_t message_id_count;
     CRITICAL_SECTION frame_count_mutex;
 
     uint32_t session_id;        // session id received from the server after connection accepted
@@ -61,9 +63,15 @@ QueueSeqNum queue_sqn;
 
 HANDLE recieve_frame_thread;
 HANDLE process_frame_thread;
-HANDLE ack_nak_thread;
+// HANDLE ack_nak_thread;
 HANDLE ping_pong_thread;
 HANDLE command_thread;
+
+CRITICAL_SECTION hash_table_mutex;
+
+HANDLE resend_thread;
+
+AckHashNode *hash_table[HASH_SIZE] = {NULL};
 
 const char *server_ip = "10.10.10.1"; // loopback address
 const char *client_ip = "10.10.10.2";
@@ -71,17 +79,16 @@ const char *client_ip = "10.10.10.2";
 // --- Function prototypes ---
 int send_connect_request(const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
                                         const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, 
-                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_long_text_fragment(const uint32_t seq_nr, const uint32_t session_id, const uint32_t message_id, const char* fragment_text, 
-                                        const uint32_t total_len, const uint32_t fragment_len, const uint32_t fragment_offset, 
-                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr);                                        
+int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, const uint32_t message_id, const uint32_t text_len, const uint32_t text_offset,
+                                        const char* fragment_text, const uint32_t fragment_len, const uint32_t chunk_offset, 
+                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr);                                       
 
 unsigned int WINAPI command_thread_func(void* ptr);
 unsigned int WINAPI receive_frame_thread_func(void* ptr);
 unsigned int WINAPI process_frame_thread_func(void* ptr);
 unsigned int WINAPI ping_pong_thread_func(void* ptr);
-unsigned int WINAPI ack_nak_thread_func(void* ptr);
+// unsigned int WINAPI ack_nak_thread_func(void* ptr);
+unsigned int WINAPI resend_thread_func(void *ptr);
 
 
 long get_text_file_size(const char *filepath){
@@ -174,15 +181,16 @@ void init_client(){
     queue_frame.tail = 0;
     InitializeCriticalSection(&queue_frame.mutex);
     
-    client.frame_count = 0;    
-    uint32_t len = sizeof(CLIENT_NAME) - 1;
-    strncpy(client.client_name, CLIENT_NAME, len);
-    client.client_name[len] = '\0'; // Ensure null termination
+    client.frame_count = 0;
+    client.message_id_count = 0xBB;  
+    strncpy(client.client_name, CLIENT_NAME, sizeof(CLIENT_NAME));
+    client.client_name[sizeof(CLIENT_NAME) - 1] = '\0'; // Ensure null termination
     client.client_id = CLIENT_ID;
     client.client_status = CLIENT_READY;
     client.session_status = SESSION_DISCONNECTED;
     client.log_file_path[0] = '\0';
     InitializeCriticalSection(&client.frame_count_mutex);
+    InitializeCriticalSection(&hash_table_mutex);
     return;
 }
 void start_threads(){
@@ -193,12 +201,18 @@ void start_threads(){
         client.session_status = SESSION_DISCONNECTED;
         client.client_status = CLIENT_STOP; // Signal immediate shutdown
     }
-    ack_nak_thread = (HANDLE)_beginthreadex(NULL, 0, ack_nak_thread_func, NULL, 0, NULL);
-        if (ack_nak_thread == NULL) {
-        fprintf(stderr, "Failed to create ack thread. Error: %d\n", GetLastError());
+    resend_thread = (HANDLE)_beginthreadex(NULL, 0, resend_thread_func, NULL, 0, NULL);
+    if (resend_thread == NULL) {
+        fprintf(stderr, "Failed to create resend frame thread. Error: %d\n", GetLastError());
         client.session_status = SESSION_DISCONNECTED;
         client.client_status = CLIENT_STOP; // Signal immediate shutdown
     }
+    // ack_nak_thread = (HANDLE)_beginthreadex(NULL, 0, ack_nak_thread_func, NULL, 0, NULL);
+    //     if (ack_nak_thread == NULL) {
+    //     fprintf(stderr, "Failed to create ack thread. Error: %d\n", GetLastError());
+    //     client.session_status = SESSION_DISCONNECTED;
+    //     client.client_status = CLIENT_STOP; // Signal immediate shutdown
+    // }
     command_thread = (HANDLE)_beginthreadex(NULL, 0, command_thread_func, NULL, 0, NULL);
     if (command_thread == NULL) {
         fprintf(stderr, "Failed to create command thread. Error: %d\n", GetLastError());
@@ -220,11 +234,16 @@ void shutdown_client(){
         WaitForSingleObject(process_frame_thread, INFINITE);
         CloseHandle(process_frame_thread);
     }
-    if (ack_nak_thread) {
+    if (resend_thread) {
         // Signal the receive thread to stop and wait for it to finish
-        WaitForSingleObject(ack_nak_thread, INFINITE);
-        CloseHandle(ack_nak_thread);
+        WaitForSingleObject(resend_thread, INFINITE);
+        CloseHandle(resend_thread);
     }
+    // if (ack_nak_thread) {
+    //     // Signal the receive thread to stop and wait for it to finish
+    //     WaitForSingleObject(ack_nak_thread, INFINITE);
+    //     CloseHandle(ack_nak_thread);
+    // }
     if (ping_pong_thread) {
         // Signal the receive thread to stop and wait for it to finish
         WaitForSingleObject(ping_pong_thread, INFINITE);
@@ -253,6 +272,7 @@ int main() {
             EnterCriticalSection(&client.frame_count_mutex);
             client.frame_count = 0;       // this will be sent as seq_num
             LeaveCriticalSection(&client.frame_count_mutex);
+            client.message_id_count = 0;
             client.log_file_path[0] = '\0'; 
             client.session_id = 0;
             client.server_status = 0;
@@ -297,48 +317,13 @@ int send_connect_request(const uint32_t session_id, const uint32_t client_id, co
     #endif
     return bytes_sent; 
 };
-// --- Send text message ---
-int send_text_message(const uint32_t seq_nr, const uint32_t session_id, const char* text, const uint32_t len, 
-                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr){
-
-    UdpFrame frame;
-    if(text == NULL){
-        fprintf(stderr, "Invalid text!.\n");
-        return SOCKET_ERROR;
-    }
-    // Initialize the text message frame
-    memset(&frame, 0, sizeof(UdpFrame));
-    // Set the header fields
-    frame.header.start_delimiter = htons(FRAME_DELIMITER);
-    frame.header.frame_type = FRAME_TYPE_TEXT_MESSAGE;
-    frame.header.seq_num = htonl(seq_nr);
-    frame.header.session_id = htonl(session_id);
-    // Set the payload fields
-    frame.payload.text_msg.len = htonl(len);
-    // Copy the text data into the payload
-    strncpy(frame.payload.text_msg.text, text, len);
-    frame.payload.text_msg.text[len] = '\0';
-    // Calculate the checksum for the frame
-    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(TextPayload)));  
-    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
-    if(bytes_sent == SOCKET_ERROR){
-        fprintf(stderr, "send_text_message() failed\n");
-        return SOCKET_ERROR;
-    }
-    #ifdef ENABLE_LOGGING
-        if(&client != NULL && strlen(client.log_file_path) > 0){
-            log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_file_path);
-        }
-    #endif
-    return bytes_sent;
-};
 // --- Send long text message fragment ---
-int send_long_text_fragment(const uint32_t seq_nr, const uint32_t session_id, const uint32_t message_id, const char* text, 
-                                        const uint32_t total_len, const uint32_t fragment_len, const uint32_t fragment_offset, 
+int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, const uint32_t message_id, const uint32_t text_len, const uint32_t text_offset,
+                                        const char* chunk_text, const uint32_t fragment_len, const uint32_t chunk_fragment_offset, 
                                         const SOCKET src_socket, const struct sockaddr_in *dest_addr){
 
     UdpFrame frame;
-    if(text == NULL){
+    if(chunk_text == NULL){
         fprintf(stderr, "Invalid text!.\n");
         return SOCKET_ERROR;
     }
@@ -347,16 +332,17 @@ int send_long_text_fragment(const uint32_t seq_nr, const uint32_t session_id, co
     // Set the header fields
     frame.header.start_delimiter = htons(FRAME_DELIMITER);
     frame.header.frame_type = FRAME_TYPE_LONG_TEXT_MESSAGE;
-    frame.header.seq_num = htonl(seq_nr);
+    frame.header.seq_num = htonl(seq_num);
     frame.header.session_id = htonl(session_id);
     // Set the payload fields
     frame.payload.long_text_msg.message_id = htonl(message_id);
-    frame.payload.long_text_msg.total_text_len = htonl(total_len);
+    frame.payload.long_text_msg.total_text_len = htonl(text_len);
     frame.payload.long_text_msg.fragment_len = htonl(fragment_len);
-    frame.payload.long_text_msg.fragment_offset = htonl(fragment_offset);
+    frame.payload.long_text_msg.fragment_offset = htonl(text_offset);
+    
 
     // Copy the text data into the payload
-    const char *fragment_text = text + fragment_offset;
+    const char *fragment_text = chunk_text + chunk_fragment_offset;
     strncpy(frame.payload.long_text_msg.fragment_text, fragment_text, fragment_len);
     frame.payload.long_text_msg.fragment_text[fragment_len] = '\0';
     
@@ -367,6 +353,11 @@ int send_long_text_fragment(const uint32_t seq_nr, const uint32_t session_id, co
         fprintf(stderr, "send_text_message() failed\n");
         return SOCKET_ERROR;
     }
+    EnterCriticalSection(&hash_table_mutex);
+    insert_frame(hash_table, &frame);
+    LeaveCriticalSection(&hash_table_mutex);
+//    fprintf(stdout, "Inserted SeqNum -%d- to Table\n", seq_num);
+//    printTable(hash_table);
     #ifdef ENABLE_LOGGING
         if(&client != NULL && strlen(client.log_file_path) > 0){
             log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_file_path);
@@ -495,8 +486,14 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             }
 
             case FRAME_TYPE_ACK: {
+                uint32_t seq_num = ntohl(frame->header.seq_num);
+//                fprintf(stdout, "Received ack seq num: %d\n", seq_num);
                 uint8_t flag = frame->payload.ack_nak.flag;
                 client.last_server_active_time = time(NULL);
+                EnterCriticalSection(&hash_table_mutex);
+                remove_frame(hash_table, seq_num);
+                LeaveCriticalSection(&hash_table_mutex);
+//                printTable(hash_table);
                 break;
             }
 
@@ -552,22 +549,22 @@ unsigned int WINAPI ping_pong_thread_func(void* ptr){
     return 0;
 }
 // --- Send Ack ---
-unsigned int WINAPI ack_nak_thread_func(void* ptr){
+// unsigned int WINAPI ack_nak_thread_func(void* ptr){
 
-    SeqNumEntry seq_num_entry;   
-    while(client.client_status == CLIENT_READY){
-        memset(&seq_num_entry, 0, sizeof(SeqNumEntry));
-        if(pop_seq_num(&queue_sqn, &seq_num_entry) == -1){
-            Sleep(10);
-            continue;
-        }
-        send_ack_nak(seq_num_entry.type, seq_num_entry.seq_num, client.session_id, client.socket, &seq_num_entry.addr, client.log_file_path);
-        client.last_client_active_time = time(NULL);
-    }
-    fprintf(stdout, "Exit ack/nak thread...\n");
-    _endthreadex(0); // Properly exit the thread created by _beginthreadex
-    return 0;
-}
+//     SeqNumEntry seq_num_entry;   
+//     while(client.client_status == CLIENT_READY){
+//         memset(&seq_num_entry, 0, sizeof(SeqNumEntry));
+//         if(pop_seq_num(&queue_sqn, &seq_num_entry) == -1){
+//             Sleep(10);
+//             continue;
+//         }
+//         send_ack_nak(seq_num_entry.type, seq_num_entry.seq_num, client.session_id, client.socket, &seq_num_entry.addr, client.log_file_path);
+//         client.last_client_active_time = time(NULL);
+//     }
+//     fprintf(stdout, "Exit ack/nak thread...\n");
+//     _endthreadex(0); // Properly exit the thread created by _beginthreadex
+//     return 0;
+// }
 // --- Process command ---
 unsigned int WINAPI command_thread_func(void* ptr) {
 
@@ -584,7 +581,6 @@ unsigned int WINAPI command_thread_func(void* ptr) {
             if(strcmp(command_str, "c") == 0 || strcmp(command_str, "C") == 0) command_num = 1;
             if(strcmp(command_str, "d") == 0 || strcmp(command_str, "D") == 0) command_num = 2;
             if(strcmp(command_str, "q") == 0 || strcmp(command_str, "Q") == 0) command_num = 3;
-            if(strcmp(command_str, "t") == 0 || strcmp(command_str, "T") == 0) command_num = 4;
             if(strcmp(command_str, "f") == 0 || strcmp(command_str, "F") == 0) command_num = 5;
             switch(command_num) {
                 case 1:
@@ -628,40 +624,52 @@ unsigned int WINAPI command_thread_func(void* ptr) {
                     client.session_status = SESSION_DISCONNECTED;
                     printf("Shutting down...\n");
                     break;
-
-                case 4:                    
-                    fprintf(stdout,"Text message to send:");
-                    char text_buffer[255] = {0};
-                    fgets(text_buffer, sizeof(text_buffer), stdin);
-                    text_buffer[strcspn(text_buffer, "\n")] = '\0';
-                    send_text_message(get_new_seq_num(), client.session_id, text_buffer, strlen(text_buffer), client.socket, &client.server_addr);
-                    break;
-                
+               
                 case 5:
-                    char *file_path = "f:\\vscode\\test_long_text.txt";
+                    uint32_t message_id = ++client.message_id_count;
+                    uint32_t frame_fragment_offset = 0;
+                    uint32_t frame_fragment_len = 0;
+
+                    char *file_path = "E:\\test_file.txt";
                     long text_size = get_text_file_size(file_path);
-                    char *text = (char *)malloc(text_size + 1);
-                    read_text_file(file_path, text, text_size);
 
-                    uint32_t max_fragment_size = MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 4);
-                    uint32_t fragment_offset = 0;
-                    uint32_t message_id = 0xBB;
-                    uint32_t fragment_len;
+                    fprintf(stdout, "Total file bytes: %d\n", text_size);
+                    uint8_t chunk_buffer[CHUNK_SIZE];
+                    FILE *file = fopen(file_path, "rb");
                     
-                    int bytes_to_send = text_size;
-                    while (bytes_to_send > 0){
-                        if(bytes_to_send > max_fragment_size){
-                            fragment_len = max_fragment_size;
-                        } else {
-                        fragment_len = bytes_to_send;
+                    uint32_t total_bytes_to_send = text_size;
+
+                    while(total_bytes_to_send > 0){
+
+                        uint32_t bytes_read = fread(chunk_buffer, 1, CHUNK_SIZE, file);
+                        if (bytes_read == 0 && ferror(file)) {
+                            perror("Error reading file");
+                        break;
                         }
-                        send_long_text_fragment(get_new_seq_num(), client.session_id, message_id, text, text_size, fragment_len, fragment_offset, client.socket, &client.server_addr);
-                        fragment_offset += fragment_len;
-                        bytes_to_send -= fragment_len;
+                    
+                        uint32_t chunk_bytes_to_send = bytes_read;
+                        
+                        // fprintf(stdout, "Chunk Bytes to send: %d\n", chunk_bytes_to_send);
+                        // fprintf(stdout, "Fragment Offset: %d\n", frame_fragment_offset);
+                        
+                        uint32_t chunk_fragment_offset = 0;
+
+                        while (chunk_bytes_to_send > 0){
+                            if(chunk_bytes_to_send > FRAGMENT_SIZE){
+                                frame_fragment_len = FRAGMENT_SIZE;
+                            } else {
+                            frame_fragment_len = chunk_bytes_to_send;
+                            }    
+
+                            send_long_text_fragment(get_new_seq_num(), client.session_id, message_id, text_size, frame_fragment_offset, chunk_buffer, frame_fragment_len, chunk_fragment_offset, client.socket, &client.server_addr);
+                            chunk_fragment_offset += frame_fragment_len;
+                            frame_fragment_offset += frame_fragment_len;                       
+                            chunk_bytes_to_send -= frame_fragment_len;
+                            total_bytes_to_send -= frame_fragment_len;
+                        }
+                        
                     }
-
-                    free(text); // Free allocated memory
-
+                    fclose(file);
                     break;
                 default:
                     fprintf(stdout, "Invalid command!\n");
@@ -676,3 +684,32 @@ unsigned int WINAPI command_thread_func(void* ptr) {
     return 0;
 }
 
+
+unsigned int WINAPI resend_thread_func(void *ptr){
+
+   
+    // while(client.client_status == CLIENT_READY){
+    // EnterCriticalSection(&hash_table_mutex);
+    //     for (int i = 0; i < HASH_SIZE; i++) {
+    //         if(hash_table[i]){
+                        
+    //             AckHashNode *ptr = hash_table[i];
+    //             while (ptr) {     
+    //                     if(time(NULL) - ptr->time > 5){
+    //                         send_frame(&ptr->frame, client.socket, &client.server_addr);
+    //                         ptr->time = time(NULL);
+    //                         fprintf(stdout, "resent frame: %d", ntohl(ptr->frame.header.seq_num));
+    //                     }
+
+    //                     ptr = ptr->next;
+    //             }
+    //         }
+                 
+    //     }
+    //     LeaveCriticalSection(&hash_table_mutex);
+    //     Sleep(1);
+    // }
+    fprintf(stdout, "Exit resend thread...\n");
+    _endthreadex(0); // Properly exit the thread created by _beginthreadex
+    return 0;
+}

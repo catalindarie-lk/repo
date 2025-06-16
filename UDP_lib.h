@@ -11,14 +11,16 @@
 #include <ws2tcpip.h>   // For modern IP address functions (inet_pton, inet_ntop)
 #include <process.h>    // For _beginthreadex (preferred over CreateThread for CRT safety)
 #include <windows.h>    // For Windows-specific functions like CreateThread, Sleep
+#include <iphlpapi.h>
 
-//#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+#pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
+#pragma comment(lib, "iphlpapi.lib")
 
-#define MAX_PAYLOAD_SIZE    1500        // Max size of data within a frame payload (adjust as needed)
+#define MAX_PAYLOAD_SIZE    1400        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
 #define QUEUE_SIZE          1048576        // Queue buffer size
 #define NAME_SIZE           64
-#define ENABLE_LOGGING    1
+#define ENABLE_LOGGING      1
 
 #define RET_VAL_ERROR       -1
 #define RET_VAL_SUCCESS     0
@@ -38,7 +40,6 @@ enum DisconnectCode{
 // --- Frame Types ---
 typedef uint8_t FrameType;
 enum FrameType{
-    FRAME_TYPE_TEXT_MESSAGE = 1,                // Single-part text message
     FRAME_TYPE_LONG_TEXT_MESSAGE = 2,      // Fragment of a long text message
     FRAME_TYPE_FILE_METADATA_REQUEST = 3,       // Client requests to send a file (includes filename, size, hash)
     FRAME_TYPE_FILE_METADATA_RESPONSE = 4,      // Server grants file transfer (assigns file_id)
@@ -77,11 +78,6 @@ typedef struct {
     uint8_t  server_status;     // BUSY (0) READY (1) or ERR (x), etc
     char     server_name[NAME_SIZE];   // Optional: human-readable identifier
 } ConnectResponsePayload;
-
-typedef struct {
-    uint32_t len;           // Length of the text message
-    char     text[MAX_PAYLOAD_SIZE - sizeof(uint32_t)]; // Actual text
-} TextPayload;
 
 typedef struct {
     uint32_t message_id;         // Unique ID for this specific long message
@@ -130,7 +126,6 @@ typedef struct {
     union {
         ConnectRequestPayload request;              // Client's connect request
         ConnectResponsePayload response;            // Server's response to client connect
-        TextPayload text_msg;                   // Single-part text message
         LongTextPayload long_text_msg;          // Fragment of a long text message
         FileMetadataPayload file_metadata;      // File metadata request/response
         FileDataPayload file_data;                  // File data fragment
@@ -234,9 +229,6 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
     // Determine the actual size to send based on frame type if payloads are variable
     size_t frame_size = sizeof(FrameHeader);
     switch (frame->header.frame_type) {
-        case FRAME_TYPE_TEXT_MESSAGE:
-            frame_size += sizeof(TextPayload); // Or just header + text_len + sizeof(text_len)
-            break;
         case FRAME_TYPE_LONG_TEXT_MESSAGE:
             frame_size += sizeof(LongTextPayload); // Or header + payload_len + related metadata
             break;
@@ -384,7 +376,7 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
         fprintf(stdout, "Invalid buffer!\n");
     }
 
-    char* log_folder = "G:\\logs\\";
+    char* log_folder = "E:\\logs\\";
     char file_name[64] = {0};
     if(type == 0){
         snprintf(file_name, 64, "srv_%d.txt", session_id);
@@ -435,10 +427,13 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
         snprintf(buffer, sizeof(buffer), "Received frame from %s:%d - [UTC %04d-%02d-%02d %02d:%02d:%02d]\0", 
                         str_addr, port, utc_time->tm_year + 1900, utc_time->tm_mon + 1, utc_time->tm_mday,
                         utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec);
-    } else {
+    } else if(log_type == LOG_FRAME_SENT) {
+
         snprintf(buffer, sizeof(buffer), "Sent frame to %s:%d - [UTC %04d-%02d-%02d %02d:%02d:%02d]\0", 
                         str_addr, port, utc_time->tm_year + 1900, utc_time->tm_mon + 1, utc_time->tm_mday,
                         utc_time->tm_hour, utc_time->tm_min, utc_time->tm_sec);       
+    } else {
+        fprintf(stdout, "Invalid Log Type!\n");
     }
    
     switch(frame->header.frame_type){
@@ -469,14 +464,6 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     ntohl(frame->payload.response.session_timeout), 
                                                     frame->payload.response.server_status, 
                                                     frame->payload.response.server_name);
-            break;
-        case FRAME_TYPE_TEXT_MESSAGE:
-            fprintf(file, "%s\n   FRAME_TYPE_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Text Length: %d\n   Text: %s\n", 
-                                                    buffer,
-                                                    ntohl(frame->header.seq_num), 
-                                                    ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum),
-                                                    ntohl(frame->payload.text_msg.len), frame->payload.text_msg.text);
             break;
         case FRAME_TYPE_LONG_TEXT_MESSAGE:
             fprintf(file, "%s   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
