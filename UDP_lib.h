@@ -16,14 +16,14 @@
 #pragma comment(lib, "Ws2_32.lib") // Link against Winsock library
 #pragma comment(lib, "iphlpapi.lib")
 
-#define MAX_PAYLOAD_SIZE    1400        // Max size of data within a frame payload (adjust as needed)
-#define FRAME_DELIMITER     0xAABB      // A magic number to identify valid frames
-#define QUEUE_SIZE          1048576        // Queue buffer size
-#define NAME_SIZE           64
-#define ENABLE_LOGGING      1
+#define MAX_PAYLOAD_SIZE                1400        // Max size of data within a frame payload (adjust as needed)
+#define FRAME_DELIMITER                 0xAABB      // A magic number to identify valid frames
+#define QUEUE_SIZE                      1048576        // Queue buffer size
+#define NAME_SIZE                       64
+//#define ENABLE_FRAME_LOG                1
 
-#define RET_VAL_ERROR       -1
-#define RET_VAL_SUCCESS     0
+#define RET_VAL_ERROR                   -1
+#define RET_VAL_SUCCESS                 0
 
 typedef uint8_t LogType;
 enum LogType{
@@ -41,9 +41,9 @@ enum DisconnectCode{
 typedef uint8_t FrameType;
 enum FrameType{
     FRAME_TYPE_LONG_TEXT_MESSAGE = 2,      // Fragment of a long text message
-    FRAME_TYPE_FILE_METADATA_REQUEST = 3,       // Client requests to send a file (includes filename, size, hash)
+    FRAME_TYPE_FILE_METADATA = 3,       // Client requests to send a file (includes filename, size, hash)
     FRAME_TYPE_FILE_METADATA_RESPONSE = 4,      // Server grants file transfer (assigns file_id)
-    FRAME_TYPE_FILE_DATA = 5,                   // File data fragment
+    FRAME_TYPE_FILE_FRAGMENT = 5,                   // File data fragment
     FRAME_TYPE_ACK = 6,                         // Acknowledgment for a received frame
     FRAME_TYPE_NACK = 7,                        // Negative Acknowledgment (request retransmission)
     FRAME_TYPE_CONNECT_REQUEST = 8,             // Client's initial contact to server
@@ -89,17 +89,18 @@ typedef struct {
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
-    uint32_t total_file_size;       // Total size of the file being transferred
-    uint8_t  file_hash[16];      // For MD5 hash (adjust size for SHA256 etc.)
+    uint32_t file_size;       // Total size of the file being transferred
+    uint32_t max_fragment_size;
+    uint8_t  file_hash[32];      // For MD5 hash (adjust size for SHA256 etc.)
     char     filename[256];      // Max filename length
 } FileMetadataPayload;
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
-    uint32_t fragment_offset;       // Offset of this fragment within the file
-    uint32_t payload_len;           // Length of actual data in 'fragment_data'
-    uint8_t  fragment_data[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 3)]; // Adjusted size
-} FileDataPayload;
+    uint32_t offset;       // Offset of this fragment within the file
+    uint32_t size;           // Length of actual data in 'fragment_data'
+    char  bytes[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 3)]; // Adjusted size
+} FileFragmentPayload;
 
 typedef struct {
     uint8_t flag;           // For future use
@@ -128,7 +129,7 @@ typedef struct {
         ConnectResponsePayload response;            // Server's response to client connect
         LongTextPayload long_text_msg;          // Fragment of a long text message
         FileMetadataPayload file_metadata;      // File metadata request/response
-        FileDataPayload file_data;                  // File data fragment
+        FileFragmentPayload file_fragment;                  // File data fragment
         AckNakPayload ack_nak;                // Acknowledgment or Negative Acknowledgment    
         DisconnectPayload disconnect;
         PingPongPayload ping_pong;
@@ -170,7 +171,7 @@ typedef struct {
 int calculate_crc32(const void *data, size_t len);
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 
-#ifdef ENABLE_LOGGING
+#ifdef ENABLE_FRAME_LOG
 // Logging functions for debug
 void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path);
 void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]);
@@ -232,12 +233,14 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
         case FRAME_TYPE_LONG_TEXT_MESSAGE:
             frame_size += sizeof(LongTextPayload); // Or header + payload_len + related metadata
             break;
-        case FRAME_TYPE_FILE_METADATA_REQUEST:
+        case FRAME_TYPE_FILE_METADATA:
+            frame_size += sizeof(FileMetadataPayload);
+            break;
         case FRAME_TYPE_FILE_METADATA_RESPONSE:
             frame_size += sizeof(FileMetadataPayload);
             break;
-        case FRAME_TYPE_FILE_DATA:
-            frame_size += sizeof(FileDataPayload); // Or header + payload_len + related metadata
+        case FRAME_TYPE_FILE_FRAGMENT:
+            frame_size += sizeof(FileFragmentPayload); // Or header + payload_len + related metadata
             break;
         case FRAME_TYPE_ACK:
             frame_size += sizeof(AckNakPayload); // Acknowledgment frame
@@ -272,6 +275,8 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
         fprintf(stderr, "sendto() failed with error: %d\n", WSAGetLastError());
         return SOCKET_ERROR;        
     }
+
+
     // char addr[INET_ADDRSTRLEN];
     // inet_ntop(AF_INET, &dest_addr->sin_addr, addr, INET_ADDRSTRLEN);
     // uint16_t port = ntohs(dest_addr->sin_port);
@@ -302,10 +307,8 @@ int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t sess
         fprintf(stderr, "send_ack_nack() failed\n");
         return SOCKET_ERROR;
     }
-    #ifdef ENABLE_LOGGING 
-        if(strlen(log_file_path) > 0){
-            log_frame(LOG_FRAME_SENT, &ack_frame, dest_addr, log_file_path);
-        }
+    #ifdef ENABLE_FRAME_LOG
+        log_frame(LOG_FRAME_SENT, &ack_frame, dest_addr, log_file_path);
     #endif
     return bytes_sent;
 }
@@ -329,10 +332,8 @@ int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET 
         fprintf(stderr, "send_disconnect() failed\n");
         return SOCKET_ERROR;
     }
-    #ifdef ENABLE_LOGGING
-        if(strlen(log_file_path) > 0){
-            log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
-        }
+    #ifdef ENABLE_FRAME_LOG
+        log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
     #endif
     return bytes_sent;
 }
@@ -362,10 +363,8 @@ int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t se
         fprintf(stderr, "send_ping_pong() failed\n");
         return SOCKET_ERROR;
     }
-    #ifdef ENABLE_LOGGING
-        if(strlen(log_file_path) > 0){
-            log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
-        }
+    #ifdef ENABLE_FRAME_LOG
+        log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
     #endif
     return bytes_sent;
 }
@@ -385,7 +384,7 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
     } 
     
     if (CreateDirectory(log_folder, NULL)) {
-        printf("Created folder '%s' for logs: \n", buffer);
+        printf("Created folder '%s' for logs: \n", log_folder);
     } else {
         DWORD folder_create_error = GetLastError();
         if (folder_create_error == ERROR_ALREADY_EXISTS) {
@@ -410,6 +409,15 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
 }
 // Log frame
 void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path){
+
+    if(file_path == NULL){
+        fprintf(stderr, "Invalid log file pointer address!\n");
+        return;
+    }
+    if(strlen(file_path) == 0){
+        fprintf(stderr, "Invalid log file name!\n");
+        return;
+    }
 
     char str_addr[INET_ADDRSTRLEN];
     inet_ntop(AF_INET, &addr->sin_addr, str_addr, INET_ADDRSTRLEN);
@@ -477,6 +485,27 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     ntohl(frame->payload.long_text_msg.fragment_offset), 
                                                     frame->payload.long_text_msg.fragment_text);
             break;
+        case FRAME_TYPE_FILE_METADATA:
+            fprintf(file, "%s   FRAME_TYPE_FILE_METADATA\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   File ID: %d\n   File Size: %d\n   Max Fragment Size: %d\n\n", 
+                                                    buffer,
+                                                    ntohl(frame->header.seq_num), 
+                                                    ntohl(frame->header.session_id), 
+                                                    ntohl(frame->header.checksum),
+                                                    ntohl(frame->payload.file_metadata.file_id), 
+                                                    ntohl(frame->payload.file_metadata.file_size),
+                                                    ntohl(frame->payload.file_metadata.max_fragment_size));
+                                                    break;
+        case FRAME_TYPE_FILE_FRAGMENT:
+            fprintf(file, "%s   FRAME_TYPE_FILE_FRAGMENT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   File ID: %d\n   Current Fragment Size: %d\n   Fragment Offset: %d\n   Fragment Bytes: %s\n", 
+                                                    buffer,
+                                                    ntohl(frame->header.seq_num), 
+                                                    ntohl(frame->header.session_id), 
+                                                    ntohl(frame->header.checksum),
+                                                    ntohl(frame->payload.file_fragment.file_id), 
+                                                    ntohl(frame->payload.file_fragment.size),
+                                                    ntohl(frame->payload.file_fragment.offset),
+                                                    frame->payload.file_fragment.bytes);                                                    
+                                                    break;
 
         case FRAME_TYPE_DISCONNECT:
             fprintf(file, "%s\n   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Disconnect flag: %d\n", 
@@ -519,12 +548,14 @@ int push_frame(QueueFrame *queue, FrameEntry *frame_entry){
         return RET_VAL_ERROR;
     }
     // Check if the queue is full
+    EnterCriticalSection(&queue->mutex);
     if((queue->tail + 1) % QUEUE_SIZE == queue->head){
-        printf("Queue Full\n");
+        LeaveCriticalSection(&queue->mutex);
+        fprintf(stdout, "Frame queue full\n");
         return RET_VAL_ERROR;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(&queue->mutex);
+    
     // Add the sequence number to the ACK queue 
     memcpy(&queue->frame_entry[queue->tail], frame_entry, sizeof(FrameEntry)); // Copy the frame to the queue
     // Move the tail index forward    
@@ -537,17 +568,18 @@ int push_frame(QueueFrame *queue, FrameEntry *frame_entry){
 // Pop frame data from queue - frames are poped from the queue by the frame processing thread
 int pop_frame(QueueFrame *queue, FrameEntry *frame_entry){       
     // Check if the queue is initialized
-    memset(frame_entry, 0, sizeof(FrameEntry)); // Initialize the structure to zero
     if (queue == NULL || &queue->mutex == NULL) {
         fprintf(stderr, "Queue or mutex is not initialized.\n");
         return RET_VAL_ERROR; // Return an empty RecvFrameInfo
     }
     EnterCriticalSection(&queue->mutex);
     // Check if the queue is empty before removing a ACK
+    
     if (queue->head == queue->tail) {
         LeaveCriticalSection(&queue->mutex);
         return RET_VAL_ERROR;
     }
+    memset(frame_entry, 0, sizeof(FrameEntry)); // Initialize the structure to zero
     // Acquire the mutex to ensure thread-safe access to the queue
     memcpy(frame_entry, &queue->frame_entry[queue->head], sizeof(FrameEntry)); // Copy the frame from the queue
     memset(&queue->frame_entry[queue->head], 0, sizeof(FrameEntry)); // Clear the frame at the head
@@ -565,12 +597,14 @@ int push_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){
     if (queue == NULL || &queue->mutex == NULL) {
         return RET_VAL_ERROR;
     }
+    EnterCriticalSection(&queue->mutex);
     // Check if the queue is full
     if((queue->tail + 1) % QUEUE_SIZE == queue->head){
+        LeaveCriticalSection(&queue->mutex);
+        fprintf(stdout, "Seq Num queue full\n");
         return RET_VAL_ERROR;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
-    EnterCriticalSection(&queue->mutex);
     // Add the sequence number to the ACK queue 
     memcpy(&queue->seq_num_entry[queue->tail], seq_num_entry, sizeof(SeqNumEntry));
     // Move the tail index forward    
@@ -583,7 +617,6 @@ int push_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){
 // Pop sequence num data from queue -> send ack/nak (separate thread)
 int pop_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){       
     // Check if the queue is initialized
-    memset(seq_num_entry, 0, sizeof(SeqNumEntry));
     if (queue == NULL || &queue->mutex == NULL) {
         return RET_VAL_ERROR; // Return an empty RecvFrameInfo
     }
@@ -593,6 +626,7 @@ int pop_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){
         LeaveCriticalSection(&queue->mutex);
         return RET_VAL_ERROR;
     }
+     memset(seq_num_entry, 0, sizeof(SeqNumEntry));
     // Acquire the mutex to ensure thread-safe access to the queue
     memcpy(seq_num_entry, &queue->seq_num_entry[queue->head], sizeof(SeqNumEntry));
     memset(&queue->seq_num_entry[queue->head], 0, sizeof(SeqNumEntry));
