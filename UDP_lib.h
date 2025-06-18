@@ -20,7 +20,8 @@
 #define FRAME_DELIMITER                 0xAABB      // A magic number to identify valid frames
 #define QUEUE_SIZE                      1048576        // Queue buffer size
 #define NAME_SIZE                       64
-//#define ENABLE_FRAME_LOG                1
+#define FILE_NAME_SIZE                  64
+//#define ENABLE_FRAME_LOG              1
 
 #define RET_VAL_ERROR                   -1
 #define RET_VAL_SUCCESS                 0
@@ -376,11 +377,11 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
     }
 
     char* log_folder = "E:\\logs\\";
-    char file_name[64] = {0};
+    char file_name[FILE_NAME_SIZE] = {0};
     if(type == 0){
-        snprintf(file_name, 64, "srv_%d.txt", session_id);
+        snprintf(file_name, FILE_NAME_SIZE, "srv_%d.txt", session_id);
     } else {
-        snprintf(file_name, 64, "cli_%d.txt", session_id);
+        snprintf(file_name, FILE_NAME_SIZE, "cli_%d.txt", session_id);
     } 
     
     if (CreateDirectory(log_folder, NULL)) {

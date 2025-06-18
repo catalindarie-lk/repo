@@ -11,7 +11,6 @@
 #define SERVER_NAME                     "lkdc UDP Text/File Transfer Server"
 #define MAX_CLIENTS                     20
 
-
 typedef uint8_t ServerStatus;
 enum ServerStatus {
     SERVER_STOP = 0,
@@ -56,6 +55,7 @@ typedef struct{
     unsigned long long crt_microseconds;
 
     float speed;
+    float file_transfer_progress;
 }Statistics;
 
 typedef struct {  
@@ -87,7 +87,7 @@ typedef struct {
     uint32_t bytes_received;
 
     char *file_buffer;
-    char file_path_name[64];
+    char file_path_name[FILE_NAME_SIZE];
 
     Statistics statistics;
 
@@ -572,7 +572,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
                 process_file_fragment_frame(client, frame);
-                
+                fprintf(stdout, "\rFile transfer progress: %.2f %% - Speed: %.2f MB/s", client->statistics.file_transfer_progress, client->statistics.speed);
                 break;
 
             case FRAME_TYPE_DISCONNECT:
@@ -727,28 +727,27 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
         //update received bytes counter
         client->bytes_received += fragment_size;
 
-        fprintf(stdout, "\rProgress: %.2f %% - Speed: %.2f MB/s", (float)client->bytes_received / (float)client->file_size * 100.0, client->statistics.speed);
+        client->statistics.file_transfer_progress = (float)client->bytes_received / (float)client->file_size * 100.0;
 
         if(client->bytes_received == client->file_size && check_bitmap(client->file_bitmap, client->file_fragment_count)){
             //check_bitmap(client->file_bitmap, client->file_fragment_count);
             fprintf(stdout, "\n");
             char* log_folder = "E:\\logs\\";
-            char file_name[64] = {'\0'};
-            memset(client->file_path_name, 0, 64);
+            char file_name[FILE_NAME_SIZE] = {'\0'};
+            memset(client->file_path_name, 0, FILE_NAME_SIZE);
 
             if (CreateDirectory(log_folder, NULL)) {
                 printf("Created folder '%s' for logs: \n", log_folder);
             } else {
                 DWORD folder_create_error = GetLastError();
                 if (folder_create_error == ERROR_ALREADY_EXISTS) {
-                    //printf("Folder '%s' already existed from a previous run. Good for testing.\n", client_folder_path);
                 } else {
                     fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
-                    return; // Exit if we can't even set up the test
+                    return; 
                 }
             }            
              
-            snprintf(file_name, 64, "out_%d.txt", client->session_id);
+            snprintf(file_name, FILE_NAME_SIZE, "out_%d.txt", client->session_id);
 
             strncpy(client->file_path_name, log_folder, strlen(log_folder));
             strncpy(client->file_path_name + strlen(log_folder), file_name, strlen(file_name));
@@ -775,3 +774,4 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
     }
     return;
 }
+
