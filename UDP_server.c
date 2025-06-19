@@ -1,6 +1,7 @@
 #define _CRT_SECURE_NO_WARNINGS // Suppress warnings for strcpy, strncpy, etc.
 
 #include "udp_lib.h"
+#include "udp_queue.h"
 #include "udp_hash.h"
 #include "udp_bitmap.h"
 
@@ -38,6 +39,9 @@ typedef struct{
     uint32_t session_timeout;           // Timeout period for client inactivity
     uint32_t session_id_counter;         // Global counter for unique session IDs
     char name[NAME_SIZE];        // Human-readable server name
+
+    uint32_t fram_hash_count;
+
 }ServerData;
 
 typedef struct{
@@ -54,7 +58,10 @@ typedef struct{
     ULARGE_INTEGER crt_uli;
     unsigned long long crt_microseconds;
 
-    float speed;
+    float crt_file_transfer_speed;
+    float prev_file_transfer_speed;
+
+    float avg_file_transfer_speed;
     float file_transfer_progress;
 }Statistics;
 
@@ -84,7 +91,7 @@ typedef struct {
     uint32_t file_id;
     uint32_t file_size;
     uint32_t max_fragment_size;
-    uint32_t bytes_received;
+    uint32_t file_bytes_received;
 
     char *file_buffer;
     char file_path_name[FILE_NAME_SIZE];
@@ -117,9 +124,14 @@ HANDLE server_command_thread;
 
 const char *server_ip = "10.10.10.1"; // IPv4 example
 
-// UDP communication functions
-int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
-                                const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
+// Client management functions
+ClientData* find_client(ClientList *list, const uint32_t session_id);
+ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
+int remove_client(ClientList *list, const uint32_t session_id);
+
+void process_file_metadata_frame(ClientData *client, UdpFrame *frame);
+void process_file_fragment_frame(ClientData *client, UdpFrame *frame);
+void update_statistics(ClientData *client);
 
 // Thread functions
 unsigned int WINAPI receive_frame_thread_func(void* ptr);
@@ -128,16 +140,36 @@ unsigned int WINAPI ack_nak_thread_func(void* ptr);
 unsigned int WINAPI client_timeout_thread_func(void* ptr);
 unsigned int WINAPI server_command_thread_func(void* ptr);
 
-// Client management functions
-ClientData* find_client(ClientList *list, const uint32_t session_id);
-ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
-int remove_client(ClientList *list, const uint32_t session_id);
+void get_network_config();
+void init_winsock();
+void cleanup_winsock();
+void init_server();
+void start_threads();
+void shutdown_server();
 
-void process_file_metadata_frame(ClientData *client, UdpFrame *frame);
-void process_file_fragment_frame(ClientData *client, UdpFrame *frame);
+// --- Main server function ---
+int main() {
+//    get_network_config();
+    init_winsock();
+    init_server();
+    start_threads();
+    // Main server loop for general management, timeouts, and state updates
+    while (server.status == SERVER_READY) {
 
-
-void get_network_config() {
+        printf("Press 'q' to quit...\n");
+        char c = getchar();
+        if (c == 'q' || c == 'Q') {
+            server.status = SERVER_STOP; // Signal threads to stop
+            break;
+        }
+        Sleep(10); // Prevent busy-waiting
+    }
+    // --- Server Shutdown Sequence ---
+    shutdown_server();
+    cleanup_winsock();
+    return 0;
+}
+void get_network_config(){
     DWORD bufferSize = 0;
     IP_ADAPTER_ADDRESSES *adapterAddresses = NULL, *adapter = NULL;
 
@@ -273,61 +305,7 @@ void shutdown_server() {
     closesocket(server.socket);
     printf("Server shut down cleanly.\n");
 }
-// --- Main server function ---
-int main() {
-//    get_network_config();
-    init_winsock();
-    init_server();
-    start_threads();
-    // Main server loop for general management, timeouts, and state updates
-    while (server.status == SERVER_READY) {
 
-        printf("Press 'q' to quit...\n");
-        char c = getchar();
-        if (c == 'q' || c == 'Q') {
-            server.status = SERVER_STOP; // Signal threads to stop
-            break;
-        }
-        Sleep(10); // Prevent busy-waiting
-    }
-    // --- Server Shutdown Sequence ---
-    shutdown_server();
-    cleanup_winsock();
-    return 0;
-}
-
-// --- Send connect response ---
-int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
-                                const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path) {
-    UdpFrame frame;
-    // Initialize the response frame
-    memset(&frame, 0, sizeof(UdpFrame));
-    // Set the header fields
-    frame.header.start_delimiter = htons(FRAME_DELIMITER);
-    frame.header.frame_type = FRAME_TYPE_CONNECT_RESPONSE;
-
-    frame.header.seq_num = 0;
-    frame.header.session_id = htonl(session_id); // Use client's session ID
-
-    frame.payload.response.session_timeout = htonl(session_timeout);
-    frame.payload.response.server_status = status;
-
-    strncpy(frame.payload.response.server_name, server_name, NAME_SIZE - 1);
-    frame.payload.response.server_name[NAME_SIZE - 1] = '\0';
-
-    // Calculate CRC32 for the ACK frame
-    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(ConnectResponsePayload)));
-
-    int bytes_sent = send_frame(&frame, src_socket, dest_addr);
-    if (bytes_sent == SOCKET_ERROR) {
-        fprintf(stderr, "send_connect_respose() failed\n");
-        return SOCKET_ERROR;
-    }
-    #ifdef ENABLE_FRAME_LOG
-        log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
-    #endif
-    return bytes_sent;
-}
 // Find client by session ID
 ClientData* find_client(ClientList *list, const uint32_t session_id) {
         
@@ -341,7 +319,6 @@ ClientData* find_client(ClientList *list, const uint32_t session_id) {
             return &list->client[slot];
         }
     }
-
     return NULL;
 }
 // Add a new client
@@ -359,7 +336,6 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
         fprintf(stderr, "Max clients reached. Cannot add new client.\n");
         return NULL;
     }
-
     ClientData *new_client = &list->client[free_slot];
     memset(new_client, 0, sizeof(ClientData));
  
@@ -379,9 +355,8 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
 
     inet_ntop(AF_INET, &client_addr->sin_addr, new_client->ip, INET_ADDRSTRLEN);
     new_client->port = ntohs(client_addr->sin_port);
-    fprintf(stdout, "[ADDING NEW CLIENT] %s:%d Session ID:%d\n", new_client->ip, new_client->port, new_client->session_id);
 
-    new_client->log_file_path[0] = '\0';
+    fprintf(stdout, "[ADDING NEW CLIENT] %s:%d Session ID:%d\n", new_client->ip, new_client->port, new_client->session_id);
 
     list->count++;
     #ifdef ENABLE_FRAME_LOG
@@ -399,6 +374,143 @@ int remove_client(ClientList *list, const uint32_t slot) {
     list->client[slot].connection = CLIENT_DISCONNECTED;
     list->count--;
     return 0;
+}
+// Process received file metadata frame
+void process_file_metadata_frame(ClientData *client, UdpFrame *frame){
+
+    client->file_id = ntohl(frame->payload.file_metadata.file_id);
+    client->file_size = ntohl(frame->payload.file_metadata.file_size);
+    client->max_fragment_size = ntohl(frame->payload.file_metadata.max_fragment_size);
+    client->file_buffer = NULL;
+    client->file_bitmap = NULL;
+    
+    fprintf(stdout, "Received metadata file ID: %d\n", client->file_id);
+    fprintf(stdout, "Received metadata file size: %d\n", client->file_size);
+    fprintf(stdout, "Received metadata fragment size: %d\n",  client->max_fragment_size);
+
+    client->file_buffer = malloc(client->file_size);   
+    if(client->file_buffer == NULL){
+        fprintf(stderr, "Memory allocation fail for file buffer!!!\n");
+        return;
+    }
+    memset(client->file_buffer, 0, client->file_size);
+
+    client->file_fragment_count = client->file_size / client->max_fragment_size;
+    if(client->file_size % client->max_fragment_size > 0){
+        client->file_fragment_count++;
+    }
+    fprintf(stdout, "Fragments count: %d\n", client->file_fragment_count);
+
+    uint32_t file_bitmap_entries = 0;
+    file_bitmap_entries = client->file_fragment_count / 32;
+    if(client->file_fragment_count % 32 > 0){
+        file_bitmap_entries++;
+    }
+    fprintf(stdout, "Bitmap 32bits entries needed: %d\n", file_bitmap_entries);
+
+    client->file_bitmap = malloc(file_bitmap_entries * sizeof(uint32_t));
+    if(client->file_bitmap == NULL){
+        fprintf(stderr, "Memory allocation fail for file bitmap!!!\n");
+        return;        
+    }
+    memset(client->file_bitmap, 0, file_bitmap_entries * sizeof(uint32_t));
+
+    return;
+}
+// Process received file fragment frame
+void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
+
+    uint32_t fragment_file_id = ntohl(frame->payload.file_fragment.file_id);
+    uint32_t fragment_size = ntohl(frame->payload.file_fragment.size);
+    uint32_t fragment_offset = ntohl(frame->payload.file_fragment.offset);
+
+    // fprintf(stdout, "Received fragment file ID: %d\n", fragment_file_id);
+    // fprintf(stdout, "Received fragment size: %d\n", fragment_size);
+    // fprintf(stdout, "Received fragment offset: %d\n", fragment_offset);
+    if(client->file_id == fragment_file_id){
+        //copy the received fragment text to the buffer
+        if(client->file_buffer == NULL){
+            fprintf(stderr, "Memory not allocated for file buffer!!!\n");
+            return;
+        }
+        if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
+//            fprintf(stderr, "Received duplicate frame (offset: %d)!!!\n", fragment_offset);
+            return;
+        }
+        char *dest = client->file_buffer + fragment_offset;
+        char *src = frame->payload.file_fragment.bytes;
+        memcpy(dest, src, fragment_size);
+        mark_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size);
+        //update received bytes counter
+        client->file_bytes_received += fragment_size;
+
+        if(client->file_bytes_received == client->file_size && check_bitmap(client->file_bitmap, client->file_fragment_count)){
+            //check_bitmap(client->file_bitmap, client->file_fragment_count);
+            fprintf(stdout, "\n");
+            char* log_folder = "E:\\logs\\";
+            char file_name[FILE_NAME_SIZE] = {'\0'};
+            memset(client->file_path_name, 0, FILE_NAME_SIZE);
+
+            if (CreateDirectory(log_folder, NULL)) {
+                printf("Created folder '%s' for logs: \n", log_folder);
+            } else {
+                DWORD folder_create_error = GetLastError();
+                if (folder_create_error == ERROR_ALREADY_EXISTS) {
+                } else {
+                    fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
+                    return; 
+                }
+            }            
+             
+            snprintf(file_name, FILE_NAME_SIZE, "out_%d.txt", client->session_id);
+            strncpy(client->file_path_name, log_folder, strlen(log_folder));
+            strncpy(client->file_path_name + strlen(log_folder), file_name, strlen(file_name));
+            client->file_path_name[strlen(log_folder) + strlen(file_name)] = '\0';
+
+            fprintf(stdout, "Creating output file: %s\n", client->file_path_name);
+
+            FILE *new_file = fopen(client->file_path_name, "wb");
+            if(new_file == NULL){
+                fprintf(stderr, "Error creating output file name!!!\n");
+                return;
+            }
+            fwrite(client->file_buffer, 1, client->file_bytes_received, new_file);
+            fclose(new_file);
+            fprintf(stdout, "Received file from %s:%d File ID: %d, Size: %d\n", client->ip, client->port, client->file_id, client->file_bytes_received);
+            
+            client->file_id = 0;
+            client->file_size = 0;
+            client->max_fragment_size = 0;
+            client->file_bytes_received = 0;
+            free(client->file_buffer);
+            free(client->file_bitmap);
+        }
+    }
+    return;
+}
+// update file transfer progress and speed in MBs
+void update_statistics(ClientData * client){
+
+    //update file transfer speed in MB/s
+    GetSystemTimePreciseAsFileTime(&client->statistics.ft);
+    client->statistics.crt_uli.LowPart = client->statistics.ft.dwLowDateTime;
+    client->statistics.crt_uli.HighPart = client->statistics.ft.dwHighDateTime;
+    client->statistics.crt_microseconds = client->statistics.crt_uli.QuadPart / 10;
+
+    //TRANSFER SPEED
+    //current speed (1 cycle)
+    client->statistics.crt_file_transfer_speed = (float)MAX_PAYLOAD_SIZE / (float)((client->statistics.crt_microseconds - client->statistics.prev_microseconds));
+    //prev time = current time
+    client->statistics.prev_microseconds = client->statistics.crt_microseconds;
+    //first order filter for speed calc - filtered_speed = prev_filtered_speed + factor * (crt_speed - prev_filtered_speed)
+    client->statistics.avg_file_transfer_speed = client->statistics.prev_file_transfer_speed + 0.0001 * (client->statistics.crt_file_transfer_speed - client->statistics.prev_file_transfer_speed);
+    //prev = current
+    client->statistics.prev_file_transfer_speed = client->statistics.avg_file_transfer_speed;
+
+    //PROGRESS - update file transfer progress percentage
+    client->statistics.file_transfer_progress = (float)client->file_bytes_received / (float)client->file_size * 100.0;
+
+    fprintf(stdout, "\rFile transfer progress: %.2f %% - Speed: %.2f MB/s", client->statistics.file_transfer_progress, client->statistics.avg_file_transfer_speed);
 }
 // --- Process server command ---
 unsigned int WINAPI server_command_thread_func(void* ptr){
@@ -554,14 +666,6 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
 
-                GetSystemTimePreciseAsFileTime(&client->statistics.ft);
-                client->statistics.crt_uli.LowPart = client->statistics.ft.dwLowDateTime;
-                client->statistics.crt_uli.HighPart = client->statistics.ft.dwHighDateTime;
-                client->statistics.crt_microseconds = client->statistics.crt_uli.QuadPart / 10;
-
-                client->statistics.speed = (float)MAX_PAYLOAD_SIZE / (float)((client->statistics.crt_microseconds - client->statistics.prev_microseconds));
-                client->statistics.prev_microseconds = client->statistics.crt_microseconds;
-
 
                 // Push sequence number to queue to send ACK
                 seq_num_entry.seq_num = header_seq_num;
@@ -572,7 +676,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
                 process_file_fragment_frame(client, frame);
-                fprintf(stdout, "\rFile transfer progress: %.2f %% - Speed: %.2f MB/s", client->statistics.file_transfer_progress, client->statistics.speed);
+                update_statistics(client);
                 break;
 
             case FRAME_TYPE_DISCONNECT:
@@ -596,7 +700,9 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 break;
         }
         #ifdef ENABLE_FRAME_LOG
+        if(client != NULL){
             log_frame(LOG_FRAME_RECV, frame, src_addr, client->log_file_path);
+        }           
         #endif      
     }
     printf("Exit process_frame_thread...\n");
@@ -653,125 +759,3 @@ unsigned int WINAPI ack_nak_thread_func(void* ptr){
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
     return 0;
 }
-
-
-void process_file_metadata_frame(ClientData *client, UdpFrame *frame){
-
-    client->file_id = ntohl(frame->payload.file_metadata.file_id);
-    client->file_size = ntohl(frame->payload.file_metadata.file_size);
-    client->max_fragment_size = ntohl(frame->payload.file_metadata.max_fragment_size);
-    client->file_buffer = NULL;
-    client->file_bitmap = NULL;
-    
-    fprintf(stdout, "Received metadata file ID: %d\n", client->file_id);
-    fprintf(stdout, "Received metadata file size: %d\n", client->file_size);
-    fprintf(stdout, "Received metadata fragment size: %d\n",  client->max_fragment_size);
-
-    client->file_buffer = malloc(client->file_size);   
-    if(client->file_buffer == NULL){
-        fprintf(stderr, "Memory allocation fail for file buffer!!!\n");
-        return;
-    }
-    memset(client->file_buffer, 0, client->file_size);
-
-    client->file_fragment_count = client->file_size / client->max_fragment_size;
-    if(client->file_size % client->max_fragment_size > 0){
-        client->file_fragment_count++;
-    }
-    fprintf(stdout, "Fragments count: %d\n", client->file_fragment_count);
-
-    uint32_t file_bitmap_entries = 0;
-    file_bitmap_entries = client->file_fragment_count / 32;
-    if(client->file_fragment_count % 32 > 0){
-        file_bitmap_entries++;
-    }
-    fprintf(stdout, "Bitmap 32bits entries needed: %d\n", file_bitmap_entries);
-
-    client->file_bitmap = malloc(file_bitmap_entries * sizeof(uint32_t));
-    if(client->file_bitmap == NULL){
-        fprintf(stderr, "Memory allocation fail for file bitmap!!!\n");
-        return;        
-    }
-    memset(client->file_bitmap, 0, file_bitmap_entries * sizeof(uint32_t));
-
-    return;
-}
-
-
-void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
-
-    uint32_t fragment_file_id = ntohl(frame->payload.file_fragment.file_id);
-    uint32_t fragment_size = ntohl(frame->payload.file_fragment.size);
-    uint32_t fragment_offset = ntohl(frame->payload.file_fragment.offset);
-
-    // fprintf(stdout, "Received fragment file ID: %d\n", fragment_file_id);
-    // fprintf(stdout, "Received fragment size: %d\n", fragment_size);
-    // fprintf(stdout, "Received fragment offset: %d\n", fragment_offset);
-
-    if(client->file_id == fragment_file_id){
-        //copy the received fragment text to the buffer
-        if(client->file_buffer == NULL){
-            fprintf(stderr, "Memory not allocated for file buffer!!!\n");
-            return;
-        }
-
-        if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
-//            fprintf(stderr, "Received duplicate frame (offset: %d)!!!\n", fragment_offset);
-            return;
-        }
-
-        char *dest = client->file_buffer + fragment_offset;
-        char *src = frame->payload.file_fragment.bytes;
-        memcpy(dest, src, fragment_size);
-        mark_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size);
-        //update received bytes counter
-        client->bytes_received += fragment_size;
-
-        client->statistics.file_transfer_progress = (float)client->bytes_received / (float)client->file_size * 100.0;
-
-        if(client->bytes_received == client->file_size && check_bitmap(client->file_bitmap, client->file_fragment_count)){
-            //check_bitmap(client->file_bitmap, client->file_fragment_count);
-            fprintf(stdout, "\n");
-            char* log_folder = "E:\\logs\\";
-            char file_name[FILE_NAME_SIZE] = {'\0'};
-            memset(client->file_path_name, 0, FILE_NAME_SIZE);
-
-            if (CreateDirectory(log_folder, NULL)) {
-                printf("Created folder '%s' for logs: \n", log_folder);
-            } else {
-                DWORD folder_create_error = GetLastError();
-                if (folder_create_error == ERROR_ALREADY_EXISTS) {
-                } else {
-                    fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
-                    return; 
-                }
-            }            
-             
-            snprintf(file_name, FILE_NAME_SIZE, "out_%d.txt", client->session_id);
-
-            strncpy(client->file_path_name, log_folder, strlen(log_folder));
-            strncpy(client->file_path_name + strlen(log_folder), file_name, strlen(file_name));
-            client->file_path_name[strlen(log_folder) + strlen(file_name)] = '\0';
-
-            fprintf(stdout, "Creating output file: %s\n", client->file_path_name);
-
-            FILE *new_file = fopen(client->file_path_name, "wb");
-            if(new_file == NULL){
-                fprintf(stderr, "Error creating output file name!!!\n");
-                return;
-            }
-            fwrite(client->file_buffer, 1, client->bytes_received, new_file);
-            fclose(new_file);
-            fprintf(stdout, "Received file from %s:%d File ID: %d, Size: %d\n", client->ip, client->port, client->file_id, client->bytes_received);
-            
-            client->file_id = 0;
-            client->file_size = 0;
-            client->max_fragment_size = 0;
-            client->bytes_received = 0;
-            free(client->file_buffer);
-            free(client->file_bitmap);
-        }
-    }
-    return;
-}
-

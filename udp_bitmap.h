@@ -1,3 +1,6 @@
+#ifndef _UDP_BITMAP_H
+#define _UDP_BITMAP_H
+
 #include "UDP_lib.h"
 
 // To mark a fragment as received
@@ -47,3 +50,5 @@ BOOL check_bitmap(uint32_t bitmap[], uint32_t fragment_count){
 //    fprintf(stdout, "Bitmap OK\n");
     return(TRUE);    
 }
+
+#endif

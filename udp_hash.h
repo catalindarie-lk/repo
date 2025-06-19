@@ -1,9 +1,9 @@
-#ifndef _ACK_HASH_H
-#define _ACK_HASH_H
+#ifndef _UDP_HASH_H
+#define _UDP_HASH_H
 
 #include "UDP_lib.h"
-#define HASH_SIZE 65536
 
+#define HASH_SIZE 65536
 
 typedef struct AckHashNode{
     UdpFrame frame;
@@ -36,9 +36,6 @@ uint16_t get_hash(uint32_t seq_num){
 }
 
 
-
-
-
 void insert_frame(AckHashNode *hash_table[], UdpFrame *frame) {
     uint32_t seq_num = ntohl(frame->header.seq_num);
     uint16_t index = get_hash(seq_num);
@@ -53,17 +50,11 @@ void insert_frame(AckHashNode *hash_table[], UdpFrame *frame) {
 
 }
 
-
-
-
 void remove_frame(AckHashNode *hash_table[], uint32_t seq_num) {
     uint16_t index = get_hash(seq_num);
-    
     AckHashNode *curr = hash_table[index];
     AckHashNode *prev = NULL;
-
-    while (curr) {
-        
+    while (curr) {      
         if (ntohl(curr->frame.header.seq_num) == seq_num) {
 //            fprintf(stdout, "Removing seq num: %d from index: %d\n", seq_num, index);
             // Found it
@@ -80,7 +71,24 @@ void remove_frame(AckHashNode *hash_table[], uint32_t seq_num) {
     }
 }
 
-
+void clean_frame_hash_table(AckHashNode *hash_table[]){
+    AckHashNode *head = NULL;
+    for (int i = 0; i < HASH_SIZE; i++) {
+        if(hash_table[i]){       
+            AckHashNode *ptr = hash_table[i];
+            while (ptr) {
+                    head = ptr;
+                    //fprintf(stdout, "Bucket: %d - Freeing SeqNum: %d\n", i, head->seq_num);                   
+                    ptr = ptr->next;
+                    free(head);
+            }
+            free(ptr);
+            hash_table[i] = NULL;
+        }     
+    }
+//    fprintf(stdout, "Frame hash table clean\n");
+    return;
+}
 
 
 void printTable(AckHashNode *hash_table[]) {
