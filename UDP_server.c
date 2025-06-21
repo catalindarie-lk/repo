@@ -8,7 +8,7 @@
 // --- Constants ---
 #define SERVER_PORT                     12345       // Port the server listens on
 #define RECVFROM_TIMEOUT_MS             100         // Timeout for recvfrom in milliseconds in the receive thread
-#define CLIENT_SESSION_TIMEOUT_SEC      30        // Seconds after which an inactive client is considered disconnected
+#define CLIENT_SESSION_TIMEOUT_SEC      15        // Seconds after which an inactive client is considered disconnected
 #define SERVER_NAME                     "lkdc UDP Text/File Transfer Server"
 #define MAX_CLIENTS                     20
 
@@ -34,11 +34,11 @@ enum ClientSlotStatus {
 
 typedef struct{
     SOCKET socket;
-    struct sockaddr_in addr;     // Server address structure
-    ServerStatus status;         // Status of the server (e.g., busy, ready, error)
+    struct sockaddr_in addr;            // Server address structure
+    ServerStatus status;                // Status of the server (e.g., busy, ready, error)
     uint32_t session_timeout;           // Timeout period for client inactivity
-    uint32_t session_id_counter;         // Global counter for unique session IDs
-    char name[NAME_SIZE];        // Human-readable server name
+    uint32_t session_id_counter;        // Global counter for unique session IDs
+    char name[NAME_SIZE];               // Human-readable server name
 
     uint32_t fram_hash_count;
 
@@ -104,13 +104,13 @@ typedef struct {
 } ClientData;
 
 typedef struct{
-    uint32_t count;             // Number of currently connected clients
     ClientData client[MAX_CLIENTS];      // Array of connected clients
     CRITICAL_SECTION mutex;         // For thread-safe access to connected_clients
 }ClientList;
 
 ServerData server;
 QueueFrame queue_frame;
+QueueFrame queue_frame_ctrl;
 QueueSeqNum queue_seq_num;
 ClientList list;
 
@@ -122,7 +122,7 @@ HANDLE server_command_thread;
 
 //SeqNumNode *hash_table[HASH_SIZE] = {NULL};
 
-const char *server_ip = "127.0.0.1"; // IPv4 example
+const char *server_ip = "10.10.10.1"; // IPv4 example
 
 // Client management functions
 ClientData* find_client(ClientList *list, const uint32_t session_id);
@@ -219,11 +219,9 @@ void init_server(){
         return;
     }
     
-    int size = 16 * 1024 * 1024;
-    setsockopt(server.socket, SOL_SOCKET, SO_SNDBUF, (char *)&size, sizeof(size));
-    setsockopt(server.socket, SOL_SOCKET, SO_RCVBUF, (char *)&size, sizeof(size));
-
-    
+    // int size = 16 * 1024 * 1024;
+    // setsockopt(server.socket, SOL_SOCKET, SO_SNDBUF, (char *)&size, sizeof(size));
+    // setsockopt(server.socket, SOL_SOCKET, SO_RCVBUF, (char *)&size, sizeof(size));
     
     // 2. Set up the server address structure
     server.addr.sin_family = AF_INET;
@@ -237,10 +235,14 @@ void init_server(){
         cleanup_winsock();
         return;
     }
-    list.count = 0;
+
     queue_frame.head = 0;
     queue_frame.tail = 0;
     InitializeCriticalSection(&queue_frame.mutex);
+
+    queue_frame_ctrl.head = 0;
+    queue_frame_ctrl.tail = 0;
+    InitializeCriticalSection(&queue_frame_ctrl.mutex);
 
     queue_seq_num.head = 0;
     queue_seq_num.tail = 0;
@@ -308,6 +310,8 @@ void shutdown_server() {
         CloseHandle(client_timeout_thread);
     }
     DeleteCriticalSection(&list.mutex);
+    DeleteCriticalSection(&queue_frame.mutex);
+    DeleteCriticalSection(&queue_frame_ctrl.mutex);
     DeleteCriticalSection(&queue_seq_num.mutex);
     closesocket(server.socket);
     printf("Server shut down cleanly.\n");
@@ -317,14 +321,17 @@ void shutdown_server() {
 ClientData* find_client(ClientList *list, const uint32_t session_id) {
         
     // Search for the client with the given session ID
-    if (list->count == 0) {
-        return NULL; // No clients connected
-    }
-    for (int slot = 0; slot < MAX_CLIENTS; slot++) {
+ 
+    uint32_t slot;
+
+    for (slot = 0; slot < MAX_CLIENTS; slot++) {
         if(list->client[slot].slot_status == SLOT_FREE) continue;
         if(list->client[slot].session_id == session_id){
             return &list->client[slot];
         }
+    }
+    if(slot == MAX_CLIENTS){
+        return NULL;
     }
     return NULL;
 }
@@ -365,7 +372,6 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
 
     fprintf(stdout, "[ADDING NEW CLIENT] %s:%d Session ID:%d\n", new_client->ip, new_client->port, new_client->session_id);
 
-    list->count++;
     #ifdef ENABLE_FRAME_LOG
         create_log_frame_file(0, new_client->session_id, new_client->log_file_path);
     #endif
@@ -374,12 +380,21 @@ ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struc
 // Remove a client
 int remove_client(ClientList *list, const uint32_t slot) {
     // Search for the client with the given session ID
+    if(list == NULL){
+        fprintf(stderr, "Invalid client pointer!\n");
+        return -1;
+    }
     if (slot < 0 || slot >= MAX_CLIENTS) {
+        fprintf(stderr, "Invalid client slot nr:  %d", slot);
         return -1; 
     }
+    fprintf(stdout, "Removing client with session ID: %d from slot %d\n", list->client[slot].session_id, list->client[slot].slot_num);
+
+    free(list->client[slot].file_buffer);
+    free(list->client[slot].file_bitmap);
+
     memset(&list->client[slot], 0, sizeof(ClientData));
-    list->client[slot].connection = CLIENT_DISCONNECTED;
-    list->count--;
+    fprintf(stdout, "Removed client successfully!\n");
     return 0;
 }
 // Process received file metadata frame
@@ -435,12 +450,12 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
     //fprintf(stdout, "Received File ID: %d, Fragment size: %d, Fragment Offset: %d\n", fragment_file_id, fragment_size, fragment_offset);
 
     if(client->file_id != fragment_file_id){
-        fprintf(stderr, "No metadata for file fragment\n");
+        //fprintf(stderr, "No metadata for file fragment\n");
         return;
     }
     //copy the received fragment text to the buffer
     if(client->file_buffer == NULL){
-        fprintf(stderr, "Memory not allocated for file buffer!!!\n");
+        //fprintf(stderr, "Memory not allocated for file buffer!!!\n");
         return;
     }
     if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
@@ -457,6 +472,7 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
 
     update_statistics(client);
     mark_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size);
+
     client->file_bytes_received += fragment_size;
     if(client->file_bytes_received == client->file_size && check_bitmap(client->file_bitmap, client->file_fragment_count)){
         fprintf(stdout, "\n");
@@ -491,7 +507,9 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
         fprintf(stdout, "Received file from %s:%d File ID: %d, Size: %d\n", client->ip, client->port, client->file_id, client->file_bytes_received);
         
         free(client->file_buffer);
+        client->file_buffer = NULL;
         free(client->file_bitmap);
+        client->file_bitmap = NULL;
     }
     return;
 }
@@ -549,15 +567,26 @@ unsigned int WINAPI receive_frame_thread_func(void* ptr) {
             }
         } else if (bytes_received > 0) {
             // Push the received frame to the frame queue
+
             FrameEntry frame_entry;
             memset(&frame_entry, 0, sizeof(FrameEntry));
             memcpy(&frame_entry.frame, &received_frame, sizeof(UdpFrame));
             memcpy(&frame_entry.src_addr, &src_addr, sizeof(struct sockaddr_in));
             frame_entry.bytes_received = bytes_received;
-            if(push_frame(&queue_frame, &frame_entry) == -1){
-                fprintf(stderr, "Pushing frame error!!!\n");
-                continue;
-            };
+
+            if(frame_entry.frame.header.frame_type == FRAME_TYPE_KEEP_ALIVE || 
+                    frame_entry.frame.header.frame_type == FRAME_TYPE_CONNECT_REQUEST ||
+                    frame_entry.frame.header.frame_type == FRAME_TYPE_FILE_METADATA ||
+                    frame_entry.frame.header.frame_type == FRAME_TYPE_DISCONNECT){
+                if(push_frame(&queue_frame_ctrl, &frame_entry) == -1){
+                    continue;
+                }
+
+            } else {
+                if(push_frame(&queue_frame, &frame_entry) == -1){
+                    continue;
+                }
+            }
         }
     }
     printf("Exit receive_frame_thread...\n");
@@ -567,30 +596,46 @@ unsigned int WINAPI receive_frame_thread_func(void* ptr) {
 // --- Processes a received frame ---
 unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
+    uint16_t header_delimiter;
+    uint8_t  header_frame_type;
+    uint32_t header_seq_num;
+    uint32_t header_session_id;
+
+    FrameEntry frame_entry;
+    SeqNumEntry seq_num_entry;
+
+    UdpFrame *frame;
+    struct sockaddr_in *src_addr;
+    uint32_t bytes_received;
+
+    char src_ip[INET_ADDRSTRLEN];
+    uint16_t src_port;
+
+    ClientData *client;
+
     while(server.status == SERVER_READY) {
         // Pop a frame from the queue
-        FrameEntry frame_entry;
-        SeqNumEntry seq_num_entry;
-
-        if(pop_frame(&queue_frame, &frame_entry) == -1){
-            Sleep(1); // No frames to process, yield CPU
-            continue;
-        };
-        UdpFrame *frame = &frame_entry.frame;
-        struct sockaddr_in *src_addr = &frame_entry.src_addr;
-        uint32_t bytes_received = frame_entry.bytes_received;
+        if(pop_frame(&queue_frame_ctrl, &frame_entry) == -1){
+            if(pop_frame(&queue_frame, &frame_entry) == -1){
+                Sleep(100); // No frames to process, yield CPU
+                continue;
+        
+            }
+        }
+        frame = &frame_entry.frame;
+        src_addr = &frame_entry.src_addr;
+        bytes_received = frame_entry.bytes_received;
 
         // Extract header fields   
-        uint16_t header_delimiter = ntohs(frame->header.start_delimiter);
-        uint8_t  header_frame_type = frame->header.frame_type;
-        uint32_t header_seq_num = ntohl(frame->header.seq_num);
-        uint32_t header_session_id = ntohl(frame->header.session_id);
+        header_delimiter = ntohs(frame->header.start_delimiter);
+        header_frame_type = frame->header.frame_type;
+        header_seq_num = ntohl(frame->header.seq_num);
+        header_session_id = ntohl(frame->header.session_id);
 
         //fprintf(stdout, "received buffered frame seq nu: %d, nr of bytes: %d\n", header_seq_num, bytes_received);
         
-        char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
-        uint16_t src_port = ntohs(src_addr->sin_port);
+        src_port = ntohs(src_addr->sin_port);
 
         //1. Validate Delimiter
         if (header_delimiter != FRAME_DELIMITER) {
@@ -603,8 +648,10 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             // Optionally send ACK for checksum mismatch if this is part of a reliable stream
             // For individual datagrams, retransmission is often handled by higher layers or ignored.
             continue;
-        }       
-        ClientData *client = NULL;
+        }
+
+        client = NULL;
+
         EnterCriticalSection(&list.mutex);
         if(header_frame_type == FRAME_TYPE_CONNECT_REQUEST){
             client = find_client(&list, header_session_id);
@@ -626,7 +673,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             client = find_client(&list, header_session_id);
             if(client == NULL){
                 LeaveCriticalSection(&list.mutex);
-                fprintf(stdout, "Received frame from unknown %s:%d. Ignoring...\n", src_ip, src_port);
+                //fprintf(stdout, "Received frame from unknown %s:%d. Ignoring...\n", src_ip, src_port);
                 continue;
             }
         }
@@ -650,150 +697,15 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
-                seq_num_entry.seq_num = header_seq_num;
-                seq_num_entry.type = FRAME_TYPE_ACK;
-                seq_num_entry.session_id = header_session_id;
-                memcpy(&seq_num_entry.addr, src_addr, sizeof(struct sockaddr_in));
-                if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
-                    fprintf(stderr, "Pushing seq_num error!!!\n");
-                };
+                send_ack_nak(FRAME_TYPE_ACK, header_seq_num, header_session_id, server.socket, &client->addr, client->log_file_path);
                 break;
                 //TODO: Handle ACK processing, e.g., update internal state or queues
                        
             case FRAME_TYPE_LONG_TEXT_MESSAGE:
 
-
-//                             // Update client activity time
-//                 EnterCriticalSection(&list.mutex);
-//                 client->last_activity_time = time(NULL);
-//                 LeaveCriticalSection(&list.mutex);
-
-//                 // Push sequence number to queue to send ACK
-//                 seq_num_entry.seq_num = header_seq_num;
-//                 seq_num_entry.type = FRAME_TYPE_ACK;
-//                 seq_num_entry.session_id = header_session_id;
-//                 memcpy(&seq_num_entry.addr, src_addr, sizeof(struct sockaddr_in));
-//                 if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
-//                     fprintf(stderr, "Pushing seq_num error!!!\n");
-//                 };
-
-//                 // Extract the long text fragment and recombine the long message
-//                 uint32_t payload_message_id = ntohl(frame->payload.long_text_msg.message_id);
-//                 uint32_t payload_total_text_len = ntohl(frame->payload.long_text_msg.total_text_len);
-//                 uint32_t payload_fragment_text_len = ntohl(frame->payload.long_text_msg.fragment_len);
-//                 uint32_t payload_fragment_text_offset = ntohl(frame->payload.long_text_msg.fragment_offset);
-
-//                 BOOL message_id_found = 0;
-//                 uint32_t slot = 0;
-//                 uint32_t free_slot = 0;
-
-//                 for(slot = 0; slot < MAX_CONCURRENT_LONG_MESSAGES_PER_CLIENT; slot++){
-//                     if(client->long_msg_buff[slot].message_id == 0) {
-//                         free_slot = slot;
-//                         //break;
-//                     }
-//                     if(client->long_msg_buff[slot].message_id == payload_message_id){
-//                         message_id_found = TRUE;
-//                         //check if the received sequence number is a duplicate (if it exists in the hash then it was allready received)
-
-//                         //copy the received fragment text to the buffer
-//                         char *dest = client->long_msg_buff[slot].text + payload_fragment_text_offset;
-//                         char *src = frame->payload.long_text_msg.fragment_text;                                              
-//                         memcpy(dest, src, payload_fragment_text_len);
-//                         //update received bytes counter
-//                         client->long_msg_buff[slot].bytes_received += payload_fragment_text_len;
-//  //                       fprintf(stdout, "received seq num: %d\n", header_seq_num);
-
-//                         // FILE *new_file = fopen("E:\\out.txt", "ab");
-//                         // fseek(new_file, payload_fragment_text_offset, SEEK_SET);
-//                         // fwrite(frame->payload.long_text_msg.fragment_text, 1, payload_fragment_text_len, new_file);
-//                         // fclose(new_file);
-
-//                         mark_fragment_received(bitmap, payload_fragment_text_offset, _fragment_size);
-
-//                         //check if received full message (bytes received is equal to total payload)
-//                         if(client->long_msg_buff[slot].bytes_received == payload_total_text_len){                                                      
-//                             client->long_msg_buff[slot].text[payload_total_text_len] = '\0';                           
-//                             FILE *new_file = fopen("E:\\out.txt", "wb");
-//                             //fprintf(new_file, "%s", client->long_msg_buff[slot].text);
-//                             fwrite(client->long_msg_buff[slot].text, 1, payload_total_text_len, new_file);
-//                             fclose(new_file);
-//                             // fprintf(stdout, "Received long text msg from %s:%d - Bytes: %d - ID: %d\n", src_ip, src_port, payload_total_text_len, payload_message_id);
-//                             // fprintf(stdout, "Message: %s\n", client->long_msg_buff[slot].text);                   
-//                             free(client->long_msg_buff[slot].text);
-//                             client->long_msg_buff[slot].message_id = 0;
-//                             client->long_msg_buff[slot].bytes_received = 0;
-//                             free(bitmap);
-//                             _fragment_size = 0;
-//                         }
-//                         break;                     
-//                     }
-//                 }
-//                 if(message_id_found) 
-//                     break;
-//                 //check if the received sequence number is a duplicate (if it exists in the hash then it was allready received)
-                
-//                 nr_of_fragments = payload_total_text_len / payload_fragment_text_len;
-//                 if((payload_total_text_len % payload_fragment_text_len) > 0){
-//                     ++nr_of_fragments;
-//                 }
-//                 nr_bitmap_entries = nr_of_fragments / 32 + 1;  //using 32 bits unsigned int values and each bit will store the recived state of a fragment
-                
-//                 fprintf(stdout, "Total size bytes: %d\n", payload_total_text_len);
-//                 fprintf(stdout, "Fragment size bytes: %d\n", payload_fragment_text_len);
-//                 fprintf(stdout, "Nr of Fragments: %d\n", nr_of_fragments);                
-//                 fprintf(stdout, "Nr of Bitmap 32bit entries: %d\n", nr_bitmap_entries);
-
-//                 bitmap = malloc(nr_bitmap_entries * sizeof(uint32_t));
-//                 memset(bitmap, 0, nr_bitmap_entries * sizeof(uint32_t));
-//                 _fragment_size = payload_fragment_text_len;
-                
-//                 //copy the received fragment text to the buffer            
-//                 client->long_msg_buff[free_slot].message_id = payload_message_id;
-//                 client->long_msg_buff[free_slot].text = malloc(payload_total_text_len);
-//                 if(client->long_msg_buff[free_slot].text == NULL){
-//                     fprintf(stdout, "Error allocating memory!!!\n");
-//                     break;
-//                 }
-//                 char *dest = client->long_msg_buff[free_slot].text + payload_fragment_text_offset;
-//                 char *src = frame->payload.long_text_msg.fragment_text;
-//                 memcpy(dest, src, payload_fragment_text_len);
-//                 //update received bytes counter
-//                 client->long_msg_buff[free_slot].bytes_received = payload_fragment_text_len;
-//                 //add the received seqence number to hash
-
-//                 // FILE *new_file = fopen("E:\\out.txt", "wb");
-//                 // fseek(new_file, payload_fragment_text_offset, SEEK_SET);
-//                 // fwrite(frame->payload.long_text_msg.fragment_text, 1, payload_fragment_text_len, new_file);
-//                 // fclose(new_file);
-
-
-//                 mark_fragment_received(bitmap, payload_fragment_text_offset, _fragment_size);              
-
-//                 //check if received full message (bytes received is equal to total payload)
-//                 if(client->long_msg_buff[free_slot].bytes_received == payload_total_text_len){
-//                     client->long_msg_buff[free_slot].text[payload_total_text_len] = '\0';
-//                     FILE *new_file = fopen("E:\\out.txt", "wb");
-//                     fwrite(client->long_msg_buff[free_slot].text, 1, payload_total_text_len, new_file);
-//                     //fprintf(new_file, "%s", client->long_msg_buff[free_slot].text);                   
-//                     fclose(new_file);
-//                     // fprintf(stdout, "Received long text msg from %s:%d - Bytes: %d - ID:%d\n", src_ip, src_port, payload_total_text_len, payload_message_id);                   
-//                     // fprintf(stdout, "Message: %s\n", client->long_msg_buff[free_slot].text);                   
-//                     free(client->long_msg_buff[free_slot].text);
-//                     client->long_msg_buff[free_slot].message_id = 0;
-//                     client->long_msg_buff[free_slot].bytes_received = 0;
-//                     free(bitmap);
-//                     _fragment_size = 0;
-//                 }
-
-
-
-
-
                 break;
 
             case FRAME_TYPE_FILE_METADATA:
-                fprintf(stdout, "Received metadata frame!!!\n");
                 EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
@@ -806,8 +718,10 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
-                process_file_metadata_frame(client, frame);
 
+                EnterCriticalSection(&list.mutex);
+                process_file_metadata_frame(client, frame);
+                LeaveCriticalSection(&list.mutex);
                 break;
 
             case FRAME_TYPE_FILE_FRAGMENT:
@@ -815,7 +729,6 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
 
-
                 // Push sequence number to queue to send ACK
                 seq_num_entry.seq_num = header_seq_num;
                 seq_num_entry.type = FRAME_TYPE_ACK;
@@ -824,15 +737,17 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
+
+                EnterCriticalSection(&list.mutex);
                 process_file_fragment_frame(client, frame);
+                LeaveCriticalSection(&list.mutex);
                 break;
 
             case FRAME_TYPE_DISCONNECT:
                 fprintf(stdout, "Client %s:%d with session ID %d requested disconnect...\n", client->ip, client->port, client->session_id);
                 EnterCriticalSection(&list.mutex);
                 remove_client(&list, client->slot_num);
-                LeaveCriticalSection(&list.mutex);                
-                client = NULL;
+                LeaveCriticalSection(&list.mutex);
                 break;
             default:
                 break;
@@ -862,10 +777,9 @@ unsigned int WINAPI client_timeout_thread_func(void* ptr){
                 continue;
             }
             fprintf(stdout, "\nClient with Session ID: %d disconnected due to timeout\n", list.client[slot].session_id);
-            send_disconnect(DISCONNECT_TIMEOUT, list.client[slot].session_id, server.socket, &list.client[slot].addr, list.client[slot].log_file_path);         
+            send_disconnect(list.client[slot].session_id, server.socket, &list.client[slot].addr, list.client[slot].log_file_path);         
             remove_client(&list, slot);
-            LeaveCriticalSection(&list.mutex);
-            fprintf(stdout, "Remaining connected clients: %d\n", list.count);            
+            LeaveCriticalSection(&list.mutex);    
         }
         Sleep(500);
     } 
@@ -881,7 +795,7 @@ unsigned int WINAPI ack_nak_thread_func(void* ptr){
     while (server.status == SERVER_READY) {
         memset(&seq_num_entry, 0, sizeof(SeqNumEntry));   
         if(pop_seq_num(&queue_seq_num, &seq_num_entry) == -1){
-            Sleep(1);
+            Sleep(100);
             continue;
         }
         // check if client session still open (could be optional)

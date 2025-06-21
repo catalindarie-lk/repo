@@ -31,12 +31,6 @@ enum LogType{
     LOG_FRAME_SENT = 2
 };
 
-typedef uint8_t DisconnectCode;
-enum DisconnectCode{
-    DISCONNECT_REQUEST = 1,
-    DISCONNECT_TIMEOUT = 11
-};
-
 // --- Frame Types ---
 typedef uint8_t FrameType;
 enum FrameType{
@@ -105,14 +99,6 @@ typedef struct {
 } FileFragmentPayload;
 
 typedef struct {
-    uint8_t flag;           // For future use
-} AckNakPayload;
-
-typedef struct {
-    uint8_t flag;
-}DisconnectPayload;
-
-typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
     uint8_t  final_hash[16];     // Hash of the completely received file
     uint8_t  success;            // 1 for success, 0 for failure
@@ -127,8 +113,6 @@ typedef struct {
         LongTextPayload long_text_msg;          // Fragment of a long text message
         FileMetadataPayload file_metadata;      // File metadata request/response
         FileFragmentPayload file_fragment;                  // File data fragment
-        AckNakPayload ack_nak;                // Acknowledgment or Negative Acknowledgment    
-        DisconnectPayload disconnect;
         FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
     } payload;
@@ -223,12 +207,11 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
     //-----------------------------------
     switch(frame->header.frame_type){
         case FRAME_TYPE_ACK:
-            fprintf(file,"%s\n   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Flags: %d\n",
+            fprintf(file,"%s\n   FRAME_TYPE_ACK\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n",
                                                     buffer,                                           
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum),
-                                                    frame->payload.ack_nak.flag);
+                                                    ntohl(frame->header.checksum));
             break;
         case FRAME_TYPE_KEEP_ALIVE:
             fprintf(file,"%s\n   FRAME_TYPE_KEEP_ALIVE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n",
@@ -291,12 +274,11 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     break;
 
         case FRAME_TYPE_DISCONNECT:
-            fprintf(file, "%s\n   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Disconnect flag: %d\n", 
+            fprintf(file, "%s\n   FRAME_TYPE_DISCONNECT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n", 
                                                     buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum),
-                                                    frame->payload.disconnect.flag);
+                                                    ntohl(frame->header.checksum));
             break;
         default:
             break;
@@ -364,10 +346,8 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
             frame_size += sizeof(FileFragmentPayload); // Or header + payload_len + related metadata
             break;
         case FRAME_TYPE_ACK:
-            frame_size += sizeof(AckNakPayload); // Acknowledgment frame
-            break;
         case FRAME_TYPE_NACK:
-            frame_size += sizeof(AckNakPayload);
+            frame_size = sizeof(FrameHeader); // Acknowledgment frame
             break;
         case FRAME_TYPE_FILE_TRANSFER_COMPLETE:
         case FRAME_TYPE_FILE_TRANSFER_FAILED:
@@ -380,7 +360,7 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
             frame_size += sizeof(ConnectResponsePayload); // Assuming ConnectResponse is similar
             break;
         case FRAME_TYPE_DISCONNECT:
-            frame_size += sizeof(DisconnectPayload);
+            frame_size = sizeof(FrameHeader);
             break;
         case FRAME_TYPE_KEEP_ALIVE:
             frame_size = sizeof(FrameHeader);
@@ -418,9 +398,8 @@ int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t sess
     ack_frame.header.frame_type = type;
     ack_frame.header.seq_num = htonl(seq_num);
     ack_frame.header.session_id = htonl(session_id); // Use the session ID provided
-    ack_frame.payload.ack_nak.flag = 0;
     // Calculate CRC32 for the ACK/NACK frame
-    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckNakPayload)));
+    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader)));
     
     uint32_t bytes_sent = send_frame(&ack_frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
@@ -433,7 +412,7 @@ int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t sess
     return bytes_sent;
 }
 // Send Disconnect type frame
-int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, 
+int send_disconnect(const uint32_t session_id, const SOCKET src_socket, 
                         const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame frame;
     
@@ -443,9 +422,8 @@ int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET 
     frame.header.frame_type = FRAME_TYPE_DISCONNECT;
     frame.header.seq_num = 0;
     frame.header.session_id = htonl(session_id); // Use the session ID provided
-    frame.payload.disconnect.flag = flag;   
     // Calculate CRC32 for the ACK/NACK frame
-    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(DisconnectPayload)));
+    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader)));
     
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){

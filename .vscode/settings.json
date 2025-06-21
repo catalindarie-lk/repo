@@ -1,6 +1,7 @@
 {
     "files.associations": {
         "stdlib.h": "c",
-        "process.h": "c"
+        "process.h": "c",
+        "long_text_message": "c"
     }
 }

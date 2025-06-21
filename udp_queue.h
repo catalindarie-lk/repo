@@ -3,7 +3,7 @@
 
 #include "udp_lib.h"
 
-#define QUEUE_SIZE                      384000        // Queue buffer size
+#define QUEUE_SIZE                      524288      // Queue buffer size
 
 #pragma pack(push, 1)
 typedef struct{
@@ -47,7 +47,7 @@ int push_frame(QueueFrame *queue, FrameEntry *frame_entry){
     EnterCriticalSection(&queue->mutex);
     if((queue->tail + 1) % QUEUE_SIZE == queue->head){
         LeaveCriticalSection(&queue->mutex);
-        fprintf(stdout, "Frame queue full\n");
+        //fprintf(stdout, "Frame queue full\n");
         return RET_VAL_ERROR;
     }
     // Acquire the mutex to ensure thread-safe access to the queue
@@ -69,7 +69,7 @@ int pop_frame(QueueFrame *queue, FrameEntry *frame_entry){
         return RET_VAL_ERROR; // Return an empty RecvFrameInfo
     }
     EnterCriticalSection(&queue->mutex);
-    // Check if the queue is empty before removing a ACK
+    // Check if the queue is empty before removing
     
     if (queue->head == queue->tail) {
         LeaveCriticalSection(&queue->mutex);
