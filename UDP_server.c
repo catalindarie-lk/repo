@@ -8,7 +8,7 @@
 // --- Constants ---
 #define SERVER_PORT                     12345       // Port the server listens on
 #define RECVFROM_TIMEOUT_MS             100         // Timeout for recvfrom in milliseconds in the receive thread
-#define CLIENT_SESSION_TIMEOUT_SEC      90        // Seconds after which an inactive client is considered disconnected
+#define CLIENT_SESSION_TIMEOUT_SEC      30        // Seconds after which an inactive client is considered disconnected
 #define SERVER_NAME                     "lkdc UDP Text/File Transfer Server"
 #define MAX_CLIENTS                     20
 
@@ -122,7 +122,7 @@ HANDLE server_command_thread;
 
 //SeqNumNode *hash_table[HASH_SIZE] = {NULL};
 
-const char *server_ip = "10.10.10.1"; // IPv4 example
+const char *server_ip = "127.0.0.1"; // IPv4 example
 
 // Client management functions
 ClientData* find_client(ClientList *list, const uint32_t session_id);
@@ -218,6 +218,13 @@ void init_server(){
         cleanup_winsock();
         return;
     }
+    
+    int size = 16 * 1024 * 1024;
+    setsockopt(server.socket, SOL_SOCKET, SO_SNDBUF, (char *)&size, sizeof(size));
+    setsockopt(server.socket, SOL_SOCKET, SO_RCVBUF, (char *)&size, sizeof(size));
+
+    
+    
     // 2. Set up the server address structure
     server.addr.sin_family = AF_INET;
     server.addr.sin_port = htons(SERVER_PORT);
@@ -381,6 +388,7 @@ void process_file_metadata_frame(ClientData *client, UdpFrame *frame){
     client->file_id = ntohl(frame->payload.file_metadata.file_id);
     client->file_size = ntohl(frame->payload.file_metadata.file_size);
     client->max_fragment_size = ntohl(frame->payload.file_metadata.max_fragment_size);
+    client->file_bytes_received = 0;
     client->file_buffer = NULL;
     client->file_bitmap = NULL;
     
@@ -424,67 +432,66 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
     uint32_t fragment_size = ntohl(frame->payload.file_fragment.size);
     uint32_t fragment_offset = ntohl(frame->payload.file_fragment.offset);
 
-    // fprintf(stdout, "Received fragment file ID: %d\n", fragment_file_id);
-    // fprintf(stdout, "Received fragment size: %d\n", fragment_size);
-    // fprintf(stdout, "Received fragment offset: %d\n", fragment_offset);
-    if(client->file_id == fragment_file_id){
-        //copy the received fragment text to the buffer
-        if(client->file_buffer == NULL){
-            fprintf(stderr, "Memory not allocated for file buffer!!!\n");
-            return;
-        }
-        if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
+    //fprintf(stdout, "Received File ID: %d, Fragment size: %d, Fragment Offset: %d\n", fragment_file_id, fragment_size, fragment_offset);
+
+    if(client->file_id != fragment_file_id){
+        fprintf(stderr, "No metadata for file fragment\n");
+        return;
+    }
+    //copy the received fragment text to the buffer
+    if(client->file_buffer == NULL){
+        fprintf(stderr, "Memory not allocated for file buffer!!!\n");
+        return;
+    }
+    if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
 //            fprintf(stderr, "Received duplicate frame (offset: %d)!!!\n", fragment_offset);
+        return;
+    }
+    if(fragment_offset >= client->file_size){
+        fprintf(stderr, "Received fragment with offset out of limits. File size: %d, Received offset: %d\n", client->file_size, fragment_offset);
+        return;
+    }
+    char *dest = client->file_buffer + fragment_offset;
+    char *src = frame->payload.file_fragment.bytes;
+    memcpy(dest, src, fragment_size);
+
+    update_statistics(client);
+    mark_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size);
+    client->file_bytes_received += fragment_size;
+    if(client->file_bytes_received == client->file_size && check_bitmap(client->file_bitmap, client->file_fragment_count)){
+        fprintf(stdout, "\n");
+        char* log_folder = "E:\\logs\\";
+        char file_name[FILE_NAME_SIZE] = {'\0'};
+        memset(client->file_path_name, 0, FILE_NAME_SIZE);
+
+        if (CreateDirectory(log_folder, NULL)) {
+            printf("Created folder '%s' for logs: \n", log_folder);
+        } else {
+            DWORD folder_create_error = GetLastError();
+            if (folder_create_error == ERROR_ALREADY_EXISTS) {
+            } else {
+                fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
+                return; 
+            }
+        }                      
+        snprintf(file_name, FILE_NAME_SIZE, "out_%d.txt", client->session_id);
+        strncpy(client->file_path_name, log_folder, strlen(log_folder));
+        strncpy(client->file_path_name + strlen(log_folder), file_name, strlen(file_name));
+        client->file_path_name[strlen(log_folder) + strlen(file_name)] = '\0';
+
+        fprintf(stdout, "Creating output file: %s\n", client->file_path_name);
+
+        FILE *new_file = fopen(client->file_path_name, "wb");
+        if(new_file == NULL){
+            fprintf(stderr, "Error creating output file name!!!\n");
             return;
         }
-        char *dest = client->file_buffer + fragment_offset;
-        char *src = frame->payload.file_fragment.bytes;
-        memcpy(dest, src, fragment_size);
-        mark_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size);
-        //update received bytes counter
-        client->file_bytes_received += fragment_size;
-
-        if(client->file_bytes_received == client->file_size && check_bitmap(client->file_bitmap, client->file_fragment_count)){
-            //check_bitmap(client->file_bitmap, client->file_fragment_count);
-            fprintf(stdout, "\n");
-            char* log_folder = "E:\\logs\\";
-            char file_name[FILE_NAME_SIZE] = {'\0'};
-            memset(client->file_path_name, 0, FILE_NAME_SIZE);
-
-            if (CreateDirectory(log_folder, NULL)) {
-                printf("Created folder '%s' for logs: \n", log_folder);
-            } else {
-                DWORD folder_create_error = GetLastError();
-                if (folder_create_error == ERROR_ALREADY_EXISTS) {
-                } else {
-                    fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
-                    return; 
-                }
-            }            
-             
-            snprintf(file_name, FILE_NAME_SIZE, "out_%d.txt", client->session_id);
-            strncpy(client->file_path_name, log_folder, strlen(log_folder));
-            strncpy(client->file_path_name + strlen(log_folder), file_name, strlen(file_name));
-            client->file_path_name[strlen(log_folder) + strlen(file_name)] = '\0';
-
-            fprintf(stdout, "Creating output file: %s\n", client->file_path_name);
-
-            FILE *new_file = fopen(client->file_path_name, "wb");
-            if(new_file == NULL){
-                fprintf(stderr, "Error creating output file name!!!\n");
-                return;
-            }
-            fwrite(client->file_buffer, 1, client->file_bytes_received, new_file);
-            fclose(new_file);
-            fprintf(stdout, "Received file from %s:%d File ID: %d, Size: %d\n", client->ip, client->port, client->file_id, client->file_bytes_received);
-            
-            client->file_id = 0;
-            client->file_size = 0;
-            client->max_fragment_size = 0;
-            client->file_bytes_received = 0;
-            free(client->file_buffer);
-            free(client->file_bitmap);
-        }
+        fwrite(client->file_buffer, 1, client->file_bytes_received, new_file);
+        fclose(new_file);
+        fprintf(stdout, "Received file from %s:%d File ID: %d, Size: %d\n", client->ip, client->port, client->file_id, client->file_bytes_received);
+        
+        free(client->file_buffer);
+        free(client->file_bitmap);
     }
     return;
 }
@@ -579,6 +586,8 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
         uint32_t header_seq_num = ntohl(frame->header.seq_num);
         uint32_t header_session_id = ntohl(frame->header.session_id);
 
+        //fprintf(stdout, "received buffered frame seq nu: %d, nr of bytes: %d\n", header_seq_num, bytes_received);
+        
         char src_ip[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
         uint16_t src_port = ntohs(src_addr->sin_port);
@@ -594,11 +603,8 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             // Optionally send ACK for checksum mismatch if this is part of a reliable stream
             // For individual datagrams, retransmission is often handled by higher layers or ignored.
             continue;
-        }
-        // Log the received frame
-        
+        }       
         ClientData *client = NULL;
-
         EnterCriticalSection(&list.mutex);
         if(header_frame_type == FRAME_TYPE_CONNECT_REQUEST){
             client = find_client(&list, header_session_id);
@@ -606,7 +612,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
                 fprintf(stdout, "Client already connected\n");
-                send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
+                send_connect_response(header_seq_num, client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
                 continue;
             }
             client = add_client(&list, frame, src_addr);
@@ -631,7 +637,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
-                send_connect_response(client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
+                send_connect_response(header_seq_num, client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
                 break;
             
             case FRAME_TYPE_ACK:
@@ -640,11 +646,154 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 LeaveCriticalSection(&list.mutex);
                 break;
                 //TODO: Handle ACK processing, e.g., update internal state or queues
+            case FRAME_TYPE_KEEP_ALIVE:
+                EnterCriticalSection(&list.mutex);
+                client->last_activity_time = time(NULL);
+                LeaveCriticalSection(&list.mutex);
+                seq_num_entry.seq_num = header_seq_num;
+                seq_num_entry.type = FRAME_TYPE_ACK;
+                seq_num_entry.session_id = header_session_id;
+                memcpy(&seq_num_entry.addr, src_addr, sizeof(struct sockaddr_in));
+                if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
+                    fprintf(stderr, "Pushing seq_num error!!!\n");
+                };
+                break;
+                //TODO: Handle ACK processing, e.g., update internal state or queues
                        
             case FRAME_TYPE_LONG_TEXT_MESSAGE:
+
+
+//                             // Update client activity time
+//                 EnterCriticalSection(&list.mutex);
+//                 client->last_activity_time = time(NULL);
+//                 LeaveCriticalSection(&list.mutex);
+
+//                 // Push sequence number to queue to send ACK
+//                 seq_num_entry.seq_num = header_seq_num;
+//                 seq_num_entry.type = FRAME_TYPE_ACK;
+//                 seq_num_entry.session_id = header_session_id;
+//                 memcpy(&seq_num_entry.addr, src_addr, sizeof(struct sockaddr_in));
+//                 if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
+//                     fprintf(stderr, "Pushing seq_num error!!!\n");
+//                 };
+
+//                 // Extract the long text fragment and recombine the long message
+//                 uint32_t payload_message_id = ntohl(frame->payload.long_text_msg.message_id);
+//                 uint32_t payload_total_text_len = ntohl(frame->payload.long_text_msg.total_text_len);
+//                 uint32_t payload_fragment_text_len = ntohl(frame->payload.long_text_msg.fragment_len);
+//                 uint32_t payload_fragment_text_offset = ntohl(frame->payload.long_text_msg.fragment_offset);
+
+//                 BOOL message_id_found = 0;
+//                 uint32_t slot = 0;
+//                 uint32_t free_slot = 0;
+
+//                 for(slot = 0; slot < MAX_CONCURRENT_LONG_MESSAGES_PER_CLIENT; slot++){
+//                     if(client->long_msg_buff[slot].message_id == 0) {
+//                         free_slot = slot;
+//                         //break;
+//                     }
+//                     if(client->long_msg_buff[slot].message_id == payload_message_id){
+//                         message_id_found = TRUE;
+//                         //check if the received sequence number is a duplicate (if it exists in the hash then it was allready received)
+
+//                         //copy the received fragment text to the buffer
+//                         char *dest = client->long_msg_buff[slot].text + payload_fragment_text_offset;
+//                         char *src = frame->payload.long_text_msg.fragment_text;                                              
+//                         memcpy(dest, src, payload_fragment_text_len);
+//                         //update received bytes counter
+//                         client->long_msg_buff[slot].bytes_received += payload_fragment_text_len;
+//  //                       fprintf(stdout, "received seq num: %d\n", header_seq_num);
+
+//                         // FILE *new_file = fopen("E:\\out.txt", "ab");
+//                         // fseek(new_file, payload_fragment_text_offset, SEEK_SET);
+//                         // fwrite(frame->payload.long_text_msg.fragment_text, 1, payload_fragment_text_len, new_file);
+//                         // fclose(new_file);
+
+//                         mark_fragment_received(bitmap, payload_fragment_text_offset, _fragment_size);
+
+//                         //check if received full message (bytes received is equal to total payload)
+//                         if(client->long_msg_buff[slot].bytes_received == payload_total_text_len){                                                      
+//                             client->long_msg_buff[slot].text[payload_total_text_len] = '\0';                           
+//                             FILE *new_file = fopen("E:\\out.txt", "wb");
+//                             //fprintf(new_file, "%s", client->long_msg_buff[slot].text);
+//                             fwrite(client->long_msg_buff[slot].text, 1, payload_total_text_len, new_file);
+//                             fclose(new_file);
+//                             // fprintf(stdout, "Received long text msg from %s:%d - Bytes: %d - ID: %d\n", src_ip, src_port, payload_total_text_len, payload_message_id);
+//                             // fprintf(stdout, "Message: %s\n", client->long_msg_buff[slot].text);                   
+//                             free(client->long_msg_buff[slot].text);
+//                             client->long_msg_buff[slot].message_id = 0;
+//                             client->long_msg_buff[slot].bytes_received = 0;
+//                             free(bitmap);
+//                             _fragment_size = 0;
+//                         }
+//                         break;                     
+//                     }
+//                 }
+//                 if(message_id_found) 
+//                     break;
+//                 //check if the received sequence number is a duplicate (if it exists in the hash then it was allready received)
+                
+//                 nr_of_fragments = payload_total_text_len / payload_fragment_text_len;
+//                 if((payload_total_text_len % payload_fragment_text_len) > 0){
+//                     ++nr_of_fragments;
+//                 }
+//                 nr_bitmap_entries = nr_of_fragments / 32 + 1;  //using 32 bits unsigned int values and each bit will store the recived state of a fragment
+                
+//                 fprintf(stdout, "Total size bytes: %d\n", payload_total_text_len);
+//                 fprintf(stdout, "Fragment size bytes: %d\n", payload_fragment_text_len);
+//                 fprintf(stdout, "Nr of Fragments: %d\n", nr_of_fragments);                
+//                 fprintf(stdout, "Nr of Bitmap 32bit entries: %d\n", nr_bitmap_entries);
+
+//                 bitmap = malloc(nr_bitmap_entries * sizeof(uint32_t));
+//                 memset(bitmap, 0, nr_bitmap_entries * sizeof(uint32_t));
+//                 _fragment_size = payload_fragment_text_len;
+                
+//                 //copy the received fragment text to the buffer            
+//                 client->long_msg_buff[free_slot].message_id = payload_message_id;
+//                 client->long_msg_buff[free_slot].text = malloc(payload_total_text_len);
+//                 if(client->long_msg_buff[free_slot].text == NULL){
+//                     fprintf(stdout, "Error allocating memory!!!\n");
+//                     break;
+//                 }
+//                 char *dest = client->long_msg_buff[free_slot].text + payload_fragment_text_offset;
+//                 char *src = frame->payload.long_text_msg.fragment_text;
+//                 memcpy(dest, src, payload_fragment_text_len);
+//                 //update received bytes counter
+//                 client->long_msg_buff[free_slot].bytes_received = payload_fragment_text_len;
+//                 //add the received seqence number to hash
+
+//                 // FILE *new_file = fopen("E:\\out.txt", "wb");
+//                 // fseek(new_file, payload_fragment_text_offset, SEEK_SET);
+//                 // fwrite(frame->payload.long_text_msg.fragment_text, 1, payload_fragment_text_len, new_file);
+//                 // fclose(new_file);
+
+
+//                 mark_fragment_received(bitmap, payload_fragment_text_offset, _fragment_size);              
+
+//                 //check if received full message (bytes received is equal to total payload)
+//                 if(client->long_msg_buff[free_slot].bytes_received == payload_total_text_len){
+//                     client->long_msg_buff[free_slot].text[payload_total_text_len] = '\0';
+//                     FILE *new_file = fopen("E:\\out.txt", "wb");
+//                     fwrite(client->long_msg_buff[free_slot].text, 1, payload_total_text_len, new_file);
+//                     //fprintf(new_file, "%s", client->long_msg_buff[free_slot].text);                   
+//                     fclose(new_file);
+//                     // fprintf(stdout, "Received long text msg from %s:%d - Bytes: %d - ID:%d\n", src_ip, src_port, payload_total_text_len, payload_message_id);                   
+//                     // fprintf(stdout, "Message: %s\n", client->long_msg_buff[free_slot].text);                   
+//                     free(client->long_msg_buff[free_slot].text);
+//                     client->long_msg_buff[free_slot].message_id = 0;
+//                     client->long_msg_buff[free_slot].bytes_received = 0;
+//                     free(bitmap);
+//                     _fragment_size = 0;
+//                 }
+
+
+
+
+
                 break;
 
             case FRAME_TYPE_FILE_METADATA:
+                fprintf(stdout, "Received metadata frame!!!\n");
                 EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
                 LeaveCriticalSection(&list.mutex);
@@ -676,7 +825,6 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
                 process_file_fragment_frame(client, frame);
-                update_statistics(client);
                 break;
 
             case FRAME_TYPE_DISCONNECT:
@@ -685,16 +833,6 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 remove_client(&list, client->slot_num);
                 LeaveCriticalSection(&list.mutex);                
                 client = NULL;
-                break;
-
-            case FRAME_TYPE_PING:
-                EnterCriticalSection(&list.mutex);
-                client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
-
-                uint32_t ping_ack_num = ntohl(frame->payload.ping_pong.ack_num);
-                uint8_t ping_flag = frame->payload.ping_pong.flag;
-                send_ping_pong(FRAME_TYPE_PONG, ping_ack_num, client->session_id, server.socket, &client->addr, client->log_file_path);
                 break;
             default:
                 break;

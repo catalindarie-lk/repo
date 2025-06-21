@@ -40,20 +40,22 @@ enum DisconnectCode{
 // --- Frame Types ---
 typedef uint8_t FrameType;
 enum FrameType{
-    FRAME_TYPE_LONG_TEXT_MESSAGE = 2,      // Fragment of a long text message
-    FRAME_TYPE_FILE_METADATA = 3,       // Client requests to send a file (includes filename, size, hash)
-    FRAME_TYPE_FILE_METADATA_RESPONSE = 4,      // Server grants file transfer (assigns file_id)
-    FRAME_TYPE_FILE_FRAGMENT = 5,                   // File data fragment
-    FRAME_TYPE_ACK = 6,                         // Acknowledgment for a received frame
-    FRAME_TYPE_NACK = 7,                        // Negative Acknowledgment (request retransmission)
-    FRAME_TYPE_CONNECT_REQUEST = 8,             // Client's initial contact to server
-    FRAME_TYPE_CONNECT_RESPONSE = 9,            // Server's response to client connect
-    FRAME_TYPE_DISCONNECT = 10,                 // Client requests to disconnect
 
-    FRAME_TYPE_PING = 20,                       // Client sends periodically to maintain connection status
-    FRAME_TYPE_PONG = 21,
-    FRAME_TYPE_FILE_TRANSFER_COMPLETE = 30,     // Server confirms file transfer completion and hash verification
-    FRAME_TYPE_FILE_TRANSFER_FAILED = 31,       // Server informs client of failed file transfer (e.g., hash mismatch)
+    FRAME_TYPE_CONNECT_REQUEST = 1,             // Client's initial contact to server
+    FRAME_TYPE_CONNECT_RESPONSE = 2,            // Server's response to client connect
+    FRAME_TYPE_DISCONNECT = 3,                 // Client requests to disconnect
+
+    FRAME_TYPE_ACK = 4,                         // Acknowledgment for a received frame
+    FRAME_TYPE_NACK = 5,                        // Negative Acknowledgment (request retransmission)
+    FRAME_TYPE_KEEP_ALIVE = 6,
+
+    FRAME_TYPE_LONG_TEXT_MESSAGE = 10,      // Fragment of a long text message
+
+    FRAME_TYPE_FILE_METADATA = 20,       // Client requests to send a file (includes filename, size, hash)
+    FRAME_TYPE_FILE_METADATA_RESPONSE = 21,      // Server grants file transfer (assigns file_id)
+    FRAME_TYPE_FILE_FRAGMENT = 22,                   // File data fragment
+    FRAME_TYPE_FILE_TRANSFER_COMPLETE = 23,     // Server confirms file transfer completion and hash verification
+    FRAME_TYPE_FILE_TRANSFER_FAILED = 24       // Server informs client of failed file transfer (e.g., hash mismatch)
 };
 
 //---------------------------------------------------------------------------------------------
@@ -110,11 +112,6 @@ typedef struct {
     uint8_t flag;
 }DisconnectPayload;
 
-typedef struct{
-    uint32_t ack_num;
-    uint8_t flag;
-}PingPongPayload;
-
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
     uint8_t  final_hash[16];     // Hash of the completely received file
@@ -132,7 +129,6 @@ typedef struct {
         FileFragmentPayload file_fragment;                  // File data fragment
         AckNakPayload ack_nak;                // Acknowledgment or Negative Acknowledgment    
         DisconnectPayload disconnect;
-        PingPongPayload ping_pong;
         FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
     } payload;
@@ -147,19 +143,6 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
 // Logging functions for debug - required here because send_ functions call log frame
 void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]);
 void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path);
-
-// UDP communication functions
-int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_ack_nak(const uint8_t type, const uint32_t seq_num, const uint32_t session_id, 
-                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
-int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET src_socket, 
-                        const struct sockaddr_in *dest_addr, const char *log_file_path);
-int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, 
-                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
-int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
-                        const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
-int send_connect_request(const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
-                        const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
 
 
 // ----- Function implementations -----
@@ -247,6 +230,13 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     ntohl(frame->header.checksum),
                                                     frame->payload.ack_nak.flag);
             break;
+        case FRAME_TYPE_KEEP_ALIVE:
+            fprintf(file,"%s\n   FRAME_TYPE_KEEP_ALIVE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n",
+                                                    buffer,                                           
+                                                    ntohl(frame->header.seq_num), 
+                                                    ntohl(frame->header.session_id), 
+                                                    ntohl(frame->header.checksum));
+            break;
         case FRAME_TYPE_CONNECT_REQUEST:
             fprintf(file, "%s\n   FRAME_TYPE_CONNECT_REQUEST\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Client ID: %d\n   Flags: %d\n   Client Name: %s\n", 
                                                     buffer,
@@ -307,22 +297,6 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     ntohl(frame->header.session_id), 
                                                     ntohl(frame->header.checksum),
                                                     frame->payload.disconnect.flag);
-            break;
-        case FRAME_TYPE_PING:
-            fprintf(file, "%s\n   FRAME_TYPE_PING\n   Session ID: %d\n   Checksum: %d\n   Ack Ping Seq: %d\n   Flags: %d\n", 
-                                                    buffer,
-                                                    ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum),
-                                                    ntohl(frame->payload.ping_pong.ack_num), 
-                                                    frame->payload.ping_pong.flag);
-            break;
-        case FRAME_TYPE_PONG:
-            fprintf(file, "%s\n   FRAME_TYPE_PONG\n   Session ID: %d\n   Checksum: %d\n   Ack Pong Seq: %d\n   Flags: %d\n", 
-                                                    buffer,
-                                                    ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum),
-                                                    ntohl(frame->payload.ping_pong.ack_num), 
-                                                    frame->payload.ping_pong.flag);
             break;
         default:
             break;
@@ -408,9 +382,8 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
         case FRAME_TYPE_DISCONNECT:
             frame_size += sizeof(DisconnectPayload);
             break;
-        case FRAME_TYPE_PING:
-        case FRAME_TYPE_PONG:
-            frame_size += sizeof(PingPongPayload); // These typically have no specific payload
+        case FRAME_TYPE_KEEP_ALIVE:
+            frame_size = sizeof(FrameHeader);
             break;
         default:
             frame_size = sizeof(UdpFrame); // Fallback to max size
@@ -484,39 +457,8 @@ int send_disconnect(const uint8_t flag, const uint32_t session_id, const SOCKET 
     #endif
     return bytes_sent;
 }
-// Send Ping-Pong type frame
-int send_ping_pong(const uint8_t type, const uint32_t ack_num, const uint32_t session_id, 
-                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
-    UdpFrame frame;
-    // Check frame type is valid
-    if((type != FRAME_TYPE_PING) && (type != FRAME_TYPE_PONG)){
-        fprintf(stderr, "Wrong frame type\n");
-        return SOCKET_ERROR;
-    }
-    // Initialize the ACK/NACK frame
-    memset(&frame, 0, sizeof(frame));
-    // Set the header fields
-    frame.header.start_delimiter = htons(FRAME_DELIMITER);
-    frame.header.frame_type = type;
-    frame.header.seq_num = 0;
-    frame.header.session_id = htonl(session_id); // Use the session ID provided
-    frame.payload.ping_pong.ack_num = htonl(ack_num);   
-    frame.payload.ping_pong.flag = 0;
-    // Calculate CRC32 for the ACK/NACK frame
-    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(PingPongPayload)));
-    
-    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
-    if(bytes_sent == SOCKET_ERROR){
-        fprintf(stderr, "send_ping_pong() failed\n");
-        return SOCKET_ERROR;
-    }
-    #ifdef ENABLE_FRAME_LOG
-        log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
-    #endif
-    return bytes_sent;
-}
 // --- Send connect response --- (server function)
-int send_connect_response(const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
+int send_connect_response(const uint32_t seq_num, const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
                                 const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path) {
     UdpFrame frame;
     // Initialize the response frame
@@ -525,7 +467,7 @@ int send_connect_response(const uint32_t session_id, const uint32_t session_time
     frame.header.start_delimiter = htons(FRAME_DELIMITER);
     frame.header.frame_type = FRAME_TYPE_CONNECT_RESPONSE;
 
-    frame.header.seq_num = 0;
+    frame.header.seq_num = htonl(seq_num);
     frame.header.session_id = htonl(session_id); // Use client's session ID
 
     frame.payload.response.session_timeout = htonl(session_timeout);
@@ -548,7 +490,7 @@ int send_connect_response(const uint32_t session_id, const uint32_t session_time
     return bytes_sent;
 }
 // --- Send connect request --- (client function)
-int send_connect_request(const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
+int send_connect_request(const uint32_t seq_num, const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
                                         const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
     // Create a connect request frame
     UdpFrame frame;
@@ -557,7 +499,7 @@ int send_connect_request(const uint32_t session_id, const uint32_t client_id, co
     // Set the header fields
     frame.header.start_delimiter = htons(FRAME_DELIMITER);
     frame.header.frame_type = FRAME_TYPE_CONNECT_REQUEST;
-    frame.header.seq_num = 0;
+    frame.header.seq_num = htonl(seq_num);
     frame.header.session_id = htonl(session_id);
     frame.payload.request.client_id = htonl(client_id);
     frame.payload.request.flag = flag;
@@ -578,5 +520,28 @@ int send_connect_request(const uint32_t session_id, const uint32_t client_id, co
     return bytes_sent; 
 };
 
+int send_keep_alive(const uint32_t seq_num, const uint32_t session_id, 
+                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
+    UdpFrame frame;
 
+    // Initialize the ACK/NACK frame
+    memset(&frame, 0, sizeof(frame));
+    // Set the header fields
+    frame.header.start_delimiter = htons(FRAME_DELIMITER);
+    frame.header.frame_type = FRAME_TYPE_KEEP_ALIVE;
+    frame.header.seq_num = htonl(seq_num);
+    frame.header.session_id = htonl(session_id); // Use the session ID provided  
+    // Calculate CRC32 for the frame
+    frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader)));
+    
+    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
+    if(bytes_sent == SOCKET_ERROR){
+        fprintf(stderr, "send_ping_pong() failed\n");
+        return SOCKET_ERROR;
+    }
+    #ifdef ENABLE_FRAME_LOG
+        log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
+    #endif
+    return bytes_sent;
+}
 #endif // _UDP_LIB_H
