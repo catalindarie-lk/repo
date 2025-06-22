@@ -18,9 +18,9 @@
 #define FILE_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 3)
 #define FILE_CHUNK_SIZE                 (FILE_FRAGMENT_SIZE * 128)
 
-#define RESEND_TIMEOUT                  10           //seconds
+#define RESEND_TIMEOUT                  3           //seconds
 #define RESEND_TIME_TRANSFER            1000        //miliseconds
-#define RESEND_TIME_IDLE                20          //miliseconds
+#define RESEND_TIME_IDLE                10          //miliseconds
 
 
 #define MAX_FILE_TRANSFER_THREADS       10
@@ -73,6 +73,7 @@ typedef struct{
 
     long file_size;
     long hash_count;
+    BOOL throttle;
  
 } ClientData;
 
@@ -916,7 +917,15 @@ unsigned int WINAPI file_transfer_thread_func(void *ptr){
                 continue;
             }
 
-            if(client.hash_count > 8192){
+            if(client.hash_count > 16384){
+                client.throttle = TRUE;
+            }
+
+            if(client.hash_count < 4096){
+                client.throttle = FALSE;
+            }
+
+            if(client.throttle){
                 Sleep(100);
                 continue;
             }

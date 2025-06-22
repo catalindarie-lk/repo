@@ -457,7 +457,7 @@ int process_file_fragment_frame(ClientData *client, UdpFrame *frame){
     }
     if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
 //            fprintf(stderr, "Received duplicate frame (offset: %d)!!!\n", fragment_offset);
-        return RET_VAL_ERROR;
+        return RET_VAL_SUCCESS;
     }
     if(fragment_offset >= client->file_size){
         fprintf(stderr, "Received fragment with offset out of limits. File size: %d, Received offset: %d\n", client->file_size, fragment_offset);
