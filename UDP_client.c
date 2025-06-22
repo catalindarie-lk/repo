@@ -18,9 +18,9 @@
 #define FILE_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 3)
 #define FILE_CHUNK_SIZE                 (FILE_FRAGMENT_SIZE * 128)
 
-#define RESEND_TIMEOUT                  5           //seconds
+#define RESEND_TIMEOUT                  10           //seconds
 #define RESEND_TIME_TRANSFER            1000        //miliseconds
-#define RESEND_TIME_IDLE                10          //miliseconds
+#define RESEND_TIME_IDLE                20          //miliseconds
 
 
 #define MAX_FILE_TRANSFER_THREADS       10
@@ -70,6 +70,9 @@ typedef struct{
 
     uint32_t file_id;
     uint32_t total_bytes_to_send;
+
+    long file_size;
+    long hash_count;
  
 } ClientData;
 
@@ -175,11 +178,10 @@ int read_file(const char *filepath, char *buffer, long size) {
 }
 
 uint32_t get_new_seq_num(){
-    uint32_t new_seq_num = 0;
     EnterCriticalSection(&client.frame_count_mutex);
-    new_seq_num = ++client.frame_count;
+    client.frame_count++;
     LeaveCriticalSection(&client.frame_count_mutex);
-    return new_seq_num;
+    return client.frame_count;
 }
 void init_winsock() {
     WSADATA wsaData;
@@ -346,6 +348,8 @@ int main() {
     start_threads(&client);
 
     while(client.client_status == CLIENT_BUSY || client.client_status == CLIENT_READY){
+        //printf("\r%-255s", "");
+        fprintf(stdout, "\r%-100s\rProgress: %.2f %%, Hash queue frames: %d", "", (float)(client.file_size - client.total_bytes_to_send) / (float)client.file_size * 100.0, client.hash_count);
         if(client.session_status == SESSION_DISCONNECTED){
             EnterCriticalSection(&client.frame_count_mutex);
             client.frame_count = 0;       // this will be sent as seq_num
@@ -394,7 +398,7 @@ int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, c
     // Calculate the checksum for the frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(LongTextPayload)));  
     EnterCriticalSection(&hash_table_mutex);
-    insert_frame(hash_table, &frame);
+    insert_frame(hash_table, &frame, &client.hash_count);
     LeaveCriticalSection(&hash_table_mutex);
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
@@ -430,7 +434,7 @@ int send_file_metadata(const uint32_t seq_num, const uint32_t session_id, const 
     // Calculate the checksum for the frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(FileMetadataPayload)));  
     EnterCriticalSection(&hash_table_mutex);
-    insert_frame(hash_table, &frame);
+    insert_frame(hash_table, &frame, &client.hash_count);
     LeaveCriticalSection(&hash_table_mutex);
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
@@ -473,7 +477,7 @@ int send_file_fragment(const uint32_t seq_num, const uint32_t session_id, const 
     // Calculate the checksum for the frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(FileFragmentPayload)));  
     EnterCriticalSection(&hash_table_mutex);
-    insert_frame(hash_table, &frame);
+    insert_frame(hash_table, &frame, &client.hash_count);
     LeaveCriticalSection(&hash_table_mutex);
     uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
@@ -491,23 +495,26 @@ int send_file_fragment(const uint32_t seq_num, const uint32_t session_id, const 
 
 // --- Receive frame ---
 unsigned int WINAPI receive_frame_thread_func(void* ptr) {
+
+    UdpFrame received_frame;
+    FrameEntry frame_entry;
+    DWORD timeout = RECV_TIMEOUT_MS;
+    int bytes_received;
+
+    struct sockaddr_in src_addr;
+    int src_addr_len = sizeof(src_addr);
+
+    if (setsockopt(client.socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) == SOCKET_ERROR) {
+        fprintf(stderr, "receive_thread_func: setsockopt SO_RCVTIMEO failed with error: %d\n", WSAGetLastError());
+        // Do not exit, but log the error
+    }
     
     while (client.session_status == SESSION_CONNECTING || client.session_status == SESSION_CONNECTED) {
 
-        UdpFrame received_frame;
         memset(&received_frame, 0, sizeof(UdpFrame));
-        struct sockaddr_in src_addr;
         memset(&src_addr, 0, sizeof(src_addr));
-        int src_addr_len = sizeof(src_addr);
-    
-        DWORD timeout = RECV_TIMEOUT_MS;
-        if (setsockopt(client.socket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof(timeout)) == SOCKET_ERROR) {
-            fprintf(stderr, "receive_thread_func: setsockopt SO_RCVTIMEO failed with error: %d\n", WSAGetLastError());
-            // Do not exit, but log the error
-        }
-
-        int bytes_received = recvfrom(client.socket, (char*)&received_frame, sizeof(UdpFrame), 0, (SOCKADDR*)&src_addr, &src_addr_len);
-
+        
+        bytes_received = recvfrom(client.socket, (char*)&received_frame, sizeof(UdpFrame), 0, (SOCKADDR*)&src_addr, &src_addr_len);
         if (bytes_received == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
             if (error_code != WSAETIMEDOUT) { // WSAETIMEDOUT is expected if no data for RECV_TIMEOUT_MS
@@ -516,11 +523,11 @@ unsigned int WINAPI receive_frame_thread_func(void* ptr) {
             }
         } else if (bytes_received > 0) {
             // Push the received frame to the frame queue
-            FrameEntry frame_entry;
+            
             memset(&frame_entry, 0, sizeof(FrameEntry));
             memcpy(&frame_entry.frame, &received_frame, sizeof(UdpFrame));
             memcpy(&frame_entry.src_addr, &src_addr, sizeof(struct sockaddr_in));          
-            frame_entry.bytes_received = bytes_received;
+            frame_entry.bytes_received = (uint32_t)bytes_received;
 
             if(frame_entry.frame.header.frame_type == FRAME_TYPE_CONNECT_RESPONSE || frame_entry.frame.header.frame_type == FRAME_TYPE_DISCONNECT){
                 if(push_frame(&queue_frame_ctrl, &frame_entry) == -1){
@@ -637,7 +644,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 if(received_session_id == client.session_id){
                     client.last_active_time = time(NULL);
                     EnterCriticalSection(&hash_table_mutex);
-                    remove_frame(hash_table, received_seq_num);
+                    remove_frame(hash_table, received_seq_num, &client.hash_count);
                     LeaveCriticalSection(&hash_table_mutex);
                 }
                 break;
@@ -650,7 +657,10 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 break;
 
             case FRAME_TYPE_CONNECT_REQUEST:
-                break;              
+                break;
+                
+            case FRAME_TYPE_KEEP_ALIVE:
+                break;
             default:
                 break;
         }
@@ -685,7 +695,7 @@ unsigned int WINAPI resend_thread_func(void *ptr){
     while(client.client_status == CLIENT_READY){
         if(client.session_status != SESSION_CONNECTED){
             EnterCriticalSection(&hash_table_mutex);
-            clean_frame_hash_table(hash_table);
+            clean_frame_hash_table(hash_table, &client.hash_count);
             LeaveCriticalSection(&hash_table_mutex);
             Sleep(1000);
             continue;
@@ -865,7 +875,7 @@ unsigned int WINAPI file_transfer_thread_func(void *ptr){
     FILE *file = NULL;
 
     uint8_t chunk_buffer[FILE_CHUNK_SIZE];
-    long file_size;
+//    long file_size;
     //uint32_t total_bytes_to_send;
     uint32_t chunk_bytes_to_send;
     uint32_t chunk_fragment_offset;
@@ -887,22 +897,27 @@ unsigned int WINAPI file_transfer_thread_func(void *ptr){
             fprintf(stdout, "Error opening file!!!\n");
             continue;
         }
-        file_size = get_file_size(file_path);
-        if(file_size > UINT32_MAX){
+        client.file_size = get_file_size(file_path);
+        if(client.file_size > UINT32_MAX){
             fprintf(stdout, "File too big!!!\n");
             continue;
         }
 
-        send_file_metadata(get_new_seq_num(), client.session_id, client.file_id, file_size, FILE_FRAGMENT_SIZE, client.socket, &client.server_addr);
+        send_file_metadata(get_new_seq_num(), client.session_id, client.file_id, client.file_size, FILE_FRAGMENT_SIZE, client.socket, &client.server_addr);
         
         frame_fragment_offset = 0;
-        client.total_bytes_to_send = (uint32_t)file_size;
+        client.total_bytes_to_send = (uint32_t)client.file_size;
 
         while(client.total_bytes_to_send > 0){
 
             if(client.session_status != SESSION_CONNECTED){
                 fprintf(stdout, "Session with server closed!!!\n");
                 client.total_bytes_to_send = 0;
+                continue;
+            }
+
+            if(client.hash_count > 8192){
+                Sleep(100);
                 continue;
             }
 
@@ -922,16 +937,16 @@ unsigned int WINAPI file_transfer_thread_func(void *ptr){
                     frame_fragment_size = FILE_FRAGMENT_SIZE;
                 } else {
                     frame_fragment_size = chunk_bytes_to_send;
-                }    
+                }
                 send_file_fragment(get_new_seq_num(), client.session_id, client.file_id, frame_fragment_offset, chunk_buffer, frame_fragment_size, chunk_fragment_offset, client.socket, &client.server_addr);
                 chunk_fragment_offset += frame_fragment_size;
                 frame_fragment_offset += frame_fragment_size;                       
                 chunk_bytes_to_send -= frame_fragment_size;
                 client.total_bytes_to_send -= frame_fragment_size;
-                fprintf(stdout, "\rProgress: %.2f %%", (float)(file_size - client.total_bytes_to_send) / (float)file_size * 100.0);
+                //fprintf(stdout, "\rProgress: %.2f %%", (float)(file_size - client.total_bytes_to_send) / (float)file_size * 100.0);
             }     
         }                  
-        fprintf(stdout, "Sent bytes: %d\n", file_size);
+        fprintf(stdout, "Sent bytes: %d\n", client.file_size);
         fclose(file);    
 
     }

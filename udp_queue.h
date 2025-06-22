@@ -3,7 +3,8 @@
 
 #include "udp_lib.h"
 
-#define QUEUE_SIZE                      524288      // Queue buffer size
+#define SEQ_NUM_QUEUE_SIZE                      1048576     // Queue buffer size
+#define FRAME_QUEUE_SIZE                        16384
 
 #pragma pack(push, 1)
 typedef struct{
@@ -21,14 +22,14 @@ typedef struct{
 #pragma pack(pop)
 
 typedef struct {
-    FrameEntry frame_entry[QUEUE_SIZE];
+    FrameEntry frame_entry[FRAME_QUEUE_SIZE];
     uint32_t head;          
     uint32_t tail;
     CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
 }QueueFrame;
 
 typedef struct {
-    SeqNumEntry seq_num_entry[QUEUE_SIZE];
+    SeqNumEntry seq_num_entry[SEQ_NUM_QUEUE_SIZE];
     uint32_t head;          
     uint32_t tail;
     CRITICAL_SECTION mutex; // Mutex for thread-safe access to frame_buffer
@@ -45,7 +46,7 @@ int push_frame(QueueFrame *queue, FrameEntry *frame_entry){
     }
     // Check if the queue is full
     EnterCriticalSection(&queue->mutex);
-    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
+    if((queue->tail + 1) % FRAME_QUEUE_SIZE == queue->head){
         LeaveCriticalSection(&queue->mutex);
         //fprintf(stdout, "Frame queue full\n");
         return RET_VAL_ERROR;
@@ -56,7 +57,7 @@ int push_frame(QueueFrame *queue, FrameEntry *frame_entry){
     memcpy(&queue->frame_entry[queue->tail], frame_entry, sizeof(FrameEntry)); // Copy the frame to the queue
     // Move the tail index forward    
     ++queue->tail;
-    queue->tail %= QUEUE_SIZE;
+    queue->tail %= FRAME_QUEUE_SIZE;
     // Release the mutex after modifying the queue
     LeaveCriticalSection(&queue->mutex);
     return RET_VAL_SUCCESS;
@@ -81,7 +82,7 @@ int pop_frame(QueueFrame *queue, FrameEntry *frame_entry){
     memset(&queue->frame_entry[queue->head], 0, sizeof(FrameEntry)); // Clear the frame at the head
     // Move the head index forward
     ++queue->head;
-    queue->head %= QUEUE_SIZE;
+    queue->head %= FRAME_QUEUE_SIZE;
     LeaveCriticalSection(&queue->mutex);
     return RET_VAL_SUCCESS;
 }
@@ -95,7 +96,7 @@ int push_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){
     }
     EnterCriticalSection(&queue->mutex);
     // Check if the queue is full
-    if((queue->tail + 1) % QUEUE_SIZE == queue->head){
+    if((queue->tail + 1) % SEQ_NUM_QUEUE_SIZE == queue->head){
         LeaveCriticalSection(&queue->mutex);
         fprintf(stdout, "Seq Num queue full\n");
         return RET_VAL_ERROR;
@@ -105,7 +106,7 @@ int push_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){
     memcpy(&queue->seq_num_entry[queue->tail], seq_num_entry, sizeof(SeqNumEntry));
     // Move the tail index forward    
     ++queue->tail;
-    queue->tail %= QUEUE_SIZE;
+    queue->tail %= SEQ_NUM_QUEUE_SIZE;
     // Release the mutex after modifying the queue
     LeaveCriticalSection(&queue->mutex);
     return RET_VAL_SUCCESS;
@@ -128,7 +129,7 @@ int pop_seq_num(QueueSeqNum *queue, SeqNumEntry *seq_num_entry){
     memset(&queue->seq_num_entry[queue->head], 0, sizeof(SeqNumEntry));
     // Move the head index forward
     ++queue->head;
-    queue->head %= QUEUE_SIZE;
+    queue->head %= SEQ_NUM_QUEUE_SIZE;
     LeaveCriticalSection(&queue->mutex);
     return RET_VAL_SUCCESS;
 }

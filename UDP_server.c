@@ -2,13 +2,12 @@
 
 #include "udp_lib.h"
 #include "udp_queue.h"
-#include "udp_hash.h"
 #include "udp_bitmap.h"
 
 // --- Constants ---
 #define SERVER_PORT                     12345       // Port the server listens on
 #define RECVFROM_TIMEOUT_MS             100         // Timeout for recvfrom in milliseconds in the receive thread
-#define CLIENT_SESSION_TIMEOUT_SEC      15        // Seconds after which an inactive client is considered disconnected
+#define CLIENT_SESSION_TIMEOUT_SEC      120        // Seconds after which an inactive client is considered disconnected
 #define SERVER_NAME                     "lkdc UDP Text/File Transfer Server"
 #define MAX_CLIENTS                     20
 
@@ -129,8 +128,8 @@ ClientData* find_client(ClientList *list, const uint32_t session_id);
 ClientData* add_client(ClientList *list, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
 int remove_client(ClientList *list, const uint32_t session_id);
 
-void process_file_metadata_frame(ClientData *client, UdpFrame *frame);
-void process_file_fragment_frame(ClientData *client, UdpFrame *frame);
+int process_file_metadata_frame(ClientData *client, UdpFrame *frame);
+int process_file_fragment_frame(ClientData *client, UdpFrame *frame);
 void update_statistics(ClientData *client);
 
 // Thread functions
@@ -382,11 +381,11 @@ int remove_client(ClientList *list, const uint32_t slot) {
     // Search for the client with the given session ID
     if(list == NULL){
         fprintf(stderr, "Invalid client pointer!\n");
-        return -1;
+        return RET_VAL_ERROR;
     }
     if (slot < 0 || slot >= MAX_CLIENTS) {
         fprintf(stderr, "Invalid client slot nr:  %d", slot);
-        return -1; 
+        return RET_VAL_ERROR; 
     }
     fprintf(stdout, "Removing client with session ID: %d from slot %d\n", list->client[slot].session_id, list->client[slot].slot_num);
 
@@ -395,10 +394,10 @@ int remove_client(ClientList *list, const uint32_t slot) {
 
     memset(&list->client[slot], 0, sizeof(ClientData));
     fprintf(stdout, "Removed client successfully!\n");
-    return 0;
+    return RET_VAL_SUCCESS;
 }
 // Process received file metadata frame
-void process_file_metadata_frame(ClientData *client, UdpFrame *frame){
+int process_file_metadata_frame(ClientData *client, UdpFrame *frame){
 
     client->file_id = ntohl(frame->payload.file_metadata.file_id);
     client->file_size = ntohl(frame->payload.file_metadata.file_size);
@@ -406,15 +405,13 @@ void process_file_metadata_frame(ClientData *client, UdpFrame *frame){
     client->file_bytes_received = 0;
     client->file_buffer = NULL;
     client->file_bitmap = NULL;
-    
-    fprintf(stdout, "Received metadata file ID: %d\n", client->file_id);
-    fprintf(stdout, "Received metadata file size: %d\n", client->file_size);
-    fprintf(stdout, "Received metadata fragment size: %d\n",  client->max_fragment_size);
+
+    fprintf(stdout, "Received metadata Session ID: %d, File ID: %d, File Size: %d\n", client->session_id, client->file_id, client->file_size);
 
     client->file_buffer = malloc(client->file_size);   
     if(client->file_buffer == NULL){
         fprintf(stderr, "Memory allocation fail for file buffer!!!\n");
-        return;
+        return RET_VAL_ERROR;
     }
     memset(client->file_buffer, 0, client->file_size);
 
@@ -434,14 +431,14 @@ void process_file_metadata_frame(ClientData *client, UdpFrame *frame){
     client->file_bitmap = malloc(file_bitmap_entries * sizeof(uint32_t));
     if(client->file_bitmap == NULL){
         fprintf(stderr, "Memory allocation fail for file bitmap!!!\n");
-        return;        
+        return RET_VAL_ERROR;        
     }
     memset(client->file_bitmap, 0, file_bitmap_entries * sizeof(uint32_t));
 
-    return;
+    return RET_VAL_SUCCESS;
 }
 // Process received file fragment frame
-void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
+int process_file_fragment_frame(ClientData *client, UdpFrame *frame){
 
     uint32_t fragment_file_id = ntohl(frame->payload.file_fragment.file_id);
     uint32_t fragment_size = ntohl(frame->payload.file_fragment.size);
@@ -451,20 +448,20 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
 
     if(client->file_id != fragment_file_id){
         //fprintf(stderr, "No metadata for file fragment\n");
-        return;
+        return RET_VAL_ERROR;
     }
     //copy the received fragment text to the buffer
     if(client->file_buffer == NULL){
         //fprintf(stderr, "Memory not allocated for file buffer!!!\n");
-        return;
+        return RET_VAL_ERROR;
     }
     if(check_fragment_received(client->file_bitmap, fragment_offset, client->max_fragment_size)){
 //            fprintf(stderr, "Received duplicate frame (offset: %d)!!!\n", fragment_offset);
-        return;
+        return RET_VAL_ERROR;
     }
     if(fragment_offset >= client->file_size){
         fprintf(stderr, "Received fragment with offset out of limits. File size: %d, Received offset: %d\n", client->file_size, fragment_offset);
-        return;
+        return RET_VAL_ERROR;
     }
     char *dest = client->file_buffer + fragment_offset;
     char *src = frame->payload.file_fragment.bytes;
@@ -487,7 +484,7 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
             if (folder_create_error == ERROR_ALREADY_EXISTS) {
             } else {
                 fprintf(stderr, "Error creating log folder: %lu\n", folder_create_error);
-                return; 
+                return RET_VAL_ERROR; 
             }
         }                      
         snprintf(file_name, FILE_NAME_SIZE, "out_%d.txt", client->session_id);
@@ -500,7 +497,7 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
         FILE *new_file = fopen(client->file_path_name, "wb");
         if(new_file == NULL){
             fprintf(stderr, "Error creating output file name!!!\n");
-            return;
+            return RET_VAL_ERROR;
         }
         fwrite(client->file_buffer, 1, client->file_bytes_received, new_file);
         fclose(new_file);
@@ -511,7 +508,7 @@ void process_file_fragment_frame(ClientData *client, UdpFrame *frame){
         free(client->file_bitmap);
         client->file_bitmap = NULL;
     }
-    return;
+    return RET_VAL_SUCCESS;
 }
 // update file transfer progress and speed in MBs
 void update_statistics(ClientData * client){
@@ -548,8 +545,11 @@ unsigned int WINAPI server_command_thread_func(void* ptr){
 unsigned int WINAPI receive_frame_thread_func(void* ptr) {
     
     UdpFrame received_frame;
+    FrameEntry frame_entry;
     struct sockaddr_in src_addr;
     int src_addr_len = sizeof(src_addr);
+
+    int bytes_received;
 
     // Set a receive timeout for the thread's socket.
     DWORD timeout = RECVFROM_TIMEOUT_MS;
@@ -559,7 +559,11 @@ unsigned int WINAPI receive_frame_thread_func(void* ptr) {
     }
     
     while (server.status == SERVER_READY) {
-        int bytes_received = recvfrom(server.socket, (char*)&received_frame, sizeof(UdpFrame), 0, (SOCKADDR*)&src_addr, &src_addr_len);
+
+        memset(&received_frame, 0, sizeof(UdpFrame));
+        memset(&src_addr, 0, sizeof(src_addr));
+
+        bytes_received = recvfrom(server.socket, (char*)&received_frame, sizeof(UdpFrame), 0, (SOCKADDR*)&src_addr, &src_addr_len);
         if (bytes_received == SOCKET_ERROR) {
             int error_code = WSAGetLastError();
             if (error_code != WSAETIMEDOUT) { // WSAETIMEDOUT is expected if no data for RECVFROM_TIMEOUT_MS
@@ -567,12 +571,11 @@ unsigned int WINAPI receive_frame_thread_func(void* ptr) {
             }
         } else if (bytes_received > 0) {
             // Push the received frame to the frame queue
-
-            FrameEntry frame_entry;
+           
             memset(&frame_entry, 0, sizeof(FrameEntry));
             memcpy(&frame_entry.frame, &received_frame, sizeof(UdpFrame));
             memcpy(&frame_entry.src_addr, &src_addr, sizeof(struct sockaddr_in));
-            frame_entry.bytes_received = bytes_received;
+            frame_entry.bytes_received = (uint32_t)bytes_received;
 
             if(frame_entry.frame.header.frame_type == FRAME_TYPE_KEEP_ALIVE || 
                     frame_entry.frame.header.frame_type == FRAME_TYPE_CONNECT_REQUEST ||
@@ -619,7 +622,6 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
             if(pop_frame(&queue_frame, &frame_entry) == -1){
                 Sleep(100); // No frames to process, yield CPU
                 continue;
-        
             }
         }
         frame = &frame_entry.frame;
@@ -681,34 +683,30 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
         // 3. Process Payload based on Frame Type
         switch (header_frame_type) {
             case FRAME_TYPE_CONNECT_REQUEST:
-                EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
                 send_connect_response(header_seq_num, client->session_id, server.session_timeout, server.status, server.name, server.socket, &client->addr, client->log_file_path);
                 break;
             
             case FRAME_TYPE_ACK:
-                EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
                 break;
                 //TODO: Handle ACK processing, e.g., update internal state or queues
+
             case FRAME_TYPE_KEEP_ALIVE:
-                EnterCriticalSection(&list.mutex);
                 client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
                 send_ack_nak(FRAME_TYPE_ACK, header_seq_num, header_session_id, server.socket, &client->addr, client->log_file_path);
                 break;
                 //TODO: Handle ACK processing, e.g., update internal state or queues
                        
             case FRAME_TYPE_LONG_TEXT_MESSAGE:
-
                 break;
 
             case FRAME_TYPE_FILE_METADATA:
-                EnterCriticalSection(&list.mutex);
+                if(process_file_metadata_frame(client, frame) != RET_VAL_SUCCESS){
+                    LeaveCriticalSection(&list.mutex);
+                    break;
+                }
                 client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
 
                 // Push sequence number to queue to send ACK
                 seq_num_entry.seq_num = header_seq_num;
@@ -718,16 +716,14 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
-
-                EnterCriticalSection(&list.mutex);
-                process_file_metadata_frame(client, frame);
-                LeaveCriticalSection(&list.mutex);
                 break;
 
             case FRAME_TYPE_FILE_FRAGMENT:
-                EnterCriticalSection(&list.mutex);
+                if(process_file_fragment_frame(client, frame) != RET_VAL_SUCCESS){
+                    LeaveCriticalSection(&list.mutex);
+                    break;
+                }
                 client->last_activity_time = time(NULL);
-                LeaveCriticalSection(&list.mutex);
 
                 // Push sequence number to queue to send ACK
                 seq_num_entry.seq_num = header_seq_num;
@@ -737,10 +733,6 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
                 if(push_seq_num(&queue_seq_num, &seq_num_entry) == -1){
                     fprintf(stderr, "Pushing seq_num error!!!\n");
                 };
-
-                EnterCriticalSection(&list.mutex);
-                process_file_fragment_frame(client, frame);
-                LeaveCriticalSection(&list.mutex);
                 break;
 
             case FRAME_TYPE_DISCONNECT:

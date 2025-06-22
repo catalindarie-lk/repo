@@ -19,24 +19,11 @@ typedef struct SeqNumNode{
 }SeqNumNode;
 
 
-
-//void log_ack_hash_frame(UdpFrame *frame);
-void log_ack_hash_frame(UdpFrame *frame, time_t time);
-uint16_t get_hash(uint32_t seq_num);
-void remove_frame(AckHashNode *hash_table[], uint32_t seq_num);
-void printTable(AckHashNode *hash_table[]);
-
-void insert_seq_num(SeqNumNode *hash_table[], uint32_t seq_num, uint32_t id);
-void remove_seq_num(SeqNumNode *hash_table[], uint32_t seq_num);
-SeqNumNode *search_seq_num(SeqNumNode *hash_table[], uint32_t seq_num, uint32_t message_id);
-void print_seq_num_table(SeqNumNode *hash_table[]);
-
 uint16_t get_hash(uint32_t seq_num){
     return seq_num % HASH_SIZE;
 }
 
-
-void insert_frame(AckHashNode *hash_table[], UdpFrame *frame) {
+void insert_frame(AckHashNode *hash_table[], UdpFrame *frame, uint32_t *count) {
     uint32_t seq_num = ntohl(frame->header.seq_num);
     uint16_t index = get_hash(seq_num);
 //    fprintf(stdout, "SeqNum: %d inserted at index: %d\n", seq_num, index);
@@ -47,10 +34,11 @@ void insert_frame(AckHashNode *hash_table[], UdpFrame *frame) {
 
     node->next = (AckHashNode *)hash_table[index];  // Insert at the head (linked list)
     hash_table[index] = node;
-
+    (*count)++;
+    return;
 }
 
-void remove_frame(AckHashNode *hash_table[], uint32_t seq_num) {
+void remove_frame(AckHashNode *hash_table[], uint32_t seq_num, uint32_t *count) {
     uint16_t index = get_hash(seq_num);
     AckHashNode *curr = hash_table[index];
     AckHashNode *prev = NULL;
@@ -64,6 +52,7 @@ void remove_frame(AckHashNode *hash_table[], uint32_t seq_num) {
                 hash_table[index] = curr->next;  // Removing head
             }
             free(curr);
+            (*count)--;
             return;
         }
         prev = curr;
@@ -71,7 +60,7 @@ void remove_frame(AckHashNode *hash_table[], uint32_t seq_num) {
     }
 }
 
-void clean_frame_hash_table(AckHashNode *hash_table[]){
+void clean_frame_hash_table(AckHashNode *hash_table[], uint32_t *count){
     AckHashNode *head = NULL;
     for (int i = 0; i < HASH_SIZE; i++) {
         if(hash_table[i]){       
@@ -81,6 +70,7 @@ void clean_frame_hash_table(AckHashNode *hash_table[]){
                     //fprintf(stdout, "Bucket: %d - Freeing SeqNum: %d\n", i, head->seq_num);                   
                     ptr = ptr->next;
                     free(head);
+                    (*count)--;
             }
             free(ptr);
             hash_table[i] = NULL;
@@ -91,55 +81,18 @@ void clean_frame_hash_table(AckHashNode *hash_table[]){
 }
 
 
-void printTable(AckHashNode *hash_table[]) {
-    for (int i = 0; i < HASH_SIZE; i++) {
-        if(hash_table[i]){
-            printf("BUCKET %d: \n", i);           
-            AckHashNode *ptr = hash_table[i];
-            while (ptr) {     
-                    log_ack_hash_frame(&ptr->frame, ptr->time);                    
-                    ptr = ptr->next;
-            }
-        }     
-    }
-}
-
-// void log_ack_hash_frame(UdpFrame *frame){
-   
-//     switch(frame->header.frame_type){
- 
-//         case FRAME_TYPE_LONG_TEXT_MESSAGE:
-//             fprintf(stdout, "   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
-//                                                     ntohl(frame->header.seq_num), 
-//                                                     ntohl(frame->header.session_id), 
-//                                                     ntohl(frame->header.checksum),
-//                                                     ntohl(frame->payload.long_text_msg.message_id), 
-//                                                     ntohl(frame->payload.long_text_msg.total_text_len),
-//                                                     ntohl(frame->payload.long_text_msg.fragment_len),
-//                                                     ntohl(frame->payload.long_text_msg.fragment_offset), 
-//                                                     frame->payload.long_text_msg.fragment_text);
-//             break;
-
-//         default:
-//             break;
+// void printTable(AckHashNode *hash_table[]) {
+//     for (int i = 0; i < HASH_SIZE; i++) {
+//         if(hash_table[i]){
+//             printf("BUCKET %d: \n", i);           
+//             AckHashNode *ptr = hash_table[i];
+//             while (ptr) {     
+//                     log_ack_hash_frame(&ptr->frame, ptr->time);                    
+//                     ptr = ptr->next;
+//             }
+//         }     
 //     }
-//     return;
-
 // }
-
-void log_ack_hash_frame(UdpFrame *frame, time_t time){
-   
-    switch(frame->header.frame_type){ 
-        case FRAME_TYPE_LONG_TEXT_MESSAGE:
-            fprintf(stdout, "Seq Num: %d - time: %ul\n", ntohl(frame->header.seq_num), (unsigned long)time);
-            break;
-
-        default:
-            break;
-    }
-    return;
-}
-
 
 //--------------------------------------------------------------------------------------------------------------------------
 void insert_seq_num(SeqNumNode *hash_table[], uint32_t seq_num, uint32_t id) {
