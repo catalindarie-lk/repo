@@ -22,6 +22,9 @@
 #define FILE_NAME_SIZE                  64
 //#define ENABLE_FRAME_LOG                1
 
+#define TEXT_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 4)
+#define FILE_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 3)
+
 #define RET_VAL_ERROR                   -1
 #define RET_VAL_SUCCESS                 0
 
@@ -77,16 +80,15 @@ typedef struct {
 
 typedef struct {
     uint32_t message_id;         // Unique ID for this specific long message
-    uint32_t total_text_len;          // Total length of the original message
+    uint32_t message_len;          // Total length of the original message
     uint32_t fragment_len;        // Length of actual text data in 'fragment_data'
     uint32_t fragment_offset;    // Offset of this fragment within the long message
-    char     fragment_text[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 4)]; // Adjusted size
+    char     fragment_text[TEXT_FRAGMENT_SIZE]; // Adjusted size
 } LongTextPayload;
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
     uint32_t file_size;       // Total size of the file being transferred
-    uint32_t max_fragment_size;
     uint8_t  file_hash[32];      // For MD5 hash (adjust size for SHA256 etc.)
     char     filename[256];      // Max filename length
 } FileMetadataPayload;
@@ -95,12 +97,12 @@ typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
     uint32_t offset;       // Offset of this fragment within the file
     uint32_t size;           // Length of actual data in 'fragment_data'
-    char  bytes[MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 3)]; // Adjusted size
+    char  bytes[FILE_FRAGMENT_SIZE]; // Adjusted size
 } FileFragmentPayload;
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
-    uint8_t  final_hash[16];     // Hash of the completely received file
+    uint8_t  final_hash[32];     // Hash of the completely received file
     uint8_t  success;            // 1 for success, 0 for failure
 } FileTransferStatusPayload;
 
@@ -246,20 +248,19 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     ntohl(frame->header.session_id), 
                                                     ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.long_text_msg.message_id), 
-                                                    ntohl(frame->payload.long_text_msg.total_text_len),
+                                                    ntohl(frame->payload.long_text_msg.message_len),
                                                     ntohl(frame->payload.long_text_msg.fragment_len),
                                                     ntohl(frame->payload.long_text_msg.fragment_offset), 
                                                     frame->payload.long_text_msg.fragment_text);
             break;
         case FRAME_TYPE_FILE_METADATA:
-            fprintf(file, "%s   FRAME_TYPE_FILE_METADATA\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   File ID: %d\n   File Size: %d\n   Max Fragment Size: %d\n\n", 
+            fprintf(file, "%s   FRAME_TYPE_FILE_METADATA\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   File ID: %d\n   File Size: %d\n", 
                                                     buffer,
                                                     ntohl(frame->header.seq_num), 
                                                     ntohl(frame->header.session_id), 
                                                     ntohl(frame->header.checksum),
                                                     ntohl(frame->payload.file_metadata.file_id), 
-                                                    ntohl(frame->payload.file_metadata.file_size),
-                                                    ntohl(frame->payload.file_metadata.max_fragment_size));
+                                                    ntohl(frame->payload.file_metadata.file_size));                                                    
                                                     break;
         case FRAME_TYPE_FILE_FRAGMENT:
             fprintf(file, "%s   FRAME_TYPE_FILE_FRAGMENT\n   Seq Num: %d\n   Session ID: %d\n   Checksum: %d\n   File ID: %d\n   Current Fragment Size: %d\n   Fragment Offset: %d\n   Fragment Bytes: %s\n", 

@@ -1,0 +1,17 @@
+        
+
+        GetSystemTimePreciseAsFileTime(&ft);
+        crt_uli.LowPart = ft.dwLowDateTime;
+        crt_uli.HighPart = ft.dwHighDateTime;
+        crt_microseconds = crt_uli.QuadPart / 10;
+
+        file_transfer_speed = (float)NR_OF_BYTES / (float)((crt_microseconds - prev_microseconds));
+        prev_microseconds = crt_microseconds;
+        
+        
+        static float filtered;
+        static float last_filtered;
+
+        filtered = last_filtered + 0.0001 * (raw_file_transfer_speed - last_filtered);
+        //fprintf(stdout, "\rFile Speed: %.2f MB/s", filtered);
+        last_filtered = filtered;
