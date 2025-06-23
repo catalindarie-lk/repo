@@ -423,7 +423,7 @@ int process_file_metadata_frame(ClientData *client, UdpFrame *frame){
     client->file_buffer = NULL;
     client->file_bitmap = NULL;
 
-    fprintf(stdout, "Received metadata Session ID: %d, File ID: %d, File Size: %d, Fragment Size: %d - %d\n", client->session_id, client->file_id, client->file_size, (uint32_t)FILE_FRAGMENT_SIZE, (uint32_t)FILE_FRAGMENT_SIZE);
+    fprintf(stdout, "Received metadata Session ID: %d, File ID: %d, File Size: %d, Fragment Size: %d\n", client->session_id, client->file_id, client->file_size, (uint32_t)FILE_FRAGMENT_SIZE);
 
     client->file_buffer = malloc(client->file_size);   
     if(client->file_buffer == NULL){
@@ -497,10 +497,10 @@ int process_file_fragment_frame(ClientData *client, UdpFrame *frame){
             return RET_VAL_ERROR;
         }
         fprintf(stdout, "Received file from %s:%d File ID: %d, Size: %d\n", client->ip, client->port, client->file_id, client->file_bytes_received);   
-        free(client->file_buffer);
-        client->file_buffer = NULL;
-        free(client->file_bitmap);
-        client->file_bitmap = NULL;
+        // free(client->file_buffer);
+        // client->file_buffer = NULL;
+        // free(client->file_bitmap);
+        // client->file_bitmap = NULL;
     }
     return RET_VAL_SUCCESS;
 }
@@ -550,10 +550,10 @@ int process_message_fragment_frame(ClientData *client, UdpFrame *frame){
             }
             // fprintf(stdout, "\nReceived long text msg from %s:%d - Bytes: %d Session ID: %d, Message ID: %d\n", client->ip, client->port, client->inc_message[0].bytes_received, client->session_id, recv_message_id);
             // fprintf(stdout, "Message: %s\n", client->inc_message[0].buffer);
-            free(client->inc_message[0].buffer);
-            client->inc_message[0].buffer = NULL;
-            free(client->inc_message[0].bitmap);
-            client->inc_message[0].bitmap = NULL;
+            // free(client->inc_message[0].buffer);
+            // client->inc_message[0].buffer = NULL;
+            // free(client->inc_message[0].bitmap);
+            // client->inc_message[0].bitmap = NULL;
         }
     }
 
@@ -707,7 +707,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
     uint16_t header_delimiter;
     uint8_t  header_frame_type;
-    uint32_t header_seq_num;
+    uint64_t header_seq_num;
     uint32_t header_session_id;
 
     QueueFrameEntry frame_entry;
@@ -724,12 +724,16 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
     while(server.status == SERVER_READY) {
         // Pop a frame from the queue
-        if(pop_frame(&queue_frame_ctrl, &frame_entry) == -1){
-            if(pop_frame(&queue_frame, &frame_entry) == -1){
-                Sleep(100); // No frames to process, yield CPU
-                continue;
-            }
+        // Pop a frame from the queue (prioritize control queue)
+        if (pop_frame(&queue_frame_ctrl, &frame_entry) == RET_VAL_SUCCESS) {
+            // Successfully popped from queue_frame_ctrl
+        } else if (pop_frame(&queue_frame, &frame_entry) == RET_VAL_SUCCESS) {
+            // Successfully popped from queue_frame
+        } else {
+            Sleep(1); // No frames to process, yield CPU
+            continue;
         }
+
         frame = &frame_entry.frame;
         src_addr = &frame_entry.src_addr;
         bytes_received = frame_entry.bytes_received;
@@ -737,7 +741,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
         // Extract header fields   
         header_delimiter = ntohs(frame->header.start_delimiter);
         header_frame_type = frame->header.frame_type;
-        header_seq_num = ntohl(frame->header.seq_num);
+        header_seq_num = ntohll(frame->header.seq_num);
         header_session_id = ntohl(frame->header.session_id);
 
         //fprintf(stdout, "received buffered frame seq nu: %d, nr of bytes: %d\n", header_seq_num, bytes_received);
@@ -868,7 +872,7 @@ unsigned int WINAPI ack_nak_thread_func(void* ptr){
     QueueSeqNumEntry seq_num_entry;   
     while (server.status == SERVER_READY) {
         memset(&seq_num_entry, 0, sizeof(QueueSeqNumEntry));   
-        if(pop_seq_num(&queue_seq_num, &seq_num_entry) == -1){
+        if(pop_seq_num(&queue_seq_num, &seq_num_entry) != RET_VAL_SUCCESS){
             Sleep(100);
             continue;
         }
@@ -895,7 +899,7 @@ void handle_file_metadata(ClientData *client, UdpFrame *frame, const struct sock
     client->last_activity_time = time(NULL);
     LeaveCriticalSection(&list.mutex);
     QueueSeqNumEntry ack_entry = {
-        .seq_num = ntohl(frame->header.seq_num),
+        .seq_num = ntohll(frame->header.seq_num),
         .type = FRAME_TYPE_ACK,
         .session_id = ntohl(frame->header.session_id)
     };
@@ -912,7 +916,7 @@ void handle_file_fragment(ClientData *client, UdpFrame *frame, const struct sock
     client->last_activity_time = time(NULL);
     LeaveCriticalSection(&list.mutex);
     QueueSeqNumEntry ack_entry = {
-        .seq_num = ntohl(frame->header.seq_num),
+        .seq_num = ntohll(frame->header.seq_num),
         .type = FRAME_TYPE_ACK,
         .session_id = ntohl(frame->header.session_id)
     };
@@ -929,7 +933,7 @@ void handle_message_fragment(ClientData *client, UdpFrame *frame, const struct s
     client->last_activity_time = time(NULL);
     LeaveCriticalSection(&list.mutex);
     QueueSeqNumEntry ack_entry = {
-        .seq_num = ntohl(frame->header.seq_num),
+        .seq_num = ntohll(frame->header.seq_num),
         .type = FRAME_TYPE_ACK,
         .session_id = ntohl(frame->header.session_id)
     };

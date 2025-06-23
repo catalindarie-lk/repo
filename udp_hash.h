@@ -13,18 +13,18 @@ typedef struct AckHashNode{
 }AckHashNode;
 
 typedef struct SeqNumNode{
-    uint32_t seq_num;
+    uint64_t seq_num;
     uint32_t id;
     struct SeqNumNode *next;
 }SeqNumNode;
 
 
-uint16_t get_hash(uint32_t seq_num){
-    return seq_num % HASH_SIZE;
+uint16_t get_hash(uint64_t seq_num){
+    return (uint16_t)(seq_num % HASH_SIZE);
 }
 
 void insert_frame(AckHashNode *hash_table[], UdpFrame *frame, uint32_t *count) {
-    uint32_t seq_num = ntohl(frame->header.seq_num);
+    uint64_t seq_num = ntohll(frame->header.seq_num);
     uint16_t index = get_hash(seq_num);
 //    fprintf(stdout, "SeqNum: %d inserted at index: %d\n", seq_num, index);
     AckHashNode *node = (AckHashNode *)malloc(sizeof(AckHashNode));
@@ -38,12 +38,12 @@ void insert_frame(AckHashNode *hash_table[], UdpFrame *frame, uint32_t *count) {
     return;
 }
 
-void remove_frame(AckHashNode *hash_table[], uint32_t seq_num, uint32_t *count) {
+void remove_frame(AckHashNode *hash_table[], uint64_t seq_num, uint32_t *count) {
     uint16_t index = get_hash(seq_num);
     AckHashNode *curr = hash_table[index];
     AckHashNode *prev = NULL;
     while (curr) {      
-        if (ntohl(curr->frame.header.seq_num) == seq_num) {
+        if (ntohll(curr->frame.header.seq_num) == seq_num) {
 //            fprintf(stdout, "Removing seq num: %d from index: %d\n", seq_num, index);
             // Found it
             if (prev) {
@@ -95,7 +95,7 @@ void clean_frame_hash_table(AckHashNode *hash_table[], uint32_t *count){
 // }
 
 //--------------------------------------------------------------------------------------------------------------------------
-void insert_seq_num(SeqNumNode *hash_table[], uint32_t seq_num, uint32_t id) {
+void insert_seq_num(SeqNumNode *hash_table[], uint64_t seq_num, uint32_t id) {
     uint16_t index = get_hash(seq_num);
     //fprintf(stdout, "SeqNum: %d inserted at index: %d\n", seq_num, index);
     SeqNumNode *node = (SeqNumNode *)malloc(sizeof(SeqNumNode));
@@ -107,7 +107,7 @@ void insert_seq_num(SeqNumNode *hash_table[], uint32_t seq_num, uint32_t id) {
     return;
 }
 
-void remove_seq_num(SeqNumNode *hash_table[], uint32_t seq_num) {
+void remove_seq_num(SeqNumNode *hash_table[], uint64_t seq_num) {
     uint16_t index = get_hash(seq_num); 
     SeqNumNode *curr = hash_table[index];
     SeqNumNode *prev = NULL;
@@ -128,12 +128,12 @@ void remove_seq_num(SeqNumNode *hash_table[], uint32_t seq_num) {
     return;
 }
 
-SeqNumNode *search_seq_num(SeqNumNode *hash_table[], uint32_t seq_num, uint32_t message_id) {
+SeqNumNode *search_seq_num(SeqNumNode *hash_table[], uint64_t seq_num, uint32_t id) {
     uint16_t index = get_hash(seq_num);
     SeqNumNode *ptr = hash_table[index];
     while (ptr) {
-        if (ptr->seq_num == seq_num && ptr->id == message_id){
-            fprintf(stdout, "Received double SeqNum: %d for message ID: %d\n", ptr->seq_num, ptr->id);
+        if (ptr->seq_num == seq_num && ptr->id == id){
+            fprintf(stdout, "Received double SeqNum: %zu for ID: %d\n", ptr->seq_num, ptr->id);
             return ptr;
         }           
         ptr = ptr->next;
@@ -147,7 +147,7 @@ void print_seq_num_table(SeqNumNode *hash_table[]) {
             printf("BUCKET %d: \n", i);           
             SeqNumNode *ptr = hash_table[i];
             while (ptr) {     
-                    fprintf(stdout, "Bucket: %d - SeqNum: %d\n", i, ptr->seq_num);                   
+                    fprintf(stdout, "Bucket: %d - SeqNum: %zu\n", i, ptr->seq_num);                   
                     ptr = ptr->next;
             }
         }     

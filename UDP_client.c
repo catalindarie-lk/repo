@@ -53,7 +53,7 @@ typedef struct{
     SessionStatus session_status;     // 0-DISCONNECTED; 1-CONNECTED
     time_t last_active_time;
    
-    volatile uint32_t frame_count;       // this will be sent as seq_num
+    volatile uint64_t frame_count;       // this will be sent as seq_num
     CRITICAL_SECTION frame_count_mutex;
 
     uint32_t session_id;        // session id received from the server after connection accepted
@@ -81,7 +81,6 @@ ClientData client;
 
 QueueFrame queue_frame;
 QueueFrame queue_frame_ctrl;
-//QueueSeqNum queue_seq_num;
 
 HANDLE recieve_frame_thread;
 HANDLE process_frame_thread;
@@ -103,14 +102,6 @@ AckHashNode *hash_table[HASH_SIZE] = {NULL};
 
 const char *server_ip = "10.10.10.1"; // loopback address
 const char *client_ip = "10.10.10.3";
-
-// --- Function prototypes ---
-int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, const uint32_t message_id, const char* message_buffer, const uint32_t message_len, const uint32_t fragment_offset, const uint32_t fragment_len, 
-                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_file_metadata(const uint32_t seq_num, const uint32_t session_id, const uint32_t file_id, const uint32_t file_size, const uint32_t file_fragment_size, 
-                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr);
-int send_file_fragment(const uint32_t seq_num, const uint32_t session_id, const uint32_t file_id, const uint32_t fragment_offset,
-                                        const char* chunk_buffer, const uint32_t fragment_size, const uint32_t chunk_offset, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
 unsigned int WINAPI command_thread_func(void* ptr);
 unsigned int WINAPI receive_frame_thread_func(void* ptr);
@@ -181,11 +172,12 @@ int read_file(const char *filepath, char *buffer, long size) {
     return 0;
 }
 
-uint32_t get_new_seq_num(){
+uint64_t get_new_seq_num(){
+    uint64_t new_seq_num;
     EnterCriticalSection(&client.frame_count_mutex);
-    client.frame_count++;
+    new_seq_num = ++client.frame_count;
     LeaveCriticalSection(&client.frame_count_mutex);
-    return client.frame_count;
+    return new_seq_num;
 }
 void init_winsock() {
     WSADATA wsaData;
@@ -242,7 +234,7 @@ void init_client(){
     queue_frame_ctrl.tail = 0;
     InitializeCriticalSection(&queue_frame_ctrl.mutex);
     
-    client.frame_count = 0;
+    client.frame_count = (uint64_t)UINT32_MAX;
     client.message_id_count = 0xBB;
     client.file_id_count = 0xCC;
     snprintf(client.client_name, NAME_SIZE, "%.*s", NAME_SIZE - 1, CLIENT_NAME);
@@ -336,38 +328,44 @@ void shutdown_client(){
         WaitForSingleObject(recieve_frame_thread, INFINITE);
         CloseHandle(recieve_frame_thread);
     }
+    fprintf(stdout,"receive frame thread closed...\n");
     if (process_frame_thread) {
         // Signal the receive thread to stop and wait for it to finish
         WaitForSingleObject(process_frame_thread, INFINITE);
         CloseHandle(process_frame_thread);
     }
+    fprintf(stdout,"process frame thread closed...\n");
     if (resend_thread) {
         // Signal the receive thread to stop and wait for it to finish
         WaitForSingleObject(resend_thread, INFINITE);
         CloseHandle(resend_thread);
     }
-    if (command_thread) {
-        // Signal the receive thread to stop and wait for it to finish
-        WaitForSingleObject(command_thread, INFINITE);
-        CloseHandle(command_thread);
-    }
+    fprintf(stdout,"resend frame thread closed...\n");
     if (file_transfer_thread) {
         // Signal the receive thread to stop and wait for it to finish
         WaitForSingleObject(file_transfer_thread, INFINITE);
         CloseHandle(file_transfer_thread);
     }
+    fprintf(stdout,"file transfer thread closed...\n");
     if (message_send_thread) {
         // Signal the receive thread to stop and wait for it to finish
         WaitForSingleObject(message_send_thread, INFINITE);
         CloseHandle(message_send_thread);
     }
+    fprintf(stdout,"message send thread closed...\n");
+        if (command_thread) {
+        // Signal the receive thread to stop and wait for it to finish
+        WaitForSingleObject(command_thread, INFINITE);
+        CloseHandle(command_thread);
+    }
+    
+    fprintf(stdout,"command thread closed...\n");
+
     DeleteCriticalSection(&queue_frame.mutex);
     DeleteCriticalSection(&queue_frame_ctrl.mutex);
     DeleteCriticalSection(&client.frame_count_mutex);
     CloseHandle(send_file_event);
     CloseHandle(send_message_event);
-    //    DeleteCriticalSection(&queue_seq_num.mutex);
-    // Cleanup
     closesocket(client.socket);
     cleanup_winsock();
 }
@@ -386,7 +384,7 @@ int main() {
 
         if(client.session_status == SESSION_DISCONNECTED){
             EnterCriticalSection(&client.frame_count_mutex);
-            client.frame_count = 0;       // this will be sent as seq_num
+            client.frame_count = (uint64_t)UINT32_MAX;       // this will be sent as seq_num
             LeaveCriticalSection(&client.frame_count_mutex);
             client.message_id_count = 0xBB;
             client.file_id_count = 0xCC;
@@ -397,12 +395,14 @@ int main() {
         }     
         Sleep(100); // Simulate some delay between messages        
     }
+    fprintf(stdout, "Client shutting down!!!\n");
+    fprintf(stdout, "Client status: %d, Session Status: %d\n", client.client_status, client.session_status);
     shutdown_client(&client);
     return 0;
 }
 // --- Function implementations ---
 // --- Send long text message fragment ---
-int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, const uint32_t message_id, const char* message_buffer, const uint32_t message_len, const uint32_t fragment_offset, const uint32_t fragment_len, 
+int send_long_text_fragment(const uint64_t seq_num, const uint32_t session_id, const uint32_t message_id, const char* message_buffer, const uint32_t message_len, const uint32_t fragment_offset, const uint32_t fragment_len, 
                                         const SOCKET src_socket, const struct sockaddr_in *dest_addr){
 
     UdpFrame frame;
@@ -415,7 +415,7 @@ int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, c
     // Set the header fields
     frame.header.start_delimiter = htons(FRAME_DELIMITER);
     frame.header.frame_type = FRAME_TYPE_LONG_TEXT_MESSAGE;
-    frame.header.seq_num = htonl(seq_num);
+    frame.header.seq_num = htonll(seq_num);
     frame.header.session_id = htonl(session_id);
     // Set the payload fields
     frame.payload.long_text_msg.message_id = htonl(message_id);
@@ -432,7 +432,7 @@ int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, c
     EnterCriticalSection(&hash_table_mutex);
     insert_frame(hash_table, &frame, &client.hash_count);
     LeaveCriticalSection(&hash_table_mutex);
-    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
+    int bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_text_message() failed\n");
         return SOCKET_ERROR;
@@ -440,7 +440,7 @@ int send_long_text_fragment(const uint32_t seq_num, const uint32_t session_id, c
     return bytes_sent;
 }
 // Send file metadata frame
-int send_file_metadata(const uint32_t seq_num, const uint32_t session_id, const uint32_t file_id, const uint32_t file_size, const uint32_t file_fragment_size, 
+int send_file_metadata(const uint64_t seq_num, const uint32_t session_id, const uint32_t file_id, const uint32_t file_size, const uint32_t file_fragment_size, 
                                         const SOCKET src_socket, const struct sockaddr_in *dest_addr){
 
     UdpFrame frame;
@@ -450,7 +450,7 @@ int send_file_metadata(const uint32_t seq_num, const uint32_t session_id, const 
     // Set the header fields
     frame.header.start_delimiter = htons(FRAME_DELIMITER);
     frame.header.frame_type = FRAME_TYPE_FILE_METADATA;
-    frame.header.seq_num = htonl(seq_num);
+    frame.header.seq_num = htonll(seq_num);
     frame.header.session_id = htonl(session_id);
     // Set the payload fields
     frame.payload.file_metadata.file_id = htonl(file_id);
@@ -461,21 +461,18 @@ int send_file_metadata(const uint32_t seq_num, const uint32_t session_id, const 
     EnterCriticalSection(&hash_table_mutex);
     insert_frame(hash_table, &frame, &client.hash_count);
     LeaveCriticalSection(&hash_table_mutex);
-    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
+    int bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_text_message() failed\n");
         return SOCKET_ERROR;
     }
-
-//    fprintf(stdout, "Inserted SeqNum -%d- to Table\n", seq_num);
-//    printTable(hash_table);
     #ifdef ENABLE_FRAME_LOG
         log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_path);
     #endif
     return bytes_sent;
 }
 // Send file fragment frame
-int send_file_fragment(const uint32_t seq_num, const uint32_t session_id, const uint32_t file_id, const uint32_t fragment_offset,
+int send_file_fragment(const uint64_t seq_num, const uint32_t session_id, const uint32_t file_id, const uint32_t fragment_offset,
                                         const char* chunk_buffer, const uint32_t fragment_size, const uint32_t chunk_offset, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
 
     UdpFrame frame;
@@ -488,7 +485,7 @@ int send_file_fragment(const uint32_t seq_num, const uint32_t session_id, const 
     // Set the header fields
     frame.header.start_delimiter = htons(FRAME_DELIMITER);
     frame.header.frame_type = FRAME_TYPE_FILE_FRAGMENT;
-    frame.header.seq_num = htonl(seq_num);
+    frame.header.seq_num = htonll(seq_num);
     frame.header.session_id = htonl(session_id);
     // Set the payload fields
     frame.payload.file_fragment.file_id = htonl(file_id);
@@ -504,14 +501,11 @@ int send_file_fragment(const uint32_t seq_num, const uint32_t session_id, const 
     EnterCriticalSection(&hash_table_mutex);
     insert_frame(hash_table, &frame, &client.hash_count);
     LeaveCriticalSection(&hash_table_mutex);
-    uint32_t bytes_sent = send_frame(&frame, src_socket, dest_addr);
+    int bytes_sent = send_frame(&frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
         fprintf(stderr, "send_text_message() failed\n");
         return SOCKET_ERROR;
     }
-
-//    fprintf(stdout, "Inserted SeqNum -%d- to Table\n", seq_num);
-//    printTable(hash_table);
     #ifdef ENABLE_FRAME_LOG
         log_frame(LOG_FRAME_SENT, &frame, dest_addr, client.log_path);
     #endif
@@ -556,12 +550,12 @@ unsigned int WINAPI receive_frame_thread_func(void* ptr) {
             frame_entry.bytes_received = (uint32_t)bytes_received;
 
             if(frame_entry.frame.header.frame_type == FRAME_TYPE_CONNECT_RESPONSE || frame_entry.frame.header.frame_type == FRAME_TYPE_DISCONNECT){
-                if(push_frame(&queue_frame_ctrl, &frame_entry) == -1){
+                if(push_frame(&queue_frame_ctrl, &frame_entry) != RET_VAL_SUCCESS){
                     continue;
                 }
 
             } else {
-                if(push_frame(&queue_frame, &frame_entry) == -1){
+                if(push_frame(&queue_frame, &frame_entry) != RET_VAL_SUCCESS){
                     continue;
                 }
             }
@@ -582,7 +576,7 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
     uint16_t received_delimiter;
     uint8_t  received_frame_type;
-    uint32_t received_seq_num;
+    uint64_t received_seq_num;
     uint32_t received_session_id;
 
     char src_ip[INET_ADDRSTRLEN];
@@ -593,12 +587,14 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
 
     while(client.client_status == CLIENT_READY){
 
-        if(pop_frame(&queue_frame_ctrl, &frame_entry) == -1){
-            if(pop_frame(&queue_frame, &frame_entry) == -1){
-                Sleep(100); // No frames to process, yield CPU
-                continue;       
-            }
-        }       
+        if (pop_frame(&queue_frame_ctrl, &frame_entry) == RET_VAL_SUCCESS) {
+            // Successfully popped from queue_frame_ctrl
+        } else if (pop_frame(&queue_frame, &frame_entry) == RET_VAL_SUCCESS) {
+            // Successfully popped from queue_frame
+        } else {
+            Sleep(1); // No frames to process, yield CPU
+            continue;
+        }     
 
         frame = &frame_entry.frame;
         src_addr = &frame_entry.src_addr;
@@ -607,10 +603,8 @@ unsigned int WINAPI process_frame_thread_func(void* ptr) {
         // Extract header fields   
         received_delimiter = ntohs(frame->header.start_delimiter);
         received_frame_type = frame->header.frame_type;
-        received_seq_num = ntohl(frame->header.seq_num);
+        received_seq_num = ntohll(frame->header.seq_num);
         received_session_id = ntohl(frame->header.session_id);
-
-        //fprintf(stdout, "received buffered frame seq nu: %d, nr of bytes: %d\n", received_seq_num, bytes_received);
 
         inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
         src_port = ntohs(src_addr->sin_port);
@@ -731,7 +725,6 @@ unsigned int WINAPI resend_thread_func(void *ptr){
                     if(time(NULL) - ptr->time > (time_t)RESEND_TIMEOUT){
                         ptr->time = time(NULL);
                         send_frame(&ptr->frame, client.socket, &client.server_addr);
-                        //fprintf(stdout, "resent frame: %d\n", ntohl(ptr->frame.header.seq_num));
                     }
                     ptr = ptr->next;
                 }
@@ -749,6 +742,159 @@ unsigned int WINAPI resend_thread_func(void *ptr){
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
     return 0;
 }
+// --- File transfer thread function ---
+unsigned int WINAPI file_transfer_thread_func(void *ptr){
+
+    char *file_path = "E:\\test_file.txt";
+    FILE *file = NULL;
+
+    uint8_t chunk_buffer[FILE_CHUNK_SIZE];
+    uint32_t remaining_bytes_to_send;
+    uint32_t chunk_bytes_to_send;
+    uint32_t chunk_fragment_offset;
+
+    uint32_t frame_fragment_size;
+    uint32_t frame_fragment_offset;
+
+    uint32_t file_id = ++client.file_id_count;
+
+    while(client.client_status == CLIENT_READY){
+        
+        WaitForSingleObject(send_file_event, INFINITE);
+        ResetEvent(send_file_event);
+
+        if(client.session_status != SESSION_CONNECTED){
+            fprintf(stdout, "Session with server closed!!!\n");
+            continue;           
+        }
+        file = fopen(file_path, "rb");
+        if(file == NULL){
+            fprintf(stdout, "Error opening file!!!\n");
+            continue;
+        }
+        client.file_size = get_file_size(file_path);
+        if(client.file_size > UINT32_MAX){
+            fprintf(stdout, "File too big!!!\n");
+            continue;
+        }
+
+        send_file_metadata(get_new_seq_num(), client.session_id, file_id, client.file_size, FILE_FRAGMENT_SIZE, client.socket, &client.server_addr);
+        
+        frame_fragment_offset = 0;
+        remaining_bytes_to_send = (uint32_t)client.file_size;
+
+        while(remaining_bytes_to_send > 0){
+            if(client.session_status != SESSION_CONNECTED){
+                fprintf(stdout, "Session with server closed!!!\n");
+                remaining_bytes_to_send = 0;
+                continue;
+            }
+            if(client.hash_count > HASH_HIGH_WATERMARK){
+                client.throttle = TRUE;
+            }
+            if(client.hash_count < HASH_LOW_WATERMARK){
+                client.throttle = FALSE;
+            }
+            if(client.throttle){
+                Sleep(10);
+                continue;
+            }
+            chunk_bytes_to_send = fread(chunk_buffer, 1, FILE_CHUNK_SIZE, file);
+            if (chunk_bytes_to_send == 0 && ferror(file)) {
+                fprintf(stdout, "Error reading file\n");
+                remaining_bytes_to_send = 0;
+                continue;
+            }           
+            // fprintf(stdout, "Chunk Bytes to send: %d\n", chunk_bytes_to_send);
+            // fprintf(stdout, "Fragment Offset: %d\n", frame_fragment_offset);
+            chunk_fragment_offset = 0;
+
+            while (chunk_bytes_to_send > 0){
+                if(chunk_bytes_to_send > FILE_FRAGMENT_SIZE){
+                    frame_fragment_size = FILE_FRAGMENT_SIZE;
+                } else {
+                    frame_fragment_size = chunk_bytes_to_send;
+                }
+                send_file_fragment(get_new_seq_num(), client.session_id, file_id, frame_fragment_offset, chunk_buffer, frame_fragment_size, chunk_fragment_offset, client.socket, &client.server_addr);
+                chunk_fragment_offset += frame_fragment_size;
+                frame_fragment_offset += frame_fragment_size;                       
+                chunk_bytes_to_send -= frame_fragment_size;
+                remaining_bytes_to_send -= frame_fragment_size;
+                client.file_bytes_to_send = remaining_bytes_to_send;
+                //fprintf(stdout, "\rProgress: %.2f %%", (float)(file_size - client.total_bytes_to_send) / (float)file_size * 100.0);
+            }     
+        }                  
+        fprintf(stdout, "Sent bytes: %d\n", client.file_size);
+        fclose(file);    
+
+    }
+
+    _endthreadex(0); // Properly exit the thread created by _beginthreadex
+    return 0;               
+}
+// --- Send message thread function ---
+unsigned int WINAPI message_send_thread_func(void *ptr){
+ 
+    char *file_path = "E:\\test_file.txt";
+    FILE *file = NULL;
+    uint8_t text_chunk_buffer[TEXT_CHUNK_SIZE];
+    char *message_buffer = NULL;
+
+    uint32_t message_id;
+    uint32_t remaining_bytes_to_send;
+
+    uint32_t sent_fragment_offset;
+    uint32_t sent_fragment_len;
+
+    while(client.client_status == CLIENT_READY){
+        
+        WaitForSingleObject(send_message_event, INFINITE);
+        ResetEvent(send_message_event);
+
+        client.message_len = get_text_file_size(file_path);
+        fprintf(stdout, "Total file bytes: %d\n", client.message_len);                    
+        file = fopen(file_path, "rb");
+        if(file == NULL){
+            fprintf(stdout, "Error opening file!\n");
+            continue;
+        }
+
+        message_id = ++client.message_id_count;
+        sent_fragment_offset = 0;
+
+        message_buffer = malloc(client.message_len + 1);
+        if(message_buffer == NULL){
+            fprintf(stdout, "Error allocating memeory buffer for message!\n");
+            continue;
+        }
+
+        remaining_bytes_to_send = fread(message_buffer, 1, client.message_len, file);
+        message_buffer[client.message_len] = '\0';
+        if (remaining_bytes_to_send == 0 && ferror(file)) {
+            fprintf(stdout, "Error reading message file!\n");
+            continue;
+        }
+
+        while(remaining_bytes_to_send > 0){ 
+            if(remaining_bytes_to_send > TEXT_FRAGMENT_SIZE){
+                sent_fragment_len = TEXT_FRAGMENT_SIZE;
+            } else {
+                sent_fragment_len = remaining_bytes_to_send;
+            }
+            send_long_text_fragment(get_new_seq_num(), client.session_id, message_id, message_buffer, client.message_len, sent_fragment_offset, sent_fragment_len, client.socket, &client.server_addr);
+            sent_fragment_offset += sent_fragment_len;                       
+            remaining_bytes_to_send -= sent_fragment_len;
+            client.message_bytes_to_send = remaining_bytes_to_send;
+        }
+        free(message_buffer);
+        message_buffer = NULL;
+        fclose(file);
+    }
+   _endthreadex(0); // Properly exit the thread created by _beginthreadex
+    return 0; 
+}
+
+
 // --- Process command ---
 unsigned int WINAPI command_thread_func(void* ptr) {
 
@@ -837,155 +983,4 @@ unsigned int WINAPI command_thread_func(void* ptr) {
     _endthreadex(0); // Properly exit the thread created by _beginthreadex
     
     return 0;
-}
-// --- File transfer thread function ---
-unsigned int WINAPI file_transfer_thread_func(void *ptr){
-
-    char *file_path = "E:\\test_file.txt";
-    FILE *file = NULL;
-
-    uint8_t chunk_buffer[FILE_CHUNK_SIZE];
-    uint32_t remaining_bytes_to_send;
-    uint32_t chunk_bytes_to_send;
-    uint32_t chunk_fragment_offset;
-
-    uint32_t frame_fragment_size;
-    uint32_t frame_fragment_offset;
-
-    uint32_t file_id = ++client.file_id_count;
-
-    while(client.client_status == CLIENT_READY){
-        
-        WaitForSingleObject(send_file_event, INFINITE);
-        ResetEvent(send_file_event);
-
-        if(client.session_status != SESSION_CONNECTED){
-            fprintf(stdout, "Session with server closed!!!\n");
-            continue;           
-        }
-        file = fopen(file_path, "rb");
-        if(file == NULL){
-            fprintf(stdout, "Error opening file!!!\n");
-            continue;
-        }
-        client.file_size = get_file_size(file_path);
-        if(client.file_size > UINT32_MAX){
-            fprintf(stdout, "File too big!!!\n");
-            continue;
-        }
-
-        send_file_metadata(get_new_seq_num(), client.session_id, file_id, client.file_size, FILE_FRAGMENT_SIZE, client.socket, &client.server_addr);
-        
-        frame_fragment_offset = 0;
-        remaining_bytes_to_send = (uint32_t)client.file_size;
-
-        while(remaining_bytes_to_send > 0){
-            if(client.session_status != SESSION_CONNECTED){
-                fprintf(stdout, "Session with server closed!!!\n");
-                remaining_bytes_to_send = 0;
-                continue;
-            }
-            if(client.hash_count > HASH_HIGH_WATERMARK){
-                client.throttle = TRUE;
-            }
-            if(client.hash_count < HASH_LOW_WATERMARK){
-                client.throttle = FALSE;
-            }
-            if(client.throttle){
-                Sleep(100);
-                continue;
-            }
-            chunk_bytes_to_send = fread(chunk_buffer, 1, FILE_CHUNK_SIZE, file);
-            if (chunk_bytes_to_send == 0 && ferror(file)) {
-                fprintf(stdout, "Error reading file\n");
-                remaining_bytes_to_send = 0;
-                continue;
-            }           
-            // fprintf(stdout, "Chunk Bytes to send: %d\n", chunk_bytes_to_send);
-            // fprintf(stdout, "Fragment Offset: %d\n", frame_fragment_offset);
-            chunk_fragment_offset = 0;
-
-            while (chunk_bytes_to_send > 0){
-                if(chunk_bytes_to_send > FILE_FRAGMENT_SIZE){
-                    frame_fragment_size = FILE_FRAGMENT_SIZE;
-                } else {
-                    frame_fragment_size = chunk_bytes_to_send;
-                }
-                send_file_fragment(get_new_seq_num(), client.session_id, file_id, frame_fragment_offset, chunk_buffer, frame_fragment_size, chunk_fragment_offset, client.socket, &client.server_addr);
-                chunk_fragment_offset += frame_fragment_size;
-                frame_fragment_offset += frame_fragment_size;                       
-                chunk_bytes_to_send -= frame_fragment_size;
-                remaining_bytes_to_send -= frame_fragment_size;
-                client.file_bytes_to_send = remaining_bytes_to_send;
-                //fprintf(stdout, "\rProgress: %.2f %%", (float)(file_size - client.total_bytes_to_send) / (float)file_size * 100.0);
-            }     
-        }                  
-        fprintf(stdout, "Sent bytes: %d\n", client.file_size);
-        fclose(file);    
-
-    }
-
-    _endthreadex(0); // Properly exit the thread created by _beginthreadex
-    return 0;               
-}
-
-unsigned int WINAPI message_send_thread_func(void *ptr){
- 
-    char *file_path = "E:\\test_file.txt";
-    FILE *file = NULL;
-    uint8_t text_chunk_buffer[TEXT_CHUNK_SIZE];
-    char *message_buffer = NULL;
-
-    uint32_t message_id;
-    uint32_t remaining_bytes_to_send;
-
-    uint32_t sent_fragment_offset;
-    uint32_t sent_fragment_len;
-
-    while(client.client_status == CLIENT_READY){
-        
-        WaitForSingleObject(send_message_event, INFINITE);
-        ResetEvent(send_message_event);
-
-        client.message_len = get_text_file_size(file_path);
-        fprintf(stdout, "Total file bytes: %d\n", client.message_len);                    
-        file = fopen(file_path, "rb");
-        if(file == NULL){
-            fprintf(stdout, "Error opening file!\n");
-            continue;
-        }
-
-        message_id = ++client.message_id_count;
-        sent_fragment_offset = 0;
-
-        message_buffer = malloc(client.message_len + 1);
-        if(message_buffer == NULL){
-            fprintf(stdout, "Error allocating memeory buffer for message!\n");
-            continue;
-        }
-
-        remaining_bytes_to_send = fread(message_buffer, 1, client.message_len, file);
-        message_buffer[client.message_len] = '\0';
-        if (remaining_bytes_to_send == 0 && ferror(file)) {
-            fprintf(stdout, "Error reading message file!\n");
-            continue;
-        }
-
-        while(remaining_bytes_to_send > 0){ 
-            if(remaining_bytes_to_send > TEXT_FRAGMENT_SIZE){
-                sent_fragment_len = TEXT_FRAGMENT_SIZE;
-            } else {
-                sent_fragment_len = remaining_bytes_to_send;
-            }
-            send_long_text_fragment(get_new_seq_num(), client.session_id, message_id, message_buffer, client.message_len, sent_fragment_offset, sent_fragment_len, client.socket, &client.server_addr);
-            sent_fragment_offset += sent_fragment_len;                       
-            remaining_bytes_to_send -= sent_fragment_len;
-            client.message_bytes_to_send = remaining_bytes_to_send;
-        }
-        free(message_buffer);
-        message_buffer = NULL;
-        fclose(file);
-    }
-   _endthreadex(0); // Properly exit the thread created by _beginthreadex
-    return 0; 
 }

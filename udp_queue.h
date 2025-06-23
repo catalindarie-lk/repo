@@ -3,7 +3,7 @@
 
 #include "udp_lib.h"
 
-#define SEQ_NUM_QUEUE_SIZE                      1048576     // Queue buffer size
+#define SEQ_NUM_QUEUE_SIZE                      65536     // Queue buffer size
 #define FRAME_QUEUE_SIZE                        16384
 
 #pragma pack(push, 1)
@@ -14,7 +14,7 @@ typedef struct{
 }QueueFrameEntry;
 
 typedef struct{
-    uint32_t seq_num;       // The sequence number of the frame that require ack/nak
+    uint64_t seq_num;       // The sequence number of the frame that require ack/nak
     FrameType type;         // ACK/NAK
     uint32_t session_id;    // Session ID of the frame (used to identify the connected client)
     struct sockaddr_in addr; // Address of the sender
