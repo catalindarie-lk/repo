@@ -4,18 +4,18 @@
 #include "udp_lib.h"
 
 #define SEQ_NUM_QUEUE_SIZE                      65536     // Queue buffer size
-#define FRAME_QUEUE_SIZE                        16384
+#define FRAME_QUEUE_SIZE                        32768
 
 #pragma pack(push, 1)
 typedef struct{
     UdpFrame frame; // The UDP frame to be sent
     struct sockaddr_in src_addr; // Destination address for the frame
-    uint32_t bytes_received; // Number of bytes received for this frame
+    uint32_t frame_size; // Number of bytes received for this frame
 }QueueFrameEntry;
 
 typedef struct{
     uint64_t seq_num;       // The sequence number of the frame that require ack/nak
-    FrameType type;         // ACK/NAK
+    uint8_t op_code;
     uint32_t session_id;    // Session ID of the frame (used to identify the connected client)
     struct sockaddr_in addr; // Address of the sender
 }QueueSeqNumEntry;
@@ -54,7 +54,7 @@ int push_frame(QueueFrame *queue, QueueFrameEntry *frame_entry){
     // Acquire the mutex to ensure thread-safe access to the queue
     
     // Add the sequence number to the ACK queue 
-    memcpy(&queue->frame_entry[queue->tail], frame_entry, sizeof(QueueFrameEntry)); // Copy the frame to the queue
+    RtlMoveMemory(&queue->frame_entry[queue->tail], frame_entry, sizeof(QueueFrameEntry)); // Copy the frame to the queue
     // Move the tail index forward    
     ++queue->tail;
     queue->tail %= FRAME_QUEUE_SIZE;
@@ -78,7 +78,7 @@ int pop_frame(QueueFrame *queue, QueueFrameEntry *frame_entry){
     }
     memset(frame_entry, 0, sizeof(QueueFrameEntry)); // Initialize the structure to zero
     // Acquire the mutex to ensure thread-safe access to the queue
-    memcpy(frame_entry, &queue->frame_entry[queue->head], sizeof(QueueFrameEntry)); // Copy the frame from the queue
+    RtlMoveMemory(frame_entry, &queue->frame_entry[queue->head], sizeof(QueueFrameEntry)); // Copy the frame from the queue
     memset(&queue->frame_entry[queue->head], 0, sizeof(QueueFrameEntry)); // Clear the frame at the head
     // Move the head index forward
     ++queue->head;
@@ -104,7 +104,7 @@ int push_seq_num(QueueSeqNum *queue, QueueSeqNumEntry *seq_num_entry){
     }
     // Acquire the mutex to ensure thread-safe access to the queue
     // Add the sequence number to the ACK queue 
-    memcpy(&queue->seq_num_entry[queue->tail], seq_num_entry, sizeof(QueueSeqNumEntry));
+    RtlMoveMemory(&queue->seq_num_entry[queue->tail], seq_num_entry, sizeof(QueueSeqNumEntry));
     // Move the tail index forward    
     ++queue->tail;
     queue->tail %= SEQ_NUM_QUEUE_SIZE;
@@ -116,18 +116,19 @@ int push_seq_num(QueueSeqNum *queue, QueueSeqNumEntry *seq_num_entry){
 int pop_seq_num(QueueSeqNum *queue, QueueSeqNumEntry *seq_num_entry){       
     // Check if the queue is initialized
     if (queue == NULL || &queue->mutex == NULL){
-        fprintf(stderr, "Pop - Seq Num queue not initialized\n");
+        //fprintf(stderr, "Pop - Seq Num queue not initialized\n");
         return RET_VAL_ERROR; // Return an empty RecvFrameInfo
     }
     EnterCriticalSection(&queue->mutex);
     // Check if the queue is empty before removing a ACK
     if (queue->head == queue->tail) {
         LeaveCriticalSection(&queue->mutex);
+        //fprintf(stderr, "Pop - Seq Num queue empty\n");
         return RET_VAL_ERROR;
     }
-     memset(seq_num_entry, 0, sizeof(QueueSeqNumEntry));
+    memset(seq_num_entry, 0, sizeof(QueueSeqNumEntry));
     // Acquire the mutex to ensure thread-safe access to the queue
-    memcpy(seq_num_entry, &queue->seq_num_entry[queue->head], sizeof(QueueSeqNumEntry));
+    RtlMoveMemory(seq_num_entry, &queue->seq_num_entry[queue->head], sizeof(QueueSeqNumEntry));
     memset(&queue->seq_num_entry[queue->head], 0, sizeof(QueueSeqNumEntry));
     // Move the head index forward
     ++queue->head;

@@ -18,12 +18,12 @@
 
 #define MAX_PAYLOAD_SIZE                1400        // Max size of data within a frame payload (adjust as needed)
 #define FRAME_DELIMITER                 0xAABB      // A magic number to identify valid frames
-#define NAME_SIZE                       64
-#define FILE_NAME_SIZE                  64
+#define NAME_SIZE                            255
+#define PATH_SIZE                            255
 //#define ENABLE_FRAME_LOG                1
 
 #define TEXT_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 4)
-#define FILE_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 3)
+#define FILE_FRAGMENT_SIZE              (MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 2) - sizeof(uint64_t))
 
 #define RET_VAL_ERROR                   -1
 #define RET_VAL_SUCCESS                 0
@@ -32,6 +32,24 @@ typedef uint8_t LogType;
 enum LogType{
     LOG_FRAME_RECV = 1,
     LOG_FRAME_SENT = 2
+};
+
+typedef uint8_t AckErrorCode;
+enum AckErrorCode {
+    STS_ACK = 0,
+    STS_KEEP_ALIVE = 1,
+    STS_TRANSFER_COMPLETE = 2,     // Transfer was complete, receive buffer de-allocated
+
+    ERR_INVALID_FILE_ID = 100,     // Server has completed this transfer
+    ERR_INVALID_SESSION = 101,     // Session ID not recognized
+    ERR_DUPLICATE_FRAME = 102,     // Frame was already received
+    ERR_TIMEOUT = 104,             // Session timed out due to inactivity
+    ERR_UNSUPPORTED_FRAME = 105,   // Frame type not supported
+    ERR_MALFORMED_FRAME = 106,     // Frame structure or size invalid
+    ERR_RESOURCE_LIMIT = 107,      // Server ran out of memory or slots
+    ERR_UNAUTHORIZED = 108,        // Authentication/authorization failed
+    ERR_INTERNAL_ERROR = 109,      // Catch-all for unexpected server fault
+
 };
 
 // --- Frame Types ---
@@ -43,16 +61,10 @@ enum FrameType{
     FRAME_TYPE_DISCONNECT = 3,                 // Client requests to disconnect
 
     FRAME_TYPE_ACK = 4,                         // Acknowledgment for a received frame
-    FRAME_TYPE_NACK = 5,                        // Negative Acknowledgment (request retransmission)
     FRAME_TYPE_KEEP_ALIVE = 6,
 
-    FRAME_TYPE_LONG_TEXT_MESSAGE = 10,      // Fragment of a long text message
-
     FRAME_TYPE_FILE_METADATA = 20,       // Client requests to send a file (includes filename, size, hash)
-    FRAME_TYPE_FILE_METADATA_RESPONSE = 21,      // Server grants file transfer (assigns file_id)
     FRAME_TYPE_FILE_FRAGMENT = 22,                   // File data fragment
-    FRAME_TYPE_FILE_TRANSFER_COMPLETE = 23,     // Server confirms file transfer completion and hash verification
-    FRAME_TYPE_FILE_TRANSFER_FAILED = 24       // Server informs client of failed file transfer (e.g., hash mismatch)
 };
 
 //---------------------------------------------------------------------------------------------
@@ -79,32 +91,22 @@ typedef struct {
 } ConnectResponsePayload;
 
 typedef struct {
-    uint32_t message_id;         // Unique ID for this specific long message
-    uint32_t message_len;          // Total length of the original message
-    uint32_t fragment_len;        // Length of actual text data in 'fragment_data'
-    uint32_t fragment_offset;    // Offset of this fragment within the long message
-    char     fragment_text[TEXT_FRAGMENT_SIZE]; // Adjusted size
-} LongTextPayload;
+    uint8_t op_code;
+} AckPayload;
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
-    uint32_t file_size;       // Total size of the file being transferred
+    uint64_t file_size;       // Total size of the file being transferred
     uint8_t  file_hash[32];      // For MD5 hash (adjust size for SHA256 etc.)
-    char     filename[256];      // Max filename length
+    char     filename[NAME_SIZE];      // Max filename length
 } FileMetadataPayload;
 
 typedef struct {
     uint32_t file_id;           // Unique identifier for the file transfer session
-    uint32_t offset;       // Offset of this fragment within the file
+    uint64_t offset;       // Offset of this fragment within the file
     uint32_t size;           // Length of actual data in 'fragment_data'
     char  bytes[FILE_FRAGMENT_SIZE]; // Adjusted size
 } FileFragmentPayload;
-
-typedef struct {
-    uint32_t file_id;           // Unique identifier for the file transfer session
-    uint8_t  final_hash[32];     // Hash of the completely received file
-    uint8_t  success;            // 1 for success, 0 for failure
-} FileTransferStatusPayload;
 
 // Main UDP Frame Structure
 typedef struct {
@@ -112,10 +114,9 @@ typedef struct {
     union {
         ConnectRequestPayload request;              // Client's connect request
         ConnectResponsePayload response;            // Server's response to client connect
-        LongTextPayload long_text_msg;          // Fragment of a long text message
+        AckPayload ack;
         FileMetadataPayload file_metadata;      // File metadata request/response
         FileFragmentPayload file_fragment;                  // File data fragment
-        FileTransferStatusPayload file_transfer_status;     // File transfer completion or failure status
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
     } payload;
 } UdpFrame;
@@ -282,18 +283,6 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     frame->payload.response.server_status, 
                                                     frame->payload.response.server_name);
             break;
-        case FRAME_TYPE_LONG_TEXT_MESSAGE:
-            fprintf(file, "%s   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %zu\n   Session ID: %d\n   Checksum: %d\n   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
-                                                    buffer,
-                                                    ntohll(frame->header.seq_num), 
-                                                    ntohl(frame->header.session_id), 
-                                                    ntohl(frame->header.checksum),
-                                                    ntohl(frame->payload.long_text_msg.message_id), 
-                                                    ntohl(frame->payload.long_text_msg.message_len),
-                                                    ntohl(frame->payload.long_text_msg.fragment_len),
-                                                    ntohl(frame->payload.long_text_msg.fragment_offset), 
-                                                    frame->payload.long_text_msg.fragment_text);
-            break;
         case FRAME_TYPE_FILE_METADATA:
             fprintf(file, "%s   FRAME_TYPE_FILE_METADATA\n   Seq Num: %zu\n   Session ID: %d\n   Checksum: %d\n   File ID: %d\n   File Size: %d\n", 
                                                     buffer,
@@ -337,11 +326,11 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
     buffer[0] = '\0';
     
     char* log_folder = "E:\\logs\\";
-    char file_name[FILE_NAME_SIZE] = {0};
+    char file_name[PATH_SIZE] = {0};
     if(type == 0){
-        snprintf(file_name, FILE_NAME_SIZE, "srv_%d.txt", session_id);
+        snprintf(file_name, PATH_SIZE, "srv_%d.txt", session_id);
     } else {
-        snprintf(file_name, FILE_NAME_SIZE, "cli_%d.txt", session_id);
+        snprintf(file_name, PATH_SIZE, "cli_%d.txt", session_id);
     } 
     
     if (CreateDirectory(log_folder, NULL)) {
@@ -373,33 +362,22 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
 // Send frame function
 int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
-    size_t frame_size = sizeof(FrameHeader);
+    size_t frame_size = 0;
     switch (frame->header.frame_type) {
-        case FRAME_TYPE_LONG_TEXT_MESSAGE:
-            frame_size += sizeof(LongTextPayload); // Or header + payload_len + related metadata
-            break;
         case FRAME_TYPE_FILE_METADATA:
-            frame_size += sizeof(FileMetadataPayload);
-            break;
-        case FRAME_TYPE_FILE_METADATA_RESPONSE:
-            frame_size += sizeof(FileMetadataPayload);
+            frame_size = sizeof(FrameHeader) + sizeof(FileMetadataPayload);
             break;
         case FRAME_TYPE_FILE_FRAGMENT:
-            frame_size += sizeof(FileFragmentPayload); // Or header + payload_len + related metadata
+            frame_size = sizeof(FrameHeader) + sizeof(FileFragmentPayload); // Or header + payload_len + related metadata
             break;
         case FRAME_TYPE_ACK:
-        case FRAME_TYPE_NACK:
-            frame_size = sizeof(FrameHeader); // Acknowledgment frame
-            break;
-        case FRAME_TYPE_FILE_TRANSFER_COMPLETE:
-        case FRAME_TYPE_FILE_TRANSFER_FAILED:
-            frame_size += sizeof(FileTransferStatusPayload);
+            frame_size = sizeof(FrameHeader) + sizeof(AckPayload); // Acknowledgment frame
             break;
         case FRAME_TYPE_CONNECT_REQUEST:
-            frame_size += sizeof(ConnectRequestPayload); // Assuming ConnectRequest is similar
+            frame_size = sizeof(FrameHeader) + sizeof(ConnectRequestPayload); // Assuming ConnectRequest is similar
             break;
         case FRAME_TYPE_CONNECT_RESPONSE:
-            frame_size += sizeof(ConnectResponsePayload); // Assuming ConnectResponse is similar
+            frame_size = sizeof(FrameHeader) + sizeof(ConnectResponsePayload); // Assuming ConnectResponse is similar
             break;
         case FRAME_TYPE_DISCONNECT:
             frame_size = sizeof(FrameHeader);
@@ -421,26 +399,22 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
     return bytes_sent;
 }
 // Send Ack/Nak type frame
-int send_ack_nak(const uint8_t type, const uint64_t seq_num, const uint32_t session_id, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
+int send_ack_nak(const uint64_t seq_num, const uint32_t session_id, const uint8_t op_code, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame ack_frame;
-    // Check frame type is valid
-    if((type != FRAME_TYPE_ACK) && (type != FRAME_TYPE_NACK)){
-        fprintf(stderr, "Wrong frame type\n");
-        return SOCKET_ERROR;
-    }
-    // Initialize the ACK/NACK frame
+    //initialize frame
     memset(&ack_frame, 0, sizeof(ack_frame));
     // Set the header fields
     ack_frame.header.start_delimiter = htons(FRAME_DELIMITER);
-    ack_frame.header.frame_type = type;
+    ack_frame.header.frame_type = FRAME_TYPE_ACK;
     ack_frame.header.seq_num = htonll(seq_num);
     ack_frame.header.session_id = htonl(session_id); // Use the session ID provided
+    ack_frame.payload.ack.op_code = op_code;
     // Calculate CRC32 for the ACK/NACK frame
-    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader)));
+    ack_frame.header.checksum = htonl(calculate_crc32(&ack_frame, sizeof(FrameHeader) + sizeof(AckPayload)));
     
-    uint32_t bytes_sent = send_frame(&ack_frame, src_socket, dest_addr);
+    int bytes_sent = send_frame(&ack_frame, src_socket, dest_addr);
     if(bytes_sent == SOCKET_ERROR){
-        fprintf(stderr, "send_ack_nack() failed\n");
+        fprintf(stderr, "send_ack() failed\n");
         return SOCKET_ERROR;
     }
     #ifdef ENABLE_FRAME_LOG
@@ -488,8 +462,7 @@ int send_connect_response(const uint64_t seq_num, const uint32_t session_id, con
     frame.payload.response.session_timeout = htonl(session_timeout);
     frame.payload.response.server_status = status;
 
-    strncpy(frame.payload.response.server_name, server_name, NAME_SIZE - 1);
-    frame.payload.response.server_name[NAME_SIZE - 1] = '\0';
+    snprintf(frame.payload.response.server_name, NAME_SIZE, "%.*s", NAME_SIZE - 1, server_name);
 
     // Calculate CRC32 for the ACK frame
     frame.header.checksum = htonl(calculate_crc32(&frame, sizeof(FrameHeader) + sizeof(ConnectResponsePayload)));
@@ -533,7 +506,7 @@ int send_connect_request(const uint64_t seq_num, const uint32_t session_id, cons
     #endif
     return bytes_sent; 
 };
-
+// --- Send keep alive --- (client function)
 int send_keep_alive(const uint64_t seq_num, const uint32_t session_id, 
                         const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame frame;

@@ -20,7 +20,7 @@ typedef struct SeqNumNode{
 
 
 uint16_t get_hash(uint64_t seq_num){
-    return (uint16_t)(seq_num % HASH_SIZE);
+    return (seq_num % HASH_SIZE);
 }
 
 void insert_frame(AckHashNode *hash_table[], UdpFrame *frame, uint32_t *count) {
@@ -44,15 +44,16 @@ void remove_frame(AckHashNode *hash_table[], uint64_t seq_num, uint32_t *count) 
     AckHashNode *prev = NULL;
     while (curr) {      
         if (ntohll(curr->frame.header.seq_num) == seq_num) {
-//            fprintf(stdout, "Removing seq num: %d from index: %d\n", seq_num, index);
+            //fprintf(stdout, "Removing frame with seq num: %zu from index: %d\n", seq_num, index);
             // Found it
             if (prev) {
                 prev->next = curr->next;
             } else {
-                hash_table[index] = curr->next;  // Removing head
+                hash_table[index] = curr->next;
             }
             free(curr);
             (*count)--;
+            //fprintf(stdout, "Hash count: %d\n", *count);
             return;
         }
         prev = curr;
@@ -117,7 +118,7 @@ void remove_seq_num(SeqNumNode *hash_table[], uint64_t seq_num) {
             if (prev) {
                 prev->next = curr->next;
             } else {
-                hash_table[index] = curr->next;  // Removing head
+                hash_table[index] = curr->next;
             }
             free(curr);
             return;

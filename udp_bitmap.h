@@ -4,8 +4,8 @@
 #include "UDP_lib.h"
 
 // To mark a fragment as received
-void mark_fragment_received(uint32_t bitmap[], uint32_t fragment_offset, uint32_t fragment_size) {
-    uint32_t bitmap_index = fragment_offset / fragment_size;
+void mark_fragment_received(uint32_t bitmap[], uint64_t fragment_offset, uint32_t fragment_size) {
+    uint64_t bitmap_index = fragment_offset / fragment_size;
     
     bitmap[bitmap_index / 32] |= (1 << (bitmap_index % 32));
 //    fprintf(stdout, "offset: %d, size: %d, index: %d - bitmapped: %X\n", fragment_offset, fragment_size, bitmap_index, bitmap[bitmap_index / 32]);
@@ -14,12 +14,13 @@ void mark_fragment_received(uint32_t bitmap[], uint32_t fragment_offset, uint32_
 }
 
 // To check if already received
-BOOL check_fragment_received(uint32_t bitmap[], uint32_t fragment_offset, uint32_t fragment_size) {
+BOOL check_fragment_received(uint32_t bitmap[], uint64_t fragment_offset, uint32_t fragment_size) {
   
-    uint32_t bitmap_index = fragment_offset / fragment_size;
+    uint64_t bitmap_index = fragment_offset / fragment_size;
     return (bitmap[bitmap_index / 32] & (1 << (bitmap_index % 32))) != 0;
 }
 
+// Check if bitmap is full (all fragments received)
 BOOL check_bitmap(uint32_t bitmap[], uint32_t fragment_count){
 
     uint32_t bitmap_index;
