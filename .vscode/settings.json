@@ -3,6 +3,14 @@
         "stdlib.h": "c",
         "process.h": "c",
         "long_text_message": "c",
-        "udp_lib.h": "c"
+        "udp_lib.h": "c",
+        "deque": "c",
+        "iterator": "c",
+        "queue": "c",
+        "vector": "c",
+        "initializer_list": "c",
+        "utility": "c",
+        "xstring": "c",
+        "xutility": "c"
     }
 }

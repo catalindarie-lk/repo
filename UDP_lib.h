@@ -65,6 +65,8 @@ enum FrameType{
 
     FRAME_TYPE_FILE_METADATA = 20,       // Client requests to send a file (includes filename, size, hash)
     FRAME_TYPE_FILE_FRAGMENT = 22,                   // File data fragment
+
+    FRAME_TYPE_LONG_TEXT_MESSAGE = 30      // Fragment of a long text message
 };
 
 //---------------------------------------------------------------------------------------------
@@ -108,6 +110,14 @@ typedef struct {
     char  bytes[FILE_FRAGMENT_SIZE]; // Adjusted size
 } FileFragmentPayload;
 
+typedef struct {
+    uint32_t message_id;         // Unique ID for this specific long message
+    uint32_t message_len;          // Total length of the original message
+    uint32_t fragment_len;        // Length of actual text data in 'fragment_data'
+    uint32_t fragment_offset;    // Offset of this fragment within the long message
+    char     fragment_text[TEXT_FRAGMENT_SIZE]; // Adjusted size
+} LongTextPayload;
+
 // Main UDP Frame Structure
 typedef struct {
     FrameHeader header;
@@ -117,13 +127,14 @@ typedef struct {
         AckPayload ack;
         FileMetadataPayload file_metadata;      // File metadata request/response
         FileFragmentPayload file_fragment;                  // File data fragment
+        LongTextPayload long_text_msg;          // Fragment of a long text message
         uint8_t raw_payload[MAX_PAYLOAD_SIZE]; // For generic access or padding
     } payload;
 } UdpFrame;
 #pragma pack(pop)
 
 //crc32 lookup table
-uint32_t crc32_table[256] = {
+extern uint32_t crc32_table[256] = {
     0x00000000,    0x77073096,    0xEE0E612C,    0x990951BA,    0x076DC419,    0x706AF48F,    0xE963A535,    0x9E6495A3,
     0x0EDB8832,    0x79DCB8A4,    0xE0D5E91E,    0x97D2D988,    0x09B64C2B,    0x7EB17CBD,    0xE7B82D07,    0x90BF1D91,
     0x1DB71064,    0x6AB020F2,    0xF3B97148,    0x84BE41DE,    0x1ADAD47D,    0x6DDDE4EB,    0xF4D4B551,    0x83D385C7,
@@ -157,23 +168,46 @@ uint32_t crc32_table[256] = {
     0xBDBDF21C,    0xCABAC28A,    0x53B39330,    0x24B4A3A6,    0xBAD03605,    0xCDD70693,    0x54DE5729,    0x23D967BF,
     0xB3667A2E,    0xC4614AB8,    0x5D681B02,    0x2A6F2B94,    0xB40BBE37,    0xC30C8EA1,    0x5A05DF1B,    0x2D02EF8D
 };
-//calculate crc32 with table
-uint32_t calculate_crc32_table(const void *data, size_t len) {
-    uint32_t crc = 0xFFFFFFFF;
-    uint8_t *byte_data = (uint8_t*)data;
-    for (size_t i = 0; i < len; i++) {
-        uint8_t index = (uint8_t)((crc ^ byte_data[i]) & 0xFF);
-        crc = (crc >> 8) ^ crc32_table[index];
-    }
-    return crc ^ 0xFFFFFFFF;
-}
-// Helper functions
-
-// Logging functions for debug - required here because send_ functions call log frame
-void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]);
-void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path);
 
 // ----- Function implementations -----
+// CRC32 calculation
+int calculate_crc32(const void *data, size_t len);
+// CRC32 calculation
+uint32_t calculate_crc32_table(const void *data, size_t len);
+// Checksum validation
+BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received);
+// Logging functions for debug
+void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path);
+// Create file to log frames
+void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]);
+
+// Send frame function
+int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+// Send Ack/Nak type frame
+int send_ack_nak(const uint64_t seq_num, const uint32_t session_id, const uint8_t op_code, 
+                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
+// Send Disconnect type frame
+int send_disconnect(const uint32_t session_id, const SOCKET src_socket, 
+                                        const struct sockaddr_in *dest_addr, const char *log_file_path);
+// --- Send connect response --- (server function)
+int send_connect_response(const uint64_t seq_num, const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
+                                        const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
+// --- Send connect request --- (client function)
+int send_connect_request(const uint64_t seq_num, const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
+                                        const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
+// --- Send keep alive --- (client function)
+int send_keep_alive(const uint64_t seq_num, const uint32_t session_id, 
+                                        const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path);
+
+
+
+
+
+
+
+
+
+
 // CRC32 calculation
 int calculate_crc32(const void *data, size_t len){
     uint32_t crc = 0xFFFFFFFF; // Initial value
@@ -192,6 +226,18 @@ int calculate_crc32(const void *data, size_t len){
     }
     return ~crc; // Final XOR (sometimes not used depending on CRC variant)
 }
+
+//calculate crc32 with table
+uint32_t calculate_crc32_table(const void *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFF;
+    uint8_t *byte_data = (uint8_t*)data;
+    for (size_t i = 0; i < len; i++) {
+        uint8_t index = (uint8_t)((crc ^ byte_data[i]) & 0xFF);
+        crc = (crc >> 8) ^ crc32_table[index];
+    }
+    return crc ^ 0xFFFFFFFF;
+}
+
 // Checksum validation
 BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     // Create a temporary frame to calculate checksum without its own checksum field
@@ -207,7 +253,6 @@ BOOL is_checksum_valid(const UdpFrame *frame, int bytes_received){
     return (ntohl(frame->header.checksum) == calculated_checksum); // Use ntohl for 32-bit checksum
 }
 
-// Logging functions for debug
 // Log frame to file
 void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr, const char *file_path){
 
@@ -303,7 +348,18 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
                                                     ntohl(frame->payload.file_fragment.offset),
                                                     frame->payload.file_fragment.bytes);                                                    
                                                     break;
-
+        case FRAME_TYPE_LONG_TEXT_MESSAGE:
+            fprintf(file, "%s   FRAME_TYPE_LONG_TEXT_MESSAGE\n   Seq Num: %zu\n   Session ID: %d\n   Checksum: %d\n   Message ID: %d\n   Total Length: %d\n   Fragment Length: %d\n   Fragment Offset: %d\n   Fragment Text: %s\n", 
+                                                    buffer,
+                                                    ntohll(frame->header.seq_num), 
+                                                    ntohl(frame->header.session_id), 
+                                                    ntohl(frame->header.checksum),
+                                                    ntohl(frame->payload.long_text_msg.message_id), 
+                                                    ntohl(frame->payload.long_text_msg.message_len),
+                                                    ntohl(frame->payload.long_text_msg.fragment_len),
+                                                    ntohl(frame->payload.long_text_msg.fragment_offset), 
+                                                    frame->payload.long_text_msg.fragment_text);
+                                                    break;
         case FRAME_TYPE_DISCONNECT:
             fprintf(file, "%s\n   FRAME_TYPE_DISCONNECT\n   Seq Num: %zu\n   Session ID: %d\n   Checksum: %d\n", 
                                                     buffer,
@@ -317,6 +373,7 @@ void log_frame(uint8_t log_type, UdpFrame *frame, const struct sockaddr_in *addr
     fclose(file); // Close the file  
     return;
 }
+
 // Create file to log frames
 void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[]){
 
@@ -358,7 +415,6 @@ void create_log_frame_file(uint8_t type, const uint32_t session_id, char buffer[
 
 }
 
-
 // Send frame function
 int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     // Determine the actual size to send based on frame type if payloads are variable
@@ -398,6 +454,7 @@ int send_frame(const UdpFrame *frame, const SOCKET src_socket, const struct sock
 
     return bytes_sent;
 }
+
 // Send Ack/Nak type frame
 int send_ack_nak(const uint64_t seq_num, const uint32_t session_id, const uint8_t op_code, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
     UdpFrame ack_frame;
@@ -422,6 +479,7 @@ int send_ack_nak(const uint64_t seq_num, const uint32_t session_id, const uint8_
     #endif
     return bytes_sent;
 }
+
 // Send Disconnect type frame
 int send_disconnect(const uint32_t session_id, const SOCKET src_socket, 
                         const struct sockaddr_in *dest_addr, const char *log_file_path){
@@ -446,6 +504,7 @@ int send_disconnect(const uint32_t session_id, const SOCKET src_socket,
     #endif
     return bytes_sent;
 }
+
 // --- Send connect response --- (server function)
 int send_connect_response(const uint64_t seq_num, const uint32_t session_id, const uint32_t session_timeout, const uint8_t status, 
                                 const char *server_name, SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path) {
@@ -477,6 +536,7 @@ int send_connect_response(const uint64_t seq_num, const uint32_t session_id, con
     #endif
     return bytes_sent;
 }
+
 // --- Send connect request --- (client function)
 int send_connect_request(const uint64_t seq_num, const uint32_t session_id, const uint32_t client_id, const uint32_t flag, 
                                         const char *client_name, const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
@@ -505,7 +565,8 @@ int send_connect_request(const uint64_t seq_num, const uint32_t session_id, cons
         log_frame(LOG_FRAME_SENT, &frame, dest_addr, log_file_path);
     #endif
     return bytes_sent; 
-};
+}
+
 // --- Send keep alive --- (client function)
 int send_keep_alive(const uint64_t seq_num, const uint32_t session_id, 
                         const SOCKET src_socket, const struct sockaddr_in *dest_addr, const char *log_file_path){
@@ -531,4 +592,15 @@ int send_keep_alive(const uint64_t seq_num, const uint32_t session_id,
     #endif
     return bytes_sent;
 }
+
+
+
+
+
+
+
+
+
+
+
 #endif // _UDP_LIB_H

@@ -9,6 +9,7 @@
                 "/EHsc",    // Enable exception handling (C++ standard)
                 "/favor:AMD64",
                 "${file}",
+                
                 "/Fe${workspaceFolder}\\bin\\${fileBasenameNoExtension}.exe",
                 "/Fo${workspaceFolder}\\obj\\${fileBasenameNoExtension}.obj",
                 "/Fd${workspaceFolder}\\bin\\${fileBasenameNoExtension}.pdb",
