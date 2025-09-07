@@ -21,9 +21,16 @@ HANDLE hServerMainLogicThread; // Assuming your server also has a main logic thr
 HWND g_hConnectedClientsEdit = NULL;
 
 // Arrays for Fstream controls (10 entries)
-HWND g_hFstreamProgressEdit[10] = {0};
-HWND g_hFstreamProgressBar[10] = {0};
-HWND g_hFstreamSessionIDEdit[10] = {0};
+HWND g_hFstreamProgressEdit[MAX_SERVER_ACTIVE_FSTREAMS] = {0};
+HWND g_hFstreamProgressBar[MAX_SERVER_ACTIVE_FSTREAMS] = {0};
+HWND g_hFstreamSessionIDEdit[MAX_SERVER_ACTIVE_FSTREAMS] = {0};
+
+int labelWidth = 150;        // Fstream X Progress:
+int sessionIDWidth = 80;     // For Session ID
+int percentageWidth = 80;    // For XX.YY %
+int progressBarWidth = 120;  // Width of the progress bar
+int controlHeight = 15;      // Common height for all controls
+int spacing = 3;             // Small spacing between elements
 
 // --- Function Prototypes ---
 LRESULT CALLBACK WndProc_Server(HWND, UINT, WPARAM, LPARAM);
@@ -37,12 +44,7 @@ LRESULT CALLBACK WndProc_Server(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
     switch (message) {
         case WM_CREATE: {
             HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            int labelWidth = 150;        // Fstream X Progress:
-            int sessionIDWidth = 80;     // For Session ID
-            int percentageWidth = 80;    // For XX.YY %
-            int progressBarWidth = 120;  // Width of the progress bar
-            int controlHeight = 20;      // Common height for all controls
-            int spacing = 5;             // Small spacing between elements
+
 
             int startX = 10;
             int currentY = 10;
@@ -53,7 +55,7 @@ LRESULT CALLBACK WndProc_Server(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             currentY += controlHeight + spacing * 3; // More spacing before fstream blocks
 
             // Fstream Progress Blocks (10 entries - all on one row each)
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; ++i) {
                 char labelText[64];
                 sprintf_s(labelText, sizeof(labelText), "Fstream %d Progress:", i);
 
@@ -89,7 +91,7 @@ LRESULT CALLBACK WndProc_Server(HWND hwnd, UINT message, WPARAM wParam, LPARAM l
             SetWindowTextA(g_hConnectedClientsEdit, buffer);
 
             // Update Fstream Progress and Session IDs
-            for (int i = 0; i < 10; ++i) {
+            for (int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; ++i) {
                 // Update Session ID
                 sprintf_s(buffer, _countof(buffer), "%llu", g_serverStats.fstream_session_id[i]);
                 SetWindowTextA(g_hFstreamSessionIDEdit[i], buffer);
@@ -144,6 +146,10 @@ DWORD WINAPI GuiThread_Server(LPVOID lpParam) {
         return 1;
     }
 
+
+    int windowWidth = 50 + labelWidth + sessionIDWidth + percentageWidth + progressBarWidth;
+    int windowHeight = 100 + (MAX_SERVER_ACTIVE_FSTREAMS * (controlHeight + spacing)); // Adjust height for 5 fstream entries
+
     // Adjust window size for 10 fstream entries all on one row
     hwnd = CreateWindowExA(
         WS_EX_CLIENTEDGE,
@@ -151,8 +157,8 @@ DWORD WINAPI GuiThread_Server(LPVOID lpParam) {
         "Server Statistics Dashboard",
         WS_OVERLAPPEDWINDOW | WS_MINIMIZEBOX | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        500, // Increased Width: Label (150) + SID (80) + % (80) + PB (120) + 4*spacing + padding = ~460. Set to 500 for comfort.
-        350, // Reduced Height: Connected clients (20+15) + 10 fstream blocks (10 * (20+5)) + padding = ~300. Set to 350 for comfort.
+        windowWidth, // Increased Width: Label (150) + SID (80) + % (80) + PB (120) + 4*spacing + padding = ~460. Set to 500 for comfort.
+        windowHeight, // Reduced Height: Connected clients (20+15) + 10 fstream blocks (10 * (20+5)) + padding = ~300. Set to 350 for comfort.
         NULL, NULL, hInstance, NULL);
 
     if (hwnd == NULL) {
@@ -187,7 +193,7 @@ DWORD WINAPI MainLogicThread_Server(LPVOID lpParam) {
     // Initial dummy data
     EnterCriticalSection(&g_statsLock);
     g_serverStats.connected_clients = dummy_client_count;
-    for (int i = 0; i < 10; ++i) {
+    for (int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; ++i) {
         g_serverStats.fstream_progress[i] = 0.0;
         g_serverStats.fstream_session_id[i] = 0;
     }
@@ -203,13 +209,13 @@ DWORD WINAPI MainLogicThread_Server(LPVOID lpParam) {
             }
         }
 
-        for (int i = 0; i < 10; ++i) {
+        for (int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; ++i) {
             if(pool_fstreams->fstream[i].fstream_busy){
-                g_serverStats.fstream_progress[i] = (double)((double)pool_fstreams->fstream[i].recv_bytes_count / (double)pool_fstreams->fstream[i].fsize) * 100.0;
+                g_serverStats.fstream_progress[i] = (double)((double)pool_fstreams->fstream[i].written_bytes_count / (double)pool_fstreams->fstream[i].fsize) * 100.0;
                 g_serverStats.fstream_session_id[i] = pool_fstreams->fstream[i].sid;
             } else {
-                g_serverStats.fstream_progress[i] = (double)((double)pool_fstreams->fstream[i].recv_bytes_count / (double)pool_fstreams->fstream[i].fsize) * 100.0;
-                g_serverStats.fstream_session_id[i] = pool_fstreams->fstream[i].sid;
+                g_serverStats.fstream_progress[i] = 0.0;
+                g_serverStats.fstream_session_id[i] = 0;
             }
             
         }

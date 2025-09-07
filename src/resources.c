@@ -13,7 +13,7 @@
 #include "include/mem_pool.h"
 
 
-void init_iocp_context(IOCP_CONTEXT *iocp_context, OPERATION_TYPE type) {
+void init_iocp_context(IOCP_CONTEXT *iocp_context, uint8_t type) {
     if (!iocp_context) 
         return;
     memset(iocp_context, 0, sizeof(IOCP_CONTEXT));

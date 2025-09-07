@@ -48,6 +48,12 @@ LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 DWORD WINAPI GuiThread(LPVOID lpParam);
 DWORD WINAPI MainLogicThread(LPVOID lpParam);
 
+int labelWidth = 180;
+int valueWidth = 100;
+int progressBarWidth = 150; // Smaller width for horizontal layout
+int controlHeight = 15;     // Common height for labels, edits, and progress bars
+int spacing = 3;            // Small spacing between elements
+
 
 // ------------------------------------------------------------------
 // Window Procedure for the main window
@@ -56,11 +62,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
     switch (message) {
         case WM_CREATE: {
             HFONT hFont = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-            int labelWidth = 180;
-            int valueWidth = 100;
-            int progressBarWidth = 150; // Smaller width for horizontal layout
-            int controlHeight = 20;     // Common height for labels, edits, and progress bars
-            int spacing = 5;            // Small spacing between elements
+            // int labelWidth = 180;
+            // int valueWidth = 100;
+            // int progressBarWidth = 150; // Smaller width for horizontal layout
+            // int controlHeight = 15;     // Common height for labels, edits, and progress bars
+            // int spacing = 3;            // Small spacing between elements
 
             int startX = 10;
             int currentY = 10;
@@ -257,6 +263,10 @@ DWORD WINAPI GuiThread(LPVOID lpParam) {
         return 1;
     }
 
+
+    int windowWidth = 50 + labelWidth + valueWidth + progressBarWidth;
+    int windowHeight = 100 + (CLIENT_MAX_ACTIVE_FSTREAMS * (controlHeight + spacing)); // Adjust height for 5 fstream entries
+
     // Window dimensions (same as before for the compact horizontal layout)
     hwnd = CreateWindowExA(
         WS_EX_CLIENTEDGE,
@@ -264,8 +274,8 @@ DWORD WINAPI GuiThread(LPVOID lpParam) {
         "Client Statistics Dashboard",
         WS_OVERLAPPEDWINDOW | WS_MINIMIZEBOX | WS_SYSMENU,
         CW_USEDEFAULT, CW_USEDEFAULT,
-        500, // Width
-        550, // Height
+        windowWidth, // Width
+        windowHeight, // Height
         NULL, NULL, hInstance, NULL);
 
     if (hwnd == NULL) {

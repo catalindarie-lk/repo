@@ -36,7 +36,7 @@ typedef struct{
     CRITICAL_SECTION mutex;
     size_t size;
     size_t count;
-    MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated                                        // from this pre-allocated mem pool;
+    MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated from this pre-allocated mem pool;
 }TableIDs;
 
 void init_table_id(TableIDs *table, size_t size, const size_t max_nodes);
@@ -75,5 +75,31 @@ int insert_table_send_frame(TableSendFrame *table, const uintptr_t entry);
 uintptr_t remove_table_send_frame(TableSendFrame *table, const uint64_t seq_num);
 uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num);
 
- 
+//--------------------------------------------------------------------------------------------------------------------------
+typedef struct NodeTableFileChunk{
+    OVERLAPPED overlapped;
+    uint64_t key;
+    uint8_t buffer[FILE_FRAGMENT_SIZE];
+    size_t buffer_size;
+    uint8_t type;
+    uintptr_t fstream_ptr;
+    struct NodeTableFileChunk *next;
+}NodeTableFileChunk;
+
+typedef struct{
+    NodeTableFileChunk **entry;
+    CRITICAL_SECTION mutex;
+    size_t size;
+    size_t count;
+    MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated from this pre-allocated mem pool;
+}TableFileChunk;
+
+void init_table_fchunk(TableFileChunk *table, size_t size, const size_t max_nodes);
+uint64_t ht_get_hash_fchunk(const uint64_t key, const size_t size);
+NodeTableFileChunk *ht_insert_fchunk(TableFileChunk *table, const uint64_t key, uint8_t type, uint8_t *buffer, const size_t buffer_size);
+NodeTableFileChunk *ht_insert_fchunk_rd(TableFileChunk *table, const uint64_t key, const uint8_t type);
+void ht_remove_fchunk(TableFileChunk *table, const uint64_t key);
+BOOL ht_search_fchunk(TableFileChunk *table, const uint64_t key);
+void ht_clean_fchunk(TableFileChunk *table);
+
 #endif // FRAMES_HASH_H

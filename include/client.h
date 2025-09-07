@@ -30,6 +30,8 @@
 #define CLIENT_1_ROOT_FOLDER                        "H:\\_test\\client1_root\\"
 #define CLIENT_2_ROOT_FOLDER                        "H:\\_test\\client2_root\\"
 #define CLIENT_3_ROOT_FOLDER                        "H:\\_test\\client3_root\\"
+#define CLIENT_4_ROOT_FOLDER                        "H:\\_test\\client4_root\\"
+#define CLIENT_5_ROOT_FOLDER                        "H:\\_test\\client5_root\\"
 
 #define CLIENT_ERROR_LOG_FILE                       "H:\\_test\\client_error_log.txt" // Path to the client log file
 #define CLIENT_DEBUG_LOG_FILE                       "H:\\_test\\client_debug_log.txt" // Path to the client debug log file
@@ -51,7 +53,7 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Client Stream Configuration ---
-#define CLIENT_MAX_ACTIVE_FSTREAMS                  3                     // Maximum number of concurrent file streams (transfers)
+#define CLIENT_MAX_ACTIVE_FSTREAMS                  5                     // Maximum number of concurrent file streams (transfers)
 #define CLIENT_MAX_ACTIVE_MSTREAMS                  1                     // Maximum number of concurrent message streams (e.g., long text messages)
 
 // --- Client Worker Thread Configuration ---

@@ -700,6 +700,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                         recv_op_code == ERR_DUPLICATE_FRAME || 
                         recv_op_code == ERR_EXISTING_FILE ||
                         recv_op_code == ERR_EXISTING_MESSAGE //||
+                        // recv_op_code == ERR_MISSING_METADATA ||
                         /*recv_op_code == ERR_STREAM_INIT*/){
                     
                     uintptr_t entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
@@ -1144,27 +1145,26 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
 
         sha256_final(&sha256_ctx, (uint8_t *)&fstream->calculated_sha256);
 
-        entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
-        if(!entry_send){
-            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: s_pool_alloc() returned null pointer when allocating for end frame. Should never happen since queue is blocking on push/pop semaphores.");
-            log_to_file(log_message);
-            goto clean;
-        }
-        construct_file_end(entry_send,
-                            get_new_seq_num(), 
-                            client->sid, 
-                            fstream->fid, 
-                            fstream->fsize, 
-                            (uint8_t *)&fstream->calculated_sha256,
-                            client->socket, &client->server_addr);
-        if(s_push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
-            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file end frame to 'queue_send_prio_udp_frame'. Should never happen since queue is blocking on push/pop semaphores.");
-            log_to_file(log_message);
-            s_pool_free(pool_send_udp_frame, (void*)entry_send);
-            goto clean;
-        }
-        // snprintf(log_message, sizeof(log_message), "DEBUG: Finished sending file: '%s'", _FileName);
-        // log_to_file(log_message);
+        // entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
+        // if(!entry_send){
+        //     snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: s_pool_alloc() returned null pointer when allocating for end frame. Should never happen since queue is blocking on push/pop semaphores.");
+        //     log_to_file(log_message);
+        //     goto clean;
+        // }
+        // construct_file_end(entry_send,
+        //                     get_new_seq_num(), 
+        //                     client->sid, 
+        //                     fstream->fid, 
+        //                     fstream->fsize, 
+        //                     (uint8_t *)&fstream->calculated_sha256,
+        //                     client->socket, &client->server_addr);
+        // if(s_push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
+        //     snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file end frame to 'queue_send_prio_udp_frame'. Should never happen since queue is blocking on push/pop semaphores.");
+        //     log_to_file(log_message);
+        //     s_pool_free(pool_send_udp_frame, (void*)entry_send);
+        //     goto clean;
+        // }
+
     clean:
         s_pool_free(pool_send_command, (void*)entry);
         close_file_stream(fstream);
@@ -1318,6 +1318,10 @@ static DWORD WINAPI fthread_client_command(LPVOID lpParam) {
             snprintf(client_root_folder, MAX_PATH, "%s", CLIENT_2_ROOT_FOLDER);
         } else if(nr == '3'){
             snprintf(client_root_folder, MAX_PATH, "%s", CLIENT_3_ROOT_FOLDER);
+        } else if(nr == '4'){
+            snprintf(client_root_folder, MAX_PATH, "%s", CLIENT_4_ROOT_FOLDER);
+        } else if(nr == '5'){
+            snprintf(client_root_folder, MAX_PATH, "%s", CLIENT_5_ROOT_FOLDER);
         } else {
             fprintf(stdout, "Defaulted to 'client_folder'\n");
             snprintf(client_root_folder, MAX_PATH, "%s", CLIENT_ROOT_FOLDER);

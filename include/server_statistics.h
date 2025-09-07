@@ -8,12 +8,13 @@
 #include <stdio.h>       // For sprintf_s
 #include <stdint.h>      // For uint64_t
 #include <commctrl.h>    // For progress bar control (PROGRESS_CLASSA, PBM_ messages)
+#include "include/server.h"
 
 // --- ServerStatistics Struct ---
 typedef struct {
     uint64_t connected_clients;
-    double fstream_progress[10];
-    uint64_t fstream_session_id[10];
+    double fstream_progress[MAX_SERVER_ACTIVE_FSTREAMS];
+    uint64_t fstream_session_id[MAX_SERVER_ACTIVE_FSTREAMS];
 } ServerStatistics;
 
 // --- Custom Message ID for Server GUI ---
@@ -47,9 +48,9 @@ extern HANDLE hServerMainLogicThread; // Assuming your server also has a main lo
 extern HWND g_hConnectedClientsEdit;
 
 // Arrays for Fstream controls (10 entries)
-extern HWND g_hFstreamProgressEdit[10];
-extern HWND g_hFstreamProgressBar[10];
-extern HWND g_hFstreamSessionIDEdit[10];
+extern HWND g_hFstreamProgressEdit[MAX_SERVER_ACTIVE_FSTREAMS];
+extern HWND g_hFstreamProgressBar[MAX_SERVER_ACTIVE_FSTREAMS];
+extern HWND g_hFstreamSessionIDEdit[MAX_SERVER_ACTIVE_FSTREAMS];
 
 // Function to initialize the server statistics GUI
 int init_server_statistics_gui();

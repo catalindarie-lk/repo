@@ -32,24 +32,21 @@
 #define SERVER_MESSAGE_TEXT_FILES_FOLDER            "H:\\_test\\messages_root\\"
 #define SERVER_SID_FOLDER_NAME_FOR_CLIENT           "SID_"
 
-#define FRAGMENTS_PER_CHUNK                         (64ULL)
 #define CHUNK_TRAILING                              (1u << 7) // 0b10000000
 #define CHUNK_BODY                                  (1u << 6) // 0b01000000
 #define CHUNK_HASHED                                (1u << 5) // 0b00100000
 #define CHUNK_WRITTEN                               (1u << 0) // 0b00000001
 #define CHUNK_NONE                                  (0)       // 0b00000000
 
-#define BLOCK_SIZE_CHUNK                            (FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK)
-#define BLOCK_COUNT_CHUNK                           (SERVER_POOL_SIZE_IOCP_RECV / FRAGMENTS_PER_CHUNK)
-
 //---------------------------------------------------------------------------------------------------------
 // --- Server Stream Configuration ---
-#define MAX_SERVER_ACTIVE_FSTREAMS                  10
+#define MAX_SERVER_ACTIVE_FSTREAMS                  20
 #define MAX_SERVER_ACTIVE_MSTREAMS                  10
 
 // --- Server Worker Thread Configuration ---
 #define SERVER_MAX_THREADS_RECV_SEND_FRAME          1
-#define SERVER_MAX_THREADS_PROCESS_FRAME            4
+#define SERVER_MAX_THREADS_PROCESS_FRAME            10
+#define SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT      10
 
 #define SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES    1
 #define SERVER_MAX_THREADS_SEND_MESSAGE_ACK_FRAMES  1
@@ -88,6 +85,7 @@
     ServerBuffers *buffers = &(buffers_obj); \
     ServerThreads *threads = &(threads_obj); \
     MemPool *pool_file_chunk = &((buffers_obj).pool_file_chunk); \
+    MemPool *pool_iocp_file_chunk = &((buffers_obj).pool_iocp_file_chunk); \
     MemPool *pool_iocp_send_context = &((buffers_obj).pool_iocp_send_context); \
     MemPool *pool_iocp_recv_context = &((buffers_obj).pool_iocp_recv_context); \
     MemPool *pool_recv_udp_frame = &((buffers_obj).pool_recv_udp_frame); \
@@ -96,6 +94,7 @@
     QueuePtr *queue_process_fstream = &((buffers_obj).queue_process_fstream); \
     TableIDs *table_file_id = &((buffers_obj).table_file_id); \
     TableIDs *table_message_id = &((buffers_obj).table_message_id); \
+    TableFileChunk *table_file_chunk = &((buffers_obj).table_file_chunk); \
     MemPool *pool_send_udp_frame = &((buffers_obj).pool_send_udp_frame); \
     QueuePtr *queue_send_udp_frame = &((buffers_obj).queue_send_udp_frame); \
     QueuePtr *queue_send_prio_udp_frame = &((buffers_obj).queue_send_prio_udp_frame); \
@@ -195,13 +194,6 @@ typedef struct{
 
     uint64_t *bitmap;                   // Pointer to an array of uint64_t, where each bit represents a file fragment.
                                         // A bit set to 1 means the fragment has been received.
-    uint8_t* flag;                      // Pointer to an array of uint8_t, used for custom flags per chunk/bitmap entry.
-    char** pool_block_file_chunk;       // Pointer to an array of char pointers, where each char* points to a
-                                        // memory block holding a complete chunk of data (64 fragments).
-    BOOL trailing_chunk;                // True if the last bitmap entry represents a partial chunk (less than 64 fragments).
-    BOOL trailing_chunk_complete;       // True if all bytes for the last, potentially partial, chunk have been received.
-    uint64_t trailing_chunk_size;       // The actual size of the last chunk (if partial).
-
     uint64_t file_end_frame_seq_num;
     uint64_t fragment_count;            // Total number of fragments in the entire file.
     uint64_t recv_bytes_count;          // Total bytes received for this file so far.
@@ -226,8 +218,8 @@ typedef struct{
     char fname[MAX_PATH];               // Array to store the file name+path.
     uint32_t fname_len;
 
-    char full_path[MAX_PATH];
-    FILE *fp;                           // File pointer for the file being written to disk.
+    char iocp_full_path[MAX_PATH];
+    HANDLE iocp_file_handle;
 
     SRWLOCK lock;              // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.
 
@@ -308,7 +300,11 @@ typedef struct {
     char name[MAX_NAME_SIZE];               // Human-readable server name
     
     IOCP_CONTEXT iocp_context;
-    HANDLE iocp_handle;
+    HANDLE iocp_socket_handle;
+
+    HANDLE iocp_file_handle;
+    uint64_t fragment_key;
+    SRWLOCK lock_fragment_key;
 
     ServerFstreamPool pool_fstreams;
     ServerMstreamPool pool_mstreams;
@@ -318,6 +314,7 @@ typedef struct {
 
 typedef struct {
     MemPool pool_file_chunk;
+    MemPool pool_iocp_file_chunk;
     MemPool pool_iocp_send_context;
     MemPool pool_iocp_recv_context;
 
@@ -336,11 +333,15 @@ typedef struct {
 
     TableIDs table_file_id;
     TableIDs table_message_id;
+
+    TableFileChunk table_file_chunk;
+
 }ServerBuffers;
 
 typedef struct {
 
     HANDLE recv_send_frame[SERVER_MAX_THREADS_RECV_SEND_FRAME];
+    HANDLE file_chunk_written[MAX_SERVER_ACTIVE_FSTREAMS];
     HANDLE process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
 
     HANDLE send_sack_frame[SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES];
@@ -364,6 +365,7 @@ extern ServerThreads Threads;
 
 // Thread functions
 static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam);
+static DWORD WINAPI func_thread_file_chunk_written(LPVOID lpParam);
 static DWORD WINAPI func_thread_process_frame(LPVOID lpParam);
 
 static DWORD WINAPI fthread_send_sack_frame(LPVOID lpParam);
@@ -389,7 +391,7 @@ static void cleanup_client(Client *client);
 static BOOL validate_file_hash(ServerFileStream *fstream);
 static void check_open_file_stream();
 
-
+ 
 
 
 

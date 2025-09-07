@@ -77,23 +77,18 @@ ServerFileStream* find_fstream(ServerFstreamPool* pool, const uint32_t sid, cons
         return NULL;
     }
 
-    if(sid == 0 || fid == 0){
-        fprintf(stderr, "ERROR: Invalid sid or fid values to find_fstream() in pool");
-        return NULL;
-    }
-
     ServerFileStream *fstream = NULL;
     for(uint64_t index = 0; index < pool->block_count; index++){
         if(!pool->used[index]) {
             continue;
         }
         fstream = &pool->fstream[index];
-        // AcquireSRWLockShared(&fstream->lock);
+        AcquireSRWLockShared(&fstream->lock);
         if(fstream->fstream_busy && fstream->sid == sid && fstream->fid == fid){
-            // ReleaseSRWLockShared(&fstream->lock);
+            ReleaseSRWLockShared(&fstream->lock);
             return fstream;
         }
-        // ReleaseSRWLockShared(&fstream->lock);
+        ReleaseSRWLockShared(&fstream->lock);
     }
     return NULL;
 }
@@ -203,20 +198,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     fstream->bitmap_entries_count = (fstream->fragment_count + FRAGMENTS_PER_CHUNK - 1ULL) / FRAGMENTS_PER_CHUNK;
     //fprintf(stdout, "Bitmap 64bits entries needed: %llu\n", fstream->bitmap_entries_count);
  
-    //the file size needs to be a multiple of FILE_FRAGMENT_SIZE and nr of fragments needs to be a multiple of 64 due to bitmap entries being 64 bits
-    //otherwise the trailing bitmap entry will not be full of fragments (the mask will not be ~0ULL) and this needs to be treated separately 
-
-    // Determine if there's a trailing chunk
-    // A trailing chunk exists if:
-    // 1. The total file size is not a perfect multiple of FILE_FRAGMENT_SIZE
-    // OR
-    // 2. The total number of fragments is not a perfect multiple of FRAGMENTS_PER_CHUNK (64)
-    fstream->trailing_chunk = ((fstream->fsize % FILE_FRAGMENT_SIZE) != 0) || (((fstream->fsize / FILE_FRAGMENT_SIZE) % 64ULL) != 0);
-
-    // Initialize trailing chunk status
-    fstream->trailing_chunk_complete = FALSE;
-    fstream->trailing_chunk_size = 0;
-
     // Allocate memory for bitmap
     fstream->bitmap = calloc(fstream->bitmap_entries_count, sizeof(uint64_t));
     if(fstream->bitmap == NULL){
@@ -224,23 +205,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file bitmap mem!!!\n");
         goto exit_err;
     }
-
-    // Allocate memory for flags
-    fstream->flag = calloc(fstream->bitmap_entries_count, sizeof(uint8_t));
-    if(fstream->flag == NULL){
-        fstream->fstream_err = STREAM_ERR_FLAG_MALLOC;
-        fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file entry flag!!!\n");
-        goto exit_err;
-    }
-
-    // Allocate memory for chunk memory block pointers
-    fstream->pool_block_file_chunk = calloc(fstream->bitmap_entries_count, sizeof(char*));
-    if(fstream->pool_block_file_chunk == NULL){
-        fstream->fstream_err = STREAM_ERR_CHUNK_PTR_MALLOC;
-        fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for chunk mem blocks!!!\n");
-        goto exit_err;
-    }
-
 
     if(!DriveExists(SERVER_PARTITION_DRIVE)){
         fprintf(stderr, "ERROR: init_fstream - Drive Partition \"%s\" doesn't exit\n", SERVER_PARTITION_DRIVE);
@@ -257,34 +221,37 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         goto exit_err;
     }
 
-    // fprintf(stdout,"RECEIVED RPATH: %s", fstream->rpath);
-
     if (CreateRelativeFolderRecursive(rootFolder, fstream->rpath) == FALSE) {
         fprintf(stderr, "ERROR: init_fstream - Failed to create recursive path for root folder: \"%s\", relative path \"%s\". Error code: %lu\n", rootFolder, fstream->rpath, GetLastError());
         goto exit_err;
     }
 
-    snprintf(fstream->full_path, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);  
+    snprintf(fstream->iocp_full_path, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);
 
-    if(FileExists(fstream->full_path)){
-        fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->full_path);
+    if(FileExists(fstream->iocp_full_path)){
+        fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->iocp_full_path);
         fstream->fstream_err = STREAM_ERR_FILENAME_EXIST;
         goto exit_err;
     }
-    fstream->fp = fopen(fstream->full_path, "wb+"); // "wb+" allows writing and reading, creates or truncates
 
-    // char fpath[MAX_PATH] = {0};
-    // fstream->fp = FopenRename(fstream->fpath, fpath, MAX_PATH, "wb+");
-    // if(fstream->fp == NULL){
-    //     fprintf(stderr, "Error creating/opening file for write: %s (errno: %d)\n", fstream->fname, errno);
-    //     fstream->fstream_err = STREAM_ERR_FP;
-    //     goto exit_err;
-    // }
-    // fprintf(stdout, "Received file: %s\n", fpath);
-
-    if(push_ptr(queue_process_fstream, (uintptr_t)fstream) == RET_VAL_ERROR){
-        fprintf(stderr, "ERROR: init_fstream - Failed to push file stream to processing queue\n");
-        fstream->fstream_err = STREAM_ERR_QUEUE_PUSH;
+    fstream->iocp_file_handle = CreateFile(
+        fstream->iocp_full_path,            // File path
+        GENERIC_READ | GENERIC_WRITE,       // Access: read + write
+        0,                                  // No sharing
+        NULL,                               // Default security
+        CREATE_ALWAYS,                      // Create or overwrite
+        FILE_FLAG_OVERLAPPED,               // Enable async I/O
+        NULL                                // No template
+    );
+    
+    if (!CreateIoCompletionPort(fstream->iocp_file_handle, server->iocp_file_handle, (uintptr_t)fstream, 0)) {
+        printf("Failed to associate file with IOCP: %lu\n", GetLastError());
+        CloseHandle(fstream->iocp_file_handle);
+        goto exit_err;
+    }
+    if (fstream->iocp_file_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: init_fstream - Failed to open file \"%s\". Error code: %lu\n", fstream->iocp_full_path, GetLastError());
+        fstream->fstream_err = STREAM_ERR_FWRITE;
         goto exit_err;
     }
 
@@ -314,15 +281,16 @@ void free_fstream(ServerFstreamPool* pool, ServerFileStream* fstream) {
         fprintf(stderr, "ERROR: Attempt to free a NULL block in fstream pool!\n");
         return;
     }
+    AcquireSRWLockExclusive(&pool->lock);
     // Calculate the index of the block to be freed
     uint64_t index = (uint64_t)(((char*)fstream - (char*)pool->fstream) / sizeof(ServerFileStream));
     // uint64_t index = (uint64_t)(fstream - pool->fstream);
     // Validate the index and usage flag for safety and debugging
     if (index >= pool->block_count || pool->used[index] == FREE_BLOCK) {       
         fprintf(stderr, "CRITICAL ERROR: Attempt to free invalid fstream from pool!\n");
+        ReleaseSRWLockExclusive(&pool->lock);
         return;
     }
-    AcquireSRWLockExclusive(&pool->lock);
     // Add the freed block back to the head of the free list
     pool->next[index] = pool->free_head;
     pool->free_head = index;
@@ -335,49 +303,16 @@ void free_fstream(ServerFstreamPool* pool, ServerFileStream* fstream) {
 void close_fstream(ServerFileStream *fstream) {
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
+    
     if(!fstream){
         fprintf(stderr, "ERROR: Trying to clean a NULL pointer file stream\n");
         return;
     }
-    if(fstream->fp && fstream->fstream_busy && !fstream->file_complete){
-        fclose(fstream->fp);
-        remove(fstream->full_path);
-        fstream->fp = NULL;
-    }
-    if(fstream->fp){
-        if(fflush(fstream->fp) != 0){
-            fprintf(stderr, "Error flushing the file to disk. File is still in use.\n");
-        } else {
-            int fclosed = fclose(fstream->fp);
-            Sleep(1);
-            if(fclosed != 0){
-                fprintf(stderr, "Error closing the file stream: %s (errno: %d)\n", fstream->full_path, errno);
-            }
-            fstream->fp = NULL; // Set the file pointer to NULL after closing.
-        }
-    }
-    if(fstream->bitmap){
-        free(fstream->bitmap);
-        fstream->bitmap = NULL;
-    }
-    if(fstream->flag){
-        free(fstream->flag);
-        fstream->flag = NULL;
-    }    
-    for(long long index = 0; index < fstream->bitmap_entries_count; index++){
-        if(fstream->pool_block_file_chunk[index]){
-            pool_free(pool_file_chunk, fstream->pool_block_file_chunk[index]);
-        }
-        fstream->pool_block_file_chunk[index] = NULL;
-    }
-
+    CloseHandle(fstream->iocp_file_handle);
+    fstream->iocp_file_handle = NULL;
     fstream->sid = 0;                                   // Session ID associated with this file stream.
     fstream->fid = 0;                                   // File ID, unique identifier for the file associated with this file stream.
     fstream->fsize = 0;                                 // Total size of the file being transferred.
-    fstream->trailing_chunk = FALSE;                // True if the last bitmap entry represents a partial chunk (less than 64 fragments).
-    fstream->trailing_chunk_complete = FALSE;       // True if all bytes for the last, potentially partial, chunk have been received.
-    fstream->trailing_chunk_size = 0;               // The actual size of the last chunk (if partial).
     fstream->file_end_frame_seq_num = 0;
     fstream->fragment_count = 0;                    // Total number of fragments in the entire file.
     fstream->recv_bytes_count = 0;                  // Total bytes received for this file so far.
@@ -399,13 +334,14 @@ void close_fstream(ServerFileStream *fstream) {
     memset(&fstream->rpath, 0, MAX_PATH);
     fstream->fname_len = 0;
     memset(&fstream->fname, 0, MAX_PATH);
-    memset(&fstream->full_path, 0, MAX_PATH);
+    memset(&fstream->iocp_full_path, 0, MAX_PATH);
     memset(&fstream->client_addr, 0, sizeof(struct sockaddr_in));
     fstream->file_end_frame_seq_num = 0;
     fstream->fstream_busy = FALSE;                  // Indicates if this stream channel is currently in use for a transfer.    
     free_fstream(pool_fstreams, fstream);
     return;
 }
+// Deallocate all memory associated with the fstream pool
 void destroy_fstream_pool(ServerFstreamPool* pool) {
     // Check for NULL pool pointer
     if (!pool) {
@@ -430,100 +366,6 @@ void destroy_fstream_pool(ServerFstreamPool* pool) {
     }
     pool->free_blocks = 0;
 }
-static uint8_t attach_fragment_to_chunk(ServerFileStream *fstream, char *fragment_buffer, const uint64_t fragment_offset, const uint32_t fragment_size) {
-
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-    if(!fstream || !fragment_buffer || fragment_size == 0){
-        fprintf(stderr, "ERROR: Invalid parameters in file_attach_fragment_to_chunk()\n");
-        return RET_VAL_ERROR; // Error code for invalid parameters
-    }
-    
-    AcquireSRWLockExclusive(&fstream->lock);
-
-    if(fragment_size == 0){
-        ReleaseSRWLockExclusive(&fstream->lock);
-        fprintf(stderr, "ERROR: Fragment size is zero in file_attach_fragment_to_chunk()\n");
-        return ERR_MALFORMED_FRAME;
-
-    }
-
-    if(fragment_offset >= fstream->fsize){
-        ReleaseSRWLockExclusive(&fstream->lock);
-        fprintf(stderr, "Fragment offset past limits - offset: %llu, fragment size: %u, file size: %llu\n",
-                                        fragment_offset, fragment_size, fstream->fsize);
-        return ERR_MALFORMED_FRAME;
-    }
-
-    if (fragment_offset + fragment_size > fstream->fsize){
-        ReleaseSRWLockExclusive(&fstream->lock);
-        fprintf(stderr, "Fragment extends past file bounds - offset: %llu, fragment size: %u, file size: %llu\n",
-                                        fragment_offset, fragment_size, fstream->fsize);
-        return ERR_MALFORMED_FRAME;
-    }
-
-    // Calculate the index of the 64-bit bitmap entry (which corresponds to a "chunk" of 64 fragments)
-    // to which this incoming fragment belongs.
-    // fragment_offset / FILE_FRAGMENT_SIZE gives the fragment number.
-    // Dividing by 64ULL (FRAGMENTS_PER_CHUNK) then gives the chunk index.
-    uint64_t index = (fragment_offset / FILE_FRAGMENT_SIZE) / FRAGMENTS_PER_CHUNK;
-
-    if(fstream->bitmap[index] == 0ULL){
-        // Allocate a new memory chunk from the `pool_file_chunk` memory pool.
-        fstream->pool_block_file_chunk[index] = pool_alloc(pool_file_chunk);
-        // Check if the memory chunk allocation was successful.
-        if(!fstream->pool_block_file_chunk[index]){
-            ReleaseSRWLockExclusive(&fstream->lock);
-            fprintf(stderr, "ERROR: Failed to allocate memory chunk for file stream at index %llu\n", index);
-            return ERR_RESOURCE_LIMIT;
-        }
-    }
-
-    // Calculate the destination address within the target memory chunk where the fragment data will be copied.
-    // fstream->pool_block_file_chunk[fstream_index] gives the base address of the chunk.
-    // (fragment_offset % (FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK)) calculates the offset *within that chunk*.
-    // This accounts for multiple fragments being part of one chunk.
-    char *dest = fstream->pool_block_file_chunk[index] + (fragment_offset % (FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK));
-    char *src = fragment_buffer; // The source buffer containing the incoming fragment data.
-
-    // Copy the fragment data from the source buffer to its calculated destination within the chunk's memory block.
-    memcpy(dest, src, fragment_size);
-
-    // Mark the flag for this chunk as CHUNK_BODY.
-    // This assumes that by default, chunks are considered 'body' chunks unless specifically identified as 'trailing'.
-
-    fstream->flag[index] = CHUNK_BODY;
-    // fprintf(stdout, "Attaching fragment with offset: %llu to chunk: %llu at offset: %llu\n", fragment_offset, fstream_index, (fragment_offset % (FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK)));
-    // Increment the total number of bytes received for this file stream.
-    fstream->recv_bytes_count += fragment_size;
-
-    // Check if this file stream is expected to have a trailing (potentially partial) chunk.
-    if(fstream->trailing_chunk == TRUE){
-        // Special handling for the last chunk, which might be the trailing chunk.
-        // Check if the current fragment belongs to the last bitmap entry (chunk).
-        if(index == fstream->bitmap_entries_count - 1ULL){
-            // If it's the last chunk, accumulate the size of the received fragments for this chunk.
-            fstream->trailing_chunk_size += fragment_size;
-            // Mark the flag for this last chunk specifically as CHUNK_TRAILING.
-            // This flag differentiates it from regular CHUNK_BODY entries for writing logic.
-            fstream->flag[index] = CHUNK_TRAILING;
-        }
-        // Check if all expected bytes for the entire file have been received.
-        if(fstream->recv_bytes_count == fstream->fsize){
-            fstream->trailing_chunk_complete = TRUE;
-            // fprintf(stdout, "Received complete file: %s, Size: %llu, Last chunk size: %llu\n", fstream->fname, fstream->recv_bytes_count, fstream->trailing_chunk_size);
-        }
-    }
-
-    // Update the bitmap to mark this specific fragment as received.
-    mark_fragment_received(fstream->bitmap, fragment_offset, FILE_FRAGMENT_SIZE);
-
-    // Release the critical section lock for the file stream.
-    ReleaseSRWLockExclusive(&fstream->lock);
-    return RET_VAL_SUCCESS;
-
-}
-
 // Process received file metadata frame
 int handle_file_metadata(Client *client, UdpFrame *frame) {
 
@@ -627,18 +469,17 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
 
+    char buffer[FILE_FRAGMENT_SIZE];
+
     if(client == NULL){
         fprintf(stdout, "Received frame for non existing client context!\n");
         return RET_VAL_ERROR;
     }
 
-    AcquireSRWLockShared(&client->lock);
     if(client->slot_status == SLOT_FREE){
-        ReleaseSRWLockShared(&client->lock);
         fprintf(stderr, "ERROR: Received file metadata frame for client with slot status SLOT_FREE!\n");
         return RET_VAL_ERROR;
     }
-    ReleaseSRWLockShared(&client->lock);
 
     uint64_t recv_seq_num = _ntohll(frame->header.seq_num);
     uint32_t recv_session_id = _ntohl(frame->header.session_id);
@@ -654,7 +495,18 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
         goto exit_err;
     }
 
-    // ServerFileStream *fstream = search_file_stream(recv_session_id, recv_file_id);
+    if(recv_fragment_size == 0 || recv_fragment_size > FILE_FRAGMENT_SIZE){
+        fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid fragment size: %u\n", recv_seq_num, recv_file_id, recv_session_id, recv_fragment_size);
+        op_code = ERR_MALFORMED_FRAME;
+        goto exit_err;
+    }
+
+    if(recv_session_id == 0 || recv_file_id == 0){
+        fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid session or file ID\n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = ERR_MALFORMED_FRAME;
+        goto exit_err;
+    }
+
     ServerFileStream *fstream = find_fstream(pool_fstreams, recv_session_id, recv_file_id);
     if(!fstream){
         fprintf(stderr, "Received fragment frame Seq: %llu for unknown fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
@@ -662,30 +514,66 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
         goto exit_err;
     }
 
+    AcquireSRWLockShared(&fstream->lock);
+    if(recv_fragment_offset + recv_fragment_size > fstream->fsize){
+        ReleaseSRWLockShared(&fstream->lock);
+        fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid fragment offset + size exceeding max file size\n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = ERR_MALFORMED_FRAME;
+        goto exit_err;
+    }
+
     if(check_fragment_received(fstream->bitmap, recv_fragment_offset, FILE_FRAGMENT_SIZE)){
+        ReleaseSRWLockShared(&fstream->lock);
         fprintf(stderr, "Received duplicate file fragment Seq: %llu; fID: %u; sID: %u; \n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_DUPLICATE_FRAME;
         goto exit_err;
     }
+    ReleaseSRWLockShared(&fstream->lock);
 
-    op_code = attach_fragment_to_chunk(fstream, frame->payload.file_fragment.bytes, recv_fragment_offset, recv_fragment_size);
-    if(op_code != RET_VAL_SUCCESS){
-        fprintf(stderr, "ERROR: Failed to attach file fragment to chunk for sID: %u; fID: %u;\n", recv_session_id, recv_file_id);
+    memcpy(buffer, frame->payload.file_fragment.bytes, recv_fragment_size);
+
+    AcquireSRWLockExclusive(&server->lock_fragment_key);
+    server->fragment_key++;
+    NodeTableFileChunk *node = ht_insert_fchunk(table_file_chunk, server->fragment_key, OP_WR, buffer, recv_fragment_size);
+    ReleaseSRWLockExclusive(&server->lock_fragment_key);
+
+    if(!node){
+        fprintf(stderr, "Failed to allocate memory for file chunk in hash table\n");
+        op_code = ERR_RESOURCE_LIMIT;
         goto exit_err;
     }
 
-    AcquireSRWLockShared(&client->lock);
+    memset(&node->overlapped, 0, sizeof(OVERLAPPED));
+    node->overlapped.Offset = (DWORD)(recv_fragment_offset);                 // Lower 32 bits
+    node->overlapped.OffsetHigh = (DWORD)(recv_fragment_offset >> 32);       // Upper 32 bits
+
+    // AcquireSRWLockShared(&fstream->lock);
+    BOOL result = WriteFile(
+        fstream->iocp_file_handle,
+        node->buffer,
+        node->buffer_size,
+        NULL,
+        &node->overlapped
+    );
+    // ReleaseSRWLockShared(&fstream->lock);
+    if (!result) {
+        DWORD err = GetLastError();
+        if (err != ERROR_IO_PENDING) {
+            fprintf(stderr, "ERROR: Initiating async write: %lu\n", err);
+            ht_remove_fchunk(table_file_chunk, server->fragment_key);
+            op_code = ERR_INTERNAL_ERROR;
+            goto exit_err;
+        }
+    }
+
     if(push_seq(&client->queue_ack_seq, frame->header.seq_num) == RET_VAL_ERROR){
-        ReleaseSRWLockShared(&client->lock);
         fprintf(stderr, "ERROR: Failed to push file fragment ack seq to queue\n");
         return RET_VAL_ERROR;
     }
     if(push_slot(queue_client_slot, client->slot) == RET_VAL_ERROR){
-        ReleaseSRWLockShared(&client->lock);
         fprintf(stderr, "ERROR: Failed to push client slot to to slot queue\n");
         return RET_VAL_ERROR;
     };
-    ReleaseSRWLockShared(&client->lock);
     return RET_VAL_SUCCESS;
 
 exit_err:
@@ -698,6 +586,7 @@ exit_err:
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
         fprintf(stderr, "ERROR: Failed to push file fragment ack error frame to queue\n");
         pool_free(pool_send_udp_frame, entry_send_frame);
+        return RET_VAL_ERROR;
     }
     return RET_VAL_ERROR;
 }

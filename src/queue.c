@@ -340,17 +340,17 @@ uint64_t pop_seq(QueueSeq *queue){
     uint64_t seq = 0;
     if (!queue) {
         fprintf(stderr, "Pop - Seq queue not initialized.\n");
-        return seq;
+        return 0;
     }
     if(queue->size <= 0){
         fprintf(stderr, "Pop - Seq queue size not initialized\n");
-        return seq;
+        return 0;
     }
     AcquireSRWLockExclusive(&queue->lock);
     // Check if the queue is empty before removing
     if (queue->head == queue->tail) {
         ReleaseSRWLockExclusive(&queue->lock);
-        return seq;
+        return 0;
     }
     seq = queue->seq[queue->head];
     queue->seq[queue->head] = 0;

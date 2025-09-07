@@ -34,6 +34,10 @@ ServerThreads Threads;
 const char *server_ip = "192.168.0.241";
 // const char *server_ip = "127.0.0.1";
 
+// uint64_t test_key = 0;
+// CRITICAL_SECTION lock_test_key;
+
+
 
 static void get_network_config(){
     DWORD bufferSize = 0;
@@ -107,12 +111,14 @@ static int init_server_config(){
 
     printf("Server listening on port %d...\n", SERVER_PORT);
 
-
-    server->iocp_handle = CreateIoCompletionPort((HANDLE)server->socket, NULL, 0, 0);
-    if (server->iocp_handle == NULL || server->iocp_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "CreateIoCompletionPort failed: %d\n", GetLastError());
-        closesocket(server->socket);
-        WSACleanup();
+    server->iocp_socket_handle = CreateIoCompletionPort((HANDLE)server->socket, NULL, 0, 0);
+    if (!server->iocp_socket_handle || server->iocp_socket_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "CreateIoCompletionPort failed socket_handle: %lu\n", GetLastError());
+        return RET_VAL_ERROR;
+    }
+    server->iocp_file_handle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!server->iocp_file_handle) {
+        fprintf(stderr, "CreateIoCompletionPort failed file_handle: %lu\n", GetLastError());
         return RET_VAL_ERROR;
     }
 
@@ -122,6 +128,9 @@ static int init_server_config(){
 static int init_server_buffers(){
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+
+    InitializeSRWLock(&server->lock_fragment_key);
+    server->fragment_key = 0;
 
     for(int i = 0; i < MAX_CLIENTS; i++){
         Client *client = &client_list->client[i];
@@ -137,7 +146,7 @@ static int init_server_buffers(){
         InitializeSRWLock(&client->lock);
     }
     // Initialize client_list lock
-    InitializeCriticalSection(&client_list->lock);
+    InitializeCriticalSection(&client_list->lock);    
 
     init_fstream_pool(pool_fstreams, MAX_SERVER_ACTIVE_FSTREAMS);
     init_mstream_pool(pool_mstreams, MAX_SERVER_ACTIVE_MSTREAMS);
@@ -146,6 +155,7 @@ static int init_server_buffers(){
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(IOCP_CONTEXT), SERVER_POOL_SIZE_IOCP_RECV);
     init_pool(pool_file_chunk, BLOCK_SIZE_CHUNK, BLOCK_COUNT_CHUNK);
+    init_pool(pool_iocp_file_chunk, BLOCK_SIZE_CHUNK, BLOCK_COUNT_CHUNK);
     
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
@@ -153,6 +163,8 @@ static int init_server_buffers(){
     init_queue_ptr(queue_process_fstream, MAX_SERVER_ACTIVE_FSTREAMS);
     init_table_id(table_file_id, 1024, 32768);
     init_table_id(table_message_id, 1024, 32768);
+
+    init_table_fchunk(table_file_chunk, 4096, 262144);
     
 
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
@@ -198,6 +210,14 @@ static int start_threads() {
             return RET_VAL_ERROR;
         }
         SetThreadPriority(threads->recv_send_frame[i], THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+    for(int i = 0; i < SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT; i++){
+        threads->file_chunk_written[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_file_chunk_written, NULL, 0, NULL);
+        if (threads->file_chunk_written[i] == NULL) {
+            fprintf(stderr, "Failed to create file_chunk_written thread. Error: %d\n", GetLastError());
+            return RET_VAL_ERROR;
+        }
+        SetThreadPriority(threads->file_chunk_written, THREAD_PRIORITY_ABOVE_NORMAL);
     }
     for(int i = 0; i < SERVER_MAX_THREADS_PROCESS_FRAME; i++){
         threads->process_frame[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_frame, NULL, 0, NULL);
@@ -255,13 +275,13 @@ static int start_threads() {
         return RET_VAL_ERROR;
     }
 
-    for(int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; i++){
-        threads->file_stream[i] = (HANDLE)_beginthreadex(NULL, 0, fthread_process_file_stream, NULL, 0, NULL);
-        if (threads->file_stream[i] == NULL) {
-            fprintf(stderr, "Failed to file stream thread. Error: %d\n", GetLastError());
-            return RET_VAL_ERROR;
-        }
-    }
+    // for(int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; i++){
+    //     threads->file_stream[i] = (HANDLE)_beginthreadex(NULL, 0, fthread_process_file_stream, NULL, 0, NULL);
+    //     if (threads->file_stream[i] == NULL) {
+    //         fprintf(stderr, "Failed to file stream thread. Error: %d\n", GetLastError());
+    //         return RET_VAL_ERROR;
+    //     }
+    // }
     threads->server_command = (HANDLE)_beginthreadex(NULL, 0, fthread_server_command, NULL, 0, NULL);
     if (threads->server_command == NULL) {
         fprintf(stderr, "Failed to create server command thread. Error: %d\n", GetLastError());
@@ -455,7 +475,7 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
     
-    HANDLE CompletitionPort = server->iocp_handle;
+    HANDLE CompletitionPort = server->iocp_socket_handle;
     DWORD NrOfBytesTransferred;
     ULONG_PTR lpCompletitionKey;
     LPOVERLAPPED lpOverlapped;
@@ -527,11 +547,13 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                         if (push_ptr(queue_recv_prio_udp_frame, (uintptr_t)recv_frame_entry) == RET_VAL_ERROR) {
                             fprintf(stderr, "CRITICAL ERROR: Dropping priority recv frame - Failed to push priority recv frame to queue.\n");
                             pool_free(pool_recv_udp_frame, recv_frame_entry);
+                            // continue;
                         }
                     } else {
                         if (push_ptr(queue_recv_udp_frame, (uintptr_t)recv_frame_entry) == RET_VAL_ERROR) {
                             fprintf(stderr, "CRITICAL ERROR: Dropping recv frame - Failed to push recv frame to queue.\n");
                             pool_free(pool_recv_udp_frame, recv_frame_entry);
+                            // continue;
                         }
                     }
 
@@ -555,7 +577,7 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                     break;
                 }
                 // refill the recv context mem pool when it drops bellow half
-                if(pool_iocp_recv_context->free_blocks > (pool_iocp_recv_context->block_count / 2)){
+                if(pool_iocp_recv_context->free_blocks < (pool_iocp_recv_context->block_count / 2)){
                     refill_recv_iocp_pool(server->socket, pool_iocp_recv_context);
                 }
                 break; // End of OP_RECV case
@@ -582,6 +604,70 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
         } // end of switch(context->type)
     } // end of while (server->server_status == STATUS_READY)
            
+    fprintf(stdout, "recv thread exiting\n");
+    _endthreadex(0);
+    return 0;
+}
+
+
+static DWORD WINAPI func_thread_file_chunk_written(LPVOID lpParam) {
+
+    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    
+    HANDLE CompletitionPort = server->iocp_file_handle;
+    DWORD NrOfBytesWritten;
+    ULONG_PTR lpCompletitionKey;
+    LPOVERLAPPED lpOverlapped;
+    
+    while (server->server_status == STATUS_READY) {
+
+        BOOL getqcompl_result = GetQueuedCompletionStatus(
+            CompletitionPort,
+            &NrOfBytesWritten,
+            &lpCompletitionKey,
+            &lpOverlapped,
+            INFINITE// WSARECV_TIMEOUT_MS
+        );
+
+        if (!getqcompl_result) {
+            DWORD err = GetLastError();
+            fprintf(stderr, "I/O failed with error: %lu\n", err);
+            continue;
+        }
+        if (!lpOverlapped) {
+            fprintf(stderr, "ERROR: NULL pOverlapped received. IOCP may be shutting down.\n");
+            continue;
+        }
+        
+        NodeTableFileChunk *node = (NodeTableFileChunk*)lpOverlapped;
+        ServerFileStream *fstream = (ServerFileStream*)lpCompletitionKey;
+
+        if (!node) {
+            fprintf(stderr, "ERROR: NULL node received in file chunk write completion. Skipping.\n");
+            continue;
+        }
+        if (!fstream) {
+            fprintf(stderr, "ERROR: NULL fstream received in file chunk write completion. Skipping.\n");
+            continue;
+        }
+        
+        if(node->type == OP_WR){
+            AcquireSRWLockExclusive(&fstream->lock);
+            if(!ht_search_fchunk(table_file_chunk, node->key)){
+                fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
+            }
+            uint64_t fragment_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
+            mark_fragment_received(fstream->bitmap, fragment_offset, FILE_FRAGMENT_SIZE);
+            ht_remove_fchunk(table_file_chunk, node->key);
+            fstream->written_bytes_count += NrOfBytesWritten;
+            if(fstream->written_bytes_count == fstream->fsize){
+                ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
+                close_fstream(fstream);
+            }
+            ReleaseSRWLockExclusive(&fstream->lock);
+        }
+
+    }
     fprintf(stdout, "recv thread exiting\n");
     _endthreadex(0);
     return 0;
@@ -746,7 +832,7 @@ static DWORD WINAPI func_thread_process_frame(LPVOID lpParam) {
         } else {
             client = find_client(recv_session_id);
             if(client == NULL){
-                //fprintf(stderr, "Received frame from unknown client\n");
+                fprintf(stderr, "Received frame from unknown client\n");
                 continue;
             }
         }
@@ -782,7 +868,9 @@ static DWORD WINAPI func_thread_process_frame(LPVOID lpParam) {
                 break;
 
             case FRAME_TYPE_FILE_FRAGMENT:
-                handle_file_fragment(client, frame);
+                if(handle_file_fragment(client, frame) == RET_VAL_ERROR){
+                    fprintf(stderr, "ERROR: handle_file_fragment() returned RET_VAL_ERROR\n");
+                }
                 break;
 
             case FRAME_TYPE_FILE_END:
@@ -1057,210 +1145,6 @@ static DWORD WINAPI fthread_client_timeout(LPVOID lpParam){
     _endthreadex(0);
     return 0; // Return 0 to indicate that the thread terminated successfully.
 }
-// --- Thread for writing file streams to disk ---
-static DWORD WINAPI fthread_process_file_stream(LPVOID lpParam) {
-
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-    SHA256_CTX sha256_ctx;
-
-    while (server->server_status == STATUS_READY) { 
-        ServerFileStream *fstream = NULL;
-        DWORD result = WaitForSingleObject(queue_process_fstream->push_semaphore, INFINITE);
-        if (result == WAIT_OBJECT_0) {
-            fstream = (ServerFileStream*)pop_ptr(queue_process_fstream);
-        } else {
-            fprintf(stderr, "CRITICAL ERROR: Unexpected result wait semaphore fstream queue: %lu\n", result);
-            continue;
-        }        
-        if(!fstream){
-            fprintf(stderr, "CRITICAL ERROR: Received null pointer from fstream queue!\n");
-            continue;
-        }
-
-        sha256_init(&sha256_ctx);
-        while(true){
-            AcquireSRWLockExclusive(&fstream->lock);
-            if(!fstream->fstream_busy){
-                ReleaseSRWLockExclusive(&fstream->lock);
-                break; // Exit the while loop if the file stream is not busy.
-            }
-            // Iterate through all bitmap entries (chunks) for the current file stream.
-            for(long long k = 0; k < fstream->bitmap_entries_count; k++){
-                // Calculate the absolute file offset where this chunk should be written.
-                uint64_t file_offset = k * FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK;
-                // Get the memory buffer associated with this chunk.
-                char* buffer = fstream->pool_block_file_chunk[k];
-                uint64_t buffer_size;
-
-                // Case 1: This is the trailing (last, potentially partial) chunk.
-                // Check if:
-                //   a) The fstream is marked as having a trailing chunk.
-                //   b) The trailing chunk's expected bytes have all been received.
-                //   c) The current chunk's flag indicates it's the trailing chunk AND it hasn't been written yet.
-                if (fstream->trailing_chunk && fstream->trailing_chunk_complete && (fstream->flag[k] == CHUNK_TRAILING)) {
-                    buffer_size = fstream->trailing_chunk_size; // Use the specific calculated size for the trailing chunk.
-
-                // Case 2: This is a full-sized chunk (not trailing).
-                // Check if:
-                //   a) All fragments within this 64-bit bitmap entry have been received (~0ULL means all bits set).
-                //   b) The current chunk's flag indicates it's a body chunk AND it hasn't been written yet.
-                } else if(fstream->bitmap[k] == ~0ULL && (fstream->flag[k] == CHUNK_BODY)) {
-                    buffer_size = FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK; // Full chunk size.
-                }
-                // Case 3: This chunk is neither a ready trailing chunk nor a complete, unwritten full chunk.
-                // It means this chunk either:
-                //   - Has not received all its data yet.
-                //   - Has already been written to disk.
-                //   - Is not the trailing chunk and not a full chunk (logic error in flag setting perhaps).
-                else {
-                    continue; // Skip this chunk and move to the next bitmap entry.
-                }
-
-                // --- FILE WRITE OPERATIONS ---
-                // Check if the file pointer is valid. If NULL, something went wrong during file opening.
-                if (fstream->fp == NULL) {
-                    fprintf(stderr, "Error: FILE pointer is null for chunk %llu. Session ID: %u, File ID: %u\n", k, fstream->sid, fstream->fid);
-                    fstream->fstream_err = STREAM_ERR_FP; // Set a specific error code.
-                    break;
-                }
-
-                // Attempt to seek to the correct offset in the file.
-                if (_fseeki64(fstream->fp, file_offset, SEEK_SET) != 0) {
-                    fprintf(stderr, "Error: Failed to seek to offset %llu for chunk %llu. Session ID: %u, File ID: %u\n", file_offset, k, fstream->sid, fstream->fid);
-                    fstream->fstream_err = STREAM_ERR_FSEEK; // Set a specific error code.
-                    break;
-                }
-
-                // Write the chunk data from the buffer to the file.
-                size_t written = fwrite(buffer, 1, buffer_size, fstream->fp);
-                // Check if the number of bytes written matches the expected buffer size.
-                if (written != buffer_size) {
-                    fprintf(stderr, "Error: Failed to write data (expected %llu, wrote %llu) for chunk %llu. Session ID: %u, File ID: %u\n", buffer_size, written, k, fstream->sid, fstream->fid);
-                    fstream->fstream_err = STREAM_ERR_FWRITE; // Set a specific error code.
-                    break;
-                }
-                fstream->written_bytes_count += written; // Accumulate the total bytes written to disk.
-                fstream->flag[k] |= CHUNK_WRITTEN; // Update the chunk's flag to reflect it has been written.
-
-                // Return the memory buffer for this chunk back to the pre-allocated pool.
-                pool_free(pool_file_chunk, fstream->pool_block_file_chunk[k]);
-                fstream->pool_block_file_chunk[k] = NULL;
-            }
-
-            if(fstream->fstream_err != STREAM_ERR_NONE){
-                close_fstream(fstream); // Clean up the entire file stream.
-                ReleaseSRWLockExclusive(&fstream->lock);
-                break;
-            }
-
-            for(long long k = 0; k < fstream->bitmap_entries_count; k++){
-                BOOL is_chunk_body = (fstream->flag[k] & CHUNK_BODY) == CHUNK_BODY;
-                BOOL is_chunk_body_complete = fstream->bitmap[k] == ~0ULL;
-                BOOL is_chunk_written = (fstream->flag[k] & CHUNK_WRITTEN) == CHUNK_WRITTEN;
-
-                BOOL is_chunk_body_and_written = fstream->flag[k] == (CHUNK_BODY | CHUNK_WRITTEN);
-                BOOL is_chunk_trailing_and_written = fstream->flag[k] == (CHUNK_TRAILING | CHUNK_WRITTEN);
-
-                if(is_chunk_body && !is_chunk_body_complete){
-                    break;  // exit the for loop
-                }
-
-                if(!is_chunk_written){
-                    break; // exit the for loop
-                }
-
-                if(is_chunk_body_and_written || is_chunk_trailing_and_written){
-                    uint64_t file_offset = k * FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK;
-                    // Attempt to seek to the correct offset in the file.
-                    if (_fseeki64(fstream->fp, file_offset, SEEK_SET) != 0) {
-                        fprintf(stderr, "Error: Failed to seek to offset %llu for chunk %llu. Session ID: %u, File ID: %u\n", file_offset, k, fstream->sid, fstream->fid);
-                        fstream->fstream_err = STREAM_ERR_FSEEK; // Set a specific error code.
-                        break;
-                    }
-
-                    char chunk_buffer[(FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK)];
-                    size_t chunk_bytes_read = fread(chunk_buffer, 1, sizeof(chunk_buffer), fstream->fp);
-
-                    if (chunk_bytes_read <= 0) {
-                        fprintf(stderr, "Error: Failed to read data from file for chunk offset %llu. Session ID: %u, File ID: %u\n", file_offset, fstream->sid, fstream->fid);
-                        fstream->fstream_err = STREAM_ERR_FREAD; // Set a specific error code.
-                        break;
-                    }                              
-
-                    sha256_update(&sha256_ctx, chunk_buffer, chunk_bytes_read);
-
-                    fstream->flag[k] |= CHUNK_HASHED;
-                    fstream->hashed_chunks_count++;
-                }
-            }
-
-            if(fstream->fstream_err != STREAM_ERR_NONE){
-                close_fstream(fstream); // Clean up the entire file stream.
-                ReleaseSRWLockExclusive(&fstream->lock);
-                break;
-            }
-
-            fstream->file_bytes_received = (fstream->recv_bytes_count == fstream->fsize);
-            fstream->file_bytes_written = (fstream->hashed_chunks_count == fstream->bitmap_entries_count);
-
-            // After attempting to write all available chunks for this file stream:
-            // Check if the total bytes received equals the total file size AND
-            // if the total bytes written to disk also equals the total file size.
-            if(fstream->file_bytes_received && fstream->file_bytes_written &&
-                    (fstream->hashed_chunks_count == fstream->bitmap_entries_count) &&
-                    !fstream->file_hash_calculated){
-                sha256_final(&sha256_ctx, (uint8_t *)&fstream->calculated_sha256);
-                fstream->file_hash_calculated = TRUE;
-            }
-
-            if(fstream->file_hash_calculated && fstream->file_hash_received && !fstream->file_hash_validated){
-                fstream->file_hash_validated = validate_file_hash(fstream);
-                if(!fstream->file_hash_validated){
-                    fstream->fstream_err = STREAM_ERR_SHA256_MISMATCH; // Set a specific error code.
-                    close_fstream(fstream);
-                    ReleaseSRWLockExclusive(&fstream->lock);
-                    fprintf(stderr, "STREAM ERROR: sha256 mismatch!\n");
-                    break;  //exit the while loop
-                }
-            }
-
-            fstream->file_complete = (fstream->file_bytes_received && 
-                                        fstream->file_bytes_written &&
-                                        fstream->file_hash_received &&
-                                        fstream->file_hash_calculated &&
-                                        fstream->file_hash_validated &&
-                                        !fstream->file_complete
-                                        );
-
-            // If the file is now completely received and written:
-            if(fstream->file_complete){           
-
-                ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
- 
-                PoolEntrySendFrame *entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
-                if(!entry_send_frame){
-                    close_fstream(fstream);
-                    ReleaseSRWLockExclusive(&fstream->lock);
-                    fprintf(stderr, "ERROR: Failed to allocate memory in the pool for file_end ack frame\n");
-                    break;
-                }
-                construct_ack_frame(entry_send_frame, fstream->file_end_frame_seq_num, fstream->sid, STS_CONFIRM_FILE_END, server->socket, &fstream->client_addr);
-                if (push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR) {
-                    pool_free(pool_send_udp_frame, entry_send_frame); // Free the entry if it fails to push
-                    fprintf(stderr, "CRITICAL ERROR: Failed to push to queue priority file_end ack frame\n");
-                }
-                close_fstream(fstream);
-                ReleaseSRWLockExclusive(&fstream->lock);
-                break; //exit the while loop
-            }
-            ReleaseSRWLockExclusive(&fstream->lock);
-            Sleep(1);
-        } // end of while(fstream->busy)
-    }
-    _endthreadex(0);
-    return 0;
-}
 // --- Process server command ---
 static DWORD WINAPI fthread_server_command(LPVOID lpParam){
     
@@ -1363,12 +1247,14 @@ int main() {
 
         Sleep(250); // Prevent busy-waiting
    
-        fprintf(stdout, "\r\033[2K-- Hash_fID_Count: %llu; FreeRecvFrame: %llu; FreeSendFrame: %llu; PendingAck: %llu; PoolFileChunk: %llu", 
+        fprintf(stdout, "\r\033[2K-- Hash_fID_Count: %llu; FreeRecvFrame: %llu; FreeSendFrame: %llu; PendingAck: %llu; PoolFileChunk: %llu; TBFC: %llu : %llu", 
                             Buffers.table_file_id.count,
                             Buffers.pool_recv_udp_frame.free_blocks,
                             Buffers.pool_send_udp_frame.free_blocks,
                             ClientList.client[0].queue_ack_seq.pending,
-                            Buffers.pool_file_chunk.free_blocks
+                            Buffers.pool_file_chunk.free_blocks,
+                            Buffers.table_file_chunk.count,
+                            Buffers.table_file_chunk.pool_nodes.free_blocks
                             );
 
     }

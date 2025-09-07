@@ -59,10 +59,6 @@ __declspec(align(64))typedef struct{
 }FRAME_CONTEXT;
  
 // Enumeration for operation type within IOCP_CONTEXT
-typedef enum {
-    OP_RECV,
-    OP_SEND
-} OPERATION_TYPE;
 
 __declspec(align(64))typedef struct {
     OVERLAPPED overlapped; // Must be the first member for easy casting
@@ -70,12 +66,11 @@ __declspec(align(64))typedef struct {
     CHAR buffer[sizeof(UdpFrame)];
     struct sockaddr_in addr;  // Source/Destination address
     int addr_len;
-    OPERATION_TYPE type;      // To distinguish between send and receive operations
+    uint8_t type;      // To distinguish between send and receive operations
 } IOCP_CONTEXT;
 //--------------------------------------------------------------------------------------------------------------------------
-
 //--------------------------------------------------------------------------------------------------------------------------
-void init_iocp_context(IOCP_CONTEXT *iocp_context, OPERATION_TYPE type);
+void init_iocp_context(IOCP_CONTEXT *iocp_context, uint8_t type);
 int udp_recv_from(const SOCKET src_socket, IOCP_CONTEXT *iocp_context);
 int udp_send_to(const char *data, size_t data_len, const SOCKET src_socket, const struct sockaddr_in *dest_addr, MemPool *mem_pool);
 
