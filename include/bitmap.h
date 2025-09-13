@@ -17,10 +17,10 @@ void mark_fragment_received(uint64_t bitmap[], uint64_t fragment_offset, uint32_
 // To check if already received
 BOOL check_fragment_received(uint64_t bitmap[], uint64_t fragment_offset, uint32_t fragment_size);
 
-// Check if bitmap is full (all fragments received)
-BOOL check_bitmap(uint64_t bitmap[], uint32_t fragment_count);
+// // Check if bitmap is full (all fragments received)
+// BOOL check_bitmap(uint64_t bitmap[], uint32_t fragment_count);
 
-// Check if a flag is set in a bitmap
-BOOL check_flag(uint8_t flag[], uint32_t fragment_count);
+// // Check if a flag is set in a bitmap
+// BOOL check_flag(uint8_t flag[], uint32_t fragment_count);
 
 #endif

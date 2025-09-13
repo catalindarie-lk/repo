@@ -34,11 +34,6 @@ ServerThreads Threads;
 const char *server_ip = "192.168.0.241";
 // const char *server_ip = "127.0.0.1";
 
-// uint64_t test_key = 0;
-// CRITICAL_SECTION lock_test_key;
-
-
-
 static void get_network_config(){
     DWORD bufferSize = 0;
     IP_ADAPTER_ADDRESSES *adapterAddresses = NULL, *adapter = NULL;
@@ -118,10 +113,14 @@ static int init_server_config(){
     }
     server->iocp_file_handle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (!server->iocp_file_handle) {
-        fprintf(stderr, "CreateIoCompletionPort failed file_handle: %lu\n", GetLastError());
+        fprintf(stderr, "CreateIoCompletionPort failed server_file_handle: %lu\n", GetLastError());
         return RET_VAL_ERROR;
     }
-
+    server->iocp_file_handle_test = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
+    if (!server->iocp_file_handle_test) {
+        fprintf(stderr, "CreateIoCompletionPort failed server_file_handle_test: %lu\n", GetLastError());
+        return RET_VAL_ERROR;
+    }
     return RET_VAL_SUCCESS;
 
 }
@@ -154,9 +153,8 @@ static int init_server_buffers(){
 
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(IOCP_CONTEXT), SERVER_POOL_SIZE_IOCP_RECV);
-    init_pool(pool_file_chunk, BLOCK_SIZE_CHUNK, BLOCK_COUNT_CHUNK);
-    init_pool(pool_iocp_file_chunk, BLOCK_SIZE_CHUNK, BLOCK_COUNT_CHUNK);
-    
+    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 256);
+        
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
 
@@ -164,9 +162,8 @@ static int init_server_buffers(){
     init_table_id(table_file_id, 1024, 32768);
     init_table_id(table_message_id, 1024, 32768);
 
-    init_table_fchunk(table_file_chunk, 4096, 262144);
+    init_table_fblock(table_file_block, 128, 256);
     
-
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
 
     init_pool(pool_send_udp_frame, sizeof(PoolEntrySendFrame), SERVER_POOL_SIZE_SEND);
@@ -212,13 +209,14 @@ static int start_threads() {
         SetThreadPriority(threads->recv_send_frame[i], THREAD_PRIORITY_ABOVE_NORMAL);
     }
     for(int i = 0; i < SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT; i++){
-        threads->file_chunk_written[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_file_chunk_written, NULL, 0, NULL);
-        if (threads->file_chunk_written[i] == NULL) {
-            fprintf(stderr, "Failed to create file_chunk_written thread. Error: %d\n", GetLastError());
+        threads->file_chunk_written_test[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_file_chunk_written_test, NULL, 0, NULL);
+        if (threads->file_chunk_written_test[i] == NULL) {
+            fprintf(stderr, "Failed to create file_chunk_written_test thread. Error: %d\n", GetLastError());
             return RET_VAL_ERROR;
         }
-        SetThreadPriority(threads->file_chunk_written, THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadPriority(threads->file_chunk_written_test[i], THREAD_PRIORITY_ABOVE_NORMAL);
     }
+
     for(int i = 0; i < SERVER_MAX_THREADS_PROCESS_FRAME; i++){
         threads->process_frame[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_frame, NULL, 0, NULL);
         if (threads->process_frame[i] == NULL) {
@@ -462,11 +460,11 @@ static void check_open_file_stream(){
     
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
 
-    for(int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; i++){
-        if(pool_fstreams->fstream[i].fstream_busy == TRUE){
-            fprintf(stdout, "File stream still open: %d\n", i);
-        }
-    }
+    // for(int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; i++){
+    //     if(pool_fstreams->fstream[i].fstream_busy == TRUE){
+    //         fprintf(stdout, "File stream still open: %d\n", i);
+    //     }
+    // }
     fprintf(stdout, "Completed checking opened file streams\n");
     return;
 }
@@ -609,12 +607,12 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
     return 0;
 }
 
-
-static DWORD WINAPI func_thread_file_chunk_written(LPVOID lpParam) {
+// --- IOCP Write block ---
+static DWORD WINAPI func_thread_file_chunk_written_test(LPVOID lpParam) {
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
     
-    HANDLE CompletitionPort = server->iocp_file_handle;
+    HANDLE CompletitionPort = server->iocp_file_handle_test;
     DWORD NrOfBytesWritten;
     ULONG_PTR lpCompletitionKey;
     LPOVERLAPPED lpOverlapped;
@@ -639,39 +637,41 @@ static DWORD WINAPI func_thread_file_chunk_written(LPVOID lpParam) {
             continue;
         }
         
-        NodeTableFileChunk *node = (NodeTableFileChunk*)lpOverlapped;
+        NodeTableFileBlock *node = (NodeTableFileBlock*)lpOverlapped;
         ServerFileStream *fstream = (ServerFileStream*)lpCompletitionKey;
 
         if (!node) {
-            fprintf(stderr, "ERROR: NULL node received in file chunk write completion. Skipping.\n");
+            fprintf(stderr, "ERROR: NULL node received in file write completion. Skipping.\n");
             continue;
         }
         if (!fstream) {
-            fprintf(stderr, "ERROR: NULL fstream received in file chunk write completion. Skipping.\n");
+            fprintf(stderr, "ERROR: NULL fstream received in file write completion. Skipping.\n");
             continue;
         }
         
         if(node->type == OP_WR){
             AcquireSRWLockExclusive(&fstream->lock);
-            if(!ht_search_fchunk(table_file_chunk, node->key)){
-                fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
-            }
-            uint64_t fragment_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
-            mark_fragment_received(fstream->bitmap, fragment_offset, FILE_FRAGMENT_SIZE);
-            ht_remove_fchunk(table_file_chunk, node->key);
-            fstream->written_bytes_count += NrOfBytesWritten;
-            if(fstream->written_bytes_count == fstream->fsize){
+            // if(!ht_search_fblock(table_file_block, node->key)){
+            //     fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
+            // }
+            // uint64_t block_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
+            // uint64_t block_nr = block_offset / SERVER_FILE_BLOCK_SIZE;
+            ht_remove_fblock(table_file_block, node->key, pool_file_block);
+
+            fstream->written_bytes_count_test += NrOfBytesWritten;
+            if(/*fstream->fstream_busy &&*/ fstream->written_bytes_count_test == fstream->file_size){
+                check_bitmap(fstream->received_file_bitmap, fstream->fragment_count);
                 ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
                 close_fstream(fstream);
             }
             ReleaseSRWLockExclusive(&fstream->lock);
         }
-
     }
     fprintf(stdout, "recv thread exiting\n");
     _endthreadex(0);
     return 0;
 }
+
 // --- Processes a received frame ---
 static DWORD WINAPI func_thread_process_frame(LPVOID lpParam) {
 
@@ -869,7 +869,7 @@ static DWORD WINAPI func_thread_process_frame(LPVOID lpParam) {
 
             case FRAME_TYPE_FILE_FRAGMENT:
                 if(handle_file_fragment(client, frame) == RET_VAL_ERROR){
-                    fprintf(stderr, "ERROR: handle_file_fragment() returned RET_VAL_ERROR\n");
+                    // fprintf(stderr, "ERROR: handle_file_fragment() returned RET_VAL_ERROR\n");
                 }
                 break;
 
@@ -1247,14 +1247,14 @@ int main() {
 
         Sleep(250); // Prevent busy-waiting
    
-        fprintf(stdout, "\r\033[2K-- Hash_fID_Count: %llu; FreeRecvFrame: %llu; FreeSendFrame: %llu; PendingAck: %llu; PoolFileChunk: %llu; TBFC: %llu : %llu", 
+        fprintf(stdout, "\r\033[2K-- Hash_fID_Count: %llu; FrRcvFr: %llu; FrSndFr: %llu; PendingAck: %llu; PoolFBlk: %llu; TBFB: %llu : %llu", 
                             Buffers.table_file_id.count,
                             Buffers.pool_recv_udp_frame.free_blocks,
                             Buffers.pool_send_udp_frame.free_blocks,
                             ClientList.client[0].queue_ack_seq.pending,
-                            Buffers.pool_file_chunk.free_blocks,
-                            Buffers.table_file_chunk.count,
-                            Buffers.table_file_chunk.pool_nodes.free_blocks
+                            Buffers.pool_file_block.free_blocks,
+                            Buffers.table_file_block.count,
+                            Buffers.table_file_block.pool_nodes.free_blocks
                             );
 
     }

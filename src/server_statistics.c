@@ -210,14 +210,8 @@ DWORD WINAPI MainLogicThread_Server(LPVOID lpParam) {
         }
 
         for (int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; ++i) {
-            if(pool_fstreams->fstream[i].fstream_busy){
-                g_serverStats.fstream_progress[i] = (double)((double)pool_fstreams->fstream[i].written_bytes_count / (double)pool_fstreams->fstream[i].fsize) * 100.0;
-                g_serverStats.fstream_session_id[i] = pool_fstreams->fstream[i].sid;
-            } else {
-                g_serverStats.fstream_progress[i] = 0.0;
-                g_serverStats.fstream_session_id[i] = 0;
-            }
-            
+                g_serverStats.fstream_progress[i] = (double)((double)pool_fstreams->fstream[i].written_bytes_count_test / (double)pool_fstreams->fstream[i].file_size) * 100.0;
+                g_serverStats.fstream_session_id[i] = pool_fstreams->fstream[i].sid;            
         }
         LeaveCriticalSection(&g_statsLock);
 

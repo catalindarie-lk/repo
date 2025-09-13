@@ -45,7 +45,7 @@
 #define DISCONNECT_REQUEST_TIMEOUT_MS               2500                  // Timeout for a disconnect request in milliseconds
 
 #define TEXT_CHUNK_SIZE                             (TEXT_FRAGMENT_SIZE * 64) // Size of a text data chunk (derived from protocol_frames.h)
-#define FILE_CHUNK_SIZE                             (FILE_FRAGMENT_SIZE * 512) // Size of a file data chunk (derived from protocol_frames.h)
+// #define FILE_CHUNK_SIZE                             (FILE_FRAGMENT_SIZE * 512) // Size of a file data chunk (derived from protocol_frames.h)
 
 #define RESEND_TIMEOUT_SEC                          5                     // Seconds before a pending frame is considered for retransmission
 #define RESEND_FILE_METADATA_TIMEOUT_SEC            1
@@ -58,7 +58,7 @@
 
 // --- Client Worker Thread Configuration ---
 #define CLIENT_MAX_THREADS_RECV_SEND_FRAME          1                     // Number of threads dedicated to receiving and sending frames
-#define CLIENT_MAX_TREADS_PROCESS_FRAME             4                     // Number of threads dedicated to processing received frames
+#define CLIENT_MAX_TREADS_PROCESS_FRAME             5                     // Number of threads dedicated to processing received frames
 #define CLIENT_MAX_THREADS_SEND_FRAME               1                     // Number of threads for popping normal send frames from queue
 //---------------------------------------------------------------------------------------------------------
 // --- Client SEND Buffer Sizes ---

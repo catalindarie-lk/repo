@@ -10,7 +10,6 @@
 #include "include/mem_pool.h"
 #include "include/hash.h"
 
-
 //--------------------------------------------------------------------------------------------------------------------------
 void init_table_send_frame(TableSendFrame *table, const size_t size, const size_t max_nodes){
     if(size <= 0){
@@ -153,7 +152,6 @@ uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num)
     return 0;
  
 }
-
 
 //--------------------------------------------------------------------------------------------------------------------------
 void init_table_id(TableIDs *table, size_t size, const size_t max_nodes){
@@ -328,95 +326,82 @@ void ht_print_id(TableIDs *table) {
     LeaveCriticalSection(&table->mutex);
 }
 
-
-
 //--------------------------------------------------------------------------------------------------------------------------
-void init_table_fchunk(TableFileChunk *table, size_t size, const size_t max_nodes) {
+void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_nodes) {
     
     if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table file chunks init\n");
+        fprintf(stderr, "ERROR: Invalid size for hash table file blocks init\n");
         return;
     }
     if(max_nodes <= size){
-        fprintf(stderr, "ERROR: Invalid max_nodes for hash table file chunks init\n");
+        fprintf(stderr, "ERROR: Invalid max_nodes for hash table file blocks init\n");
         return;
     }
     table->size = size;
-    table->entry = (NodeTableFileChunk **)_aligned_malloc(sizeof(NodeTableFileChunk) * size, 64);
+    table->entry = (NodeTableFileBlock **)_aligned_malloc(sizeof(NodeTableFileBlock) * size, 64);
     if(!table->entry){
-        fprintf(stderr, "ERROR: Unable to allocate memory for hash table file chunks init\n");
+        fprintf(stderr, "ERROR: Unable to allocate memory for hash table file blocks init\n");
         return;
     }   
     
-    init_pool(&table->pool_nodes, sizeof(NodeTableFileChunk), max_nodes);
+    init_pool(&table->pool_nodes, sizeof(NodeTableFileBlock), max_nodes);
     for(int i = 0; i < size; i++){
         table->entry[i] = NULL;
     }
-    InitializeCriticalSection(&table->mutex); 
+    InitializeSRWLock(&table->mutex); 
     table->count = 0;
 }
-uint64_t ht_get_hash_fchunk(const uint64_t key, const size_t size) {
+uint64_t ht_get_hash_fblock(const uint64_t key, const size_t size) {
     if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table file chunks\n");
+        fprintf(stderr, "ERROR: Invalid size for hash table file blocks\n");
         return RET_VAL_ERROR;
     }
     return ((uint64_t)key % (uint64_t)size);
 }
-NodeTableFileChunk *ht_insert_fchunk(TableFileChunk *table, const uint64_t key, const uint8_t type, uint8_t *buffer, const size_t buffer_size) {
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint8_t type, char* pool_node, size_t node_size) {
 
-    EnterCriticalSection(&table->mutex);
-    uint64_t index = ht_get_hash_fchunk(key, table->size);
+    AcquireSRWLockExclusive(&table->mutex);
+    uint64_t index = ht_get_hash_fblock(key, table->size);
 
-    NodeTableFileChunk *node = (NodeTableFileChunk*)pool_alloc(&table->pool_nodes);
-    if(!node){
-        LeaveCriticalSection(&table->mutex);
-        fprintf(stderr, "ERROR: fail to allocate memory for hash table file chunks node\n");
+    NodeTableFileBlock *table_node = (NodeTableFileBlock*)pool_alloc(&table->pool_nodes);
+
+    if(!table_node){
+        ReleaseSRWLockExclusive(&table->mutex);
+        fprintf(stderr, "ERROR: failed to allocate memory for file table node\n");
         return NULL;
     }
 
-    node->key = key;
-    node->type = type;
-    node->buffer_size = buffer_size;
-    memcpy(node->buffer, buffer, buffer_size);
-    node->next = (NodeTableFileChunk *)table->entry[index];  // Insert at the head (linked list)
-    table->entry[index] = node;
-    table->count++;
-    LeaveCriticalSection(&table->mutex);
-    return node;
-}
-
-NodeTableFileChunk *ht_insert_fchunk_rd(TableFileChunk *table, const uint64_t key, const uint8_t type) {
-
-    EnterCriticalSection(&table->mutex);
-    uint64_t index = ht_get_hash_fchunk(key, table->size);
-
-    NodeTableFileChunk *node = (NodeTableFileChunk*)pool_alloc(&table->pool_nodes);
-    if(!node){
-        LeaveCriticalSection(&table->mutex);
-        fprintf(stderr, "ERROR: fail to allocate memory for hash table file chunks node\n");
+    if(!pool_node){
+        ReleaseSRWLockExclusive(&table->mutex);
+        fprintf(stderr, "ERROR: invalid node pointer\n");
         return NULL;
     }
 
-    node->key = key;
-    node->type = type;
-    node->buffer_size = sizeof(node->buffer);
-    memset(node->buffer, 0, node->buffer_size);
-    node->next = (NodeTableFileChunk *)table->entry[index];  // Insert at the head (linked list)
-    table->entry[index] = node;
+    table_node->key = key;
+    table_node->type = type;
+    table_node->pool_node = pool_node;
+    table_node->block_size = node_size;
+    // memcpy(node->buffer, buffer, buffer_size);
+    table_node->next = (NodeTableFileBlock *)table->entry[index];  // Insert at the head (linked list)
+    table->entry[index] = table_node;
     table->count++;
-    LeaveCriticalSection(&table->mutex);
-    return node;
+    ReleaseSRWLockExclusive(&table->mutex);
+    return table_node;
 }
-
-void ht_remove_fchunk(TableFileChunk *table, const uint64_t key) {
+void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool) {
     
-    EnterCriticalSection(&table->mutex);
-    uint64_t index = ht_get_hash_fchunk(key, table->size);
-    NodeTableFileChunk *curr = table->entry[index];
-    NodeTableFileChunk *prev = NULL;
+    AcquireSRWLockExclusive(&table->mutex);
+    uint64_t index = ht_get_hash_fblock(key, table->size);
+    NodeTableFileBlock *curr = table->entry[index];
+    NodeTableFileBlock *prev = NULL;
     while (curr) {     
         if (curr->key == key) {
             // Found it
+            curr->key = 0;
+            curr->type = 0;
+            curr->block_size = 0;
+            pool_free(pool, (void*)curr->pool_node);
+            curr->pool_node = NULL;
             if (prev) {
                 prev->next = curr->next;
             } else {
@@ -424,48 +409,30 @@ void ht_remove_fchunk(TableFileChunk *table, const uint64_t key) {
             }
             pool_free(&table->pool_nodes, (void*)curr);
             table->count--;            
-            LeaveCriticalSection(&table->mutex);
+            ReleaseSRWLockExclusive(&table->mutex);
             // fprintf(stdout, "Removed from pool key: %llu\n", key);
             return;
         }
         prev = curr;
         curr = curr->next;
     }
-    LeaveCriticalSection(&table->mutex);
+    ReleaseSRWLockExclusive(&table->mutex);
     return;
 }
-BOOL ht_search_fchunk(TableFileChunk *table, const uint64_t key) {
+BOOL ht_search_fblock(TableFileBlock *table, const uint64_t key) {
     
-    EnterCriticalSection(&table->mutex);
-    uint64_t index = ht_get_hash_fchunk(key, table->size);
-    NodeTableFileChunk *node = table->entry[index];
+    AcquireSRWLockExclusive(&table->mutex);
+    uint64_t index = ht_get_hash_fblock(key, table->size);
+    NodeTableFileBlock *node = table->entry[index];
     while (node) {
         if (node->key == key){
-            LeaveCriticalSection(&table->mutex);
+            ReleaseSRWLockExclusive(&table->mutex);
             return TRUE;
         }           
         node = node->next;
     }
-    LeaveCriticalSection(&table->mutex);
+    ReleaseSRWLockExclusive(&table->mutex);
     return FALSE;
 }
-void ht_clean_fchunk(TableFileChunk *table) {
-    
-    EnterCriticalSection(&table->mutex);
-    NodeTableFileChunk *head = NULL;
-    for (int index = 0; index < HASH_SIZE_ID; index++) {
-        if(table->entry[index]){       
-            NodeTableFileChunk *node = table->entry[index];
-            while (node) {
-                    head = node;                
-                    node = node->next;
-                    pool_free(&table->pool_nodes, (void*)head);
-            }
-            pool_free(&table->pool_nodes, (void*)node);
-            table->count--;
-            table->entry[index] = NULL;
-        }     
-    }
-    LeaveCriticalSection(&table->mutex);
-    return;
-}
+
+

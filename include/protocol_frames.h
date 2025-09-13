@@ -27,7 +27,7 @@
 #define MAX_PAYLOAD_SIZE                    (MAX_FRAME_SIZE - sizeof(FrameHeader))
 #define TEXT_FRAGMENT_SIZE                  (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 4)
 #define FILE_FRAGMENT_SIZE                  (MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 2) - sizeof(uint64_t))
-#define FRAGMENTS_PER_CHUNK                 (64ULL)
+
 
 #define MAX_SACK_COUNT                      ((MAX_PAYLOAD_SIZE - sizeof(uint8_t)) / sizeof(uint64_t)) // Maximum number of sequence numbers in a SACK frame                      
 #define MAX_NAME_SIZE                       255                 // Maximum size for client/server names
@@ -43,8 +43,8 @@
 #define WSARECV_TIMEOUT_MS                  100         // Timeout in milliseconds in the receive frame thread
 #define GETQCOMPL_TIMEOUT                   258L
 
-#define BLOCK_SIZE_CHUNK                    (FILE_FRAGMENT_SIZE * FRAGMENTS_PER_CHUNK)
-#define BLOCK_COUNT_CHUNK                   (SERVER_POOL_SIZE_IOCP_RECV / FRAGMENTS_PER_CHUNK)
+#define SERVER_FILE_BLOCK_SIZE              (FILE_FRAGMENT_SIZE * 64ULL * 4ULL)
+#define CLIENT_FILE_BLOCK_SIZE              (FILE_FRAGMENT_SIZE * 64ULL * 4ULL)
 
 #define OP_RECV ((uint8_t)(1))
 #define OP_SEND ((uint8_t)(2))

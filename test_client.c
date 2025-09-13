@@ -151,7 +151,7 @@ static int init_client_buffers(){
    
     for(int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++){
         memset(&client->fstream[i], 0, sizeof(ClientFileStream));
-        client->fstream[i].chunk_buffer = _aligned_malloc(FILE_CHUNK_SIZE, 64);
+        client->fstream[i].chunk_buffer = _aligned_malloc(CLIENT_FILE_BLOCK_SIZE, 64);
         if(!client->fstream[i].chunk_buffer){
             fprintf(stderr, "CRITICAL ERROR: Failed to pre-allocate memory for fstream (chunk_buffer).\n");
             return RET_VAL_ERROR;
@@ -373,7 +373,7 @@ void close_file_stream(ClientFileStream *fstream){
     memset(&fstream->fname, 0, MAX_PATH);
     fstream->pending_bytes = 0;
     fstream->pending_metadata_seq_num = 0;
-    memset(fstream->chunk_buffer, 0, FILE_CHUNK_SIZE);
+    memset(fstream->chunk_buffer, 0, CLIENT_FILE_BLOCK_SIZE);
     fstream->fstream_busy = FALSE;
     LeaveCriticalSection(&fstream->lock);
     return;
@@ -1088,7 +1088,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
 
         while(fstream->pending_bytes > 0){
 
-            chunk_bytes_to_send = fread(fstream->chunk_buffer, 1, FILE_CHUNK_SIZE, fstream->fp);
+            chunk_bytes_to_send = fread(fstream->chunk_buffer, 1, CLIENT_FILE_BLOCK_SIZE, fstream->fp);
             if (chunk_bytes_to_send == 0 && ferror(fstream->fp)) {
                 snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - error reading from file %s.", full_path);
                 log_to_file(log_message);

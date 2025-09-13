@@ -45,13 +45,11 @@
 
 // --- Server Worker Thread Configuration ---
 #define SERVER_MAX_THREADS_RECV_SEND_FRAME          1
-#define SERVER_MAX_THREADS_PROCESS_FRAME            10
-#define SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT      10
+#define SERVER_MAX_THREADS_PROCESS_FRAME            20
+#define SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT      1
 
 #define SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES    1
 #define SERVER_MAX_THREADS_SEND_MESSAGE_ACK_FRAMES  1
-
-
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server SEND Buffer Sizes ---
@@ -84,8 +82,7 @@
     ClientListData *client_list = &(client_list_obj); \
     ServerBuffers *buffers = &(buffers_obj); \
     ServerThreads *threads = &(threads_obj); \
-    MemPool *pool_file_chunk = &((buffers_obj).pool_file_chunk); \
-    MemPool *pool_iocp_file_chunk = &((buffers_obj).pool_iocp_file_chunk); \
+    MemPool *pool_file_block = &((buffers_obj).pool_file_block); \
     MemPool *pool_iocp_send_context = &((buffers_obj).pool_iocp_send_context); \
     MemPool *pool_iocp_recv_context = &((buffers_obj).pool_iocp_recv_context); \
     MemPool *pool_recv_udp_frame = &((buffers_obj).pool_recv_udp_frame); \
@@ -94,7 +91,7 @@
     QueuePtr *queue_process_fstream = &((buffers_obj).queue_process_fstream); \
     TableIDs *table_file_id = &((buffers_obj).table_file_id); \
     TableIDs *table_message_id = &((buffers_obj).table_message_id); \
-    TableFileChunk *table_file_chunk = &((buffers_obj).table_file_chunk); \
+    TableFileBlock *table_file_block = &((buffers_obj).table_file_block); \
     MemPool *pool_send_udp_frame = &((buffers_obj).pool_send_udp_frame); \
     QueuePtr *queue_send_udp_frame = &((buffers_obj).queue_send_udp_frame); \
     QueuePtr *queue_send_prio_udp_frame = &((buffers_obj).queue_send_prio_udp_frame); \
@@ -155,6 +152,13 @@ enum ClientSlotStatus {
     SLOT_BUSY = 1
 };
 
+enum FileBlockStatus{
+    BLOCK_STATUS_NONE = 0,
+    BLOCK_STATUS_RECEIVEING = 1,
+    BLOCK_STATUS_RECEIVED = 2,
+    BLOCK_STATUS_WRITTEN = 3,
+};
+
 typedef struct{
     FILETIME ft;
     ULARGE_INTEGER prev_uli;
@@ -190,25 +194,36 @@ typedef struct{
 
     uint32_t sid;                       // Session ID associated with this file stream.
     uint32_t fid;                       // File ID, unique identifier for the file associated with this file stream.
-    uint64_t fsize;                     // Total size of the file being transferred.
+    uint64_t file_size;                     // Total size of the file being transferred.
 
-    uint64_t *bitmap;                   // Pointer to an array of uint64_t, where each bit represents a file fragment.
+    uint64_t *received_file_bitmap;     // Pointer to an array of uint64_t, where each bit represents a file fragment.
+    uint64_t *written_file_bitmap;      // Pointer to an array of uint64_t, where each bit represents a file fragment.
                                         // A bit set to 1 means the fragment has been received.
-    uint64_t file_end_frame_seq_num;
+    uint64_t file_bitmap_size;          // Number of uint64_t entries in the bitmap array.
+
+
+    char **file_block;
+    uint64_t *recv_block_bytes;          // Total bytes received for this file so far.
+    uint64_t *recv_block_status;
+
+
+    // uint64_t file_end_frame_seq_num;
     uint64_t fragment_count;            // Total number of fragments in the entire file.
-    uint64_t recv_bytes_count;          // Total bytes received for this file so far.
-    uint64_t written_bytes_count;       // Total bytes written to disk for this file so far.
-    uint64_t bitmap_entries_count;      // Number of uint64_t entries in the bitmap array.
-    uint64_t hashed_chunks_count;
+    uint64_t block_count;
+
+    // uint64_t written_bytes_count;       // Total bytes written to disk for this file so far.
+    uint64_t written_bytes_count_test;       // Total bytes written to disk for this file so far.
+    
+    // uint64_t hashed_chunks_count;
  
-    BOOL fstream_busy;                  // Indicates if this stream channel is currently in use for a transfer.
+    // BOOL fstream_busy;                  // Indicates if this stream channel is currently in use for a transfer.
     uint8_t fstream_err;                // Stores an error code if something goes wrong with the stream.
-    BOOL file_complete;                 // True if the entire file has been received, written and sha256 validated.
-    BOOL file_bytes_received;           // True if all file bytes have been received.
-    BOOL file_bytes_written;            // True if all file bytes were written to disk
-    BOOL file_hash_received;            // True if end frame with sha256 received from the client
-    BOOL file_hash_calculated;          // True if sha256 was calculated by the server
-    BOOL file_hash_validated;           // True if received sha256 is equal to calculated sha256
+    // BOOL file_complete;                 // True if the entire file has been received, written and sha256 validated.
+    // BOOL file_bytes_received;           // True if all file bytes have been received.
+    // BOOL file_bytes_written;            // True if all file bytes were written to disk
+    // BOOL file_hash_received;            // True if end frame with sha256 received from the client
+    // BOOL file_hash_calculated;          // True if sha256 was calculated by the server
+    // BOOL file_hash_validated;           // True if received sha256 is equal to calculated sha256
 
     uint8_t received_sha256[32];        // Buffer for sha256 received from the client
     uint8_t calculated_sha256[32];      // Buffer for sha256 calculated by the server
@@ -220,6 +235,9 @@ typedef struct{
 
     char iocp_full_path[MAX_PATH];
     HANDLE iocp_file_handle;
+    
+    char iocp_full_path_test[MAX_PATH];
+    HANDLE iocp_file_handle_test;
 
     SRWLOCK lock;              // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.
 
@@ -303,6 +321,8 @@ typedef struct {
     HANDLE iocp_socket_handle;
 
     HANDLE iocp_file_handle;
+    HANDLE iocp_file_handle_test;
+
     uint64_t fragment_key;
     SRWLOCK lock_fragment_key;
 
@@ -313,8 +333,7 @@ typedef struct {
 }ServerData;
 
 typedef struct {
-    MemPool pool_file_chunk;
-    MemPool pool_iocp_file_chunk;
+    MemPool pool_file_block;
     MemPool pool_iocp_send_context;
     MemPool pool_iocp_recv_context;
 
@@ -334,14 +353,14 @@ typedef struct {
     TableIDs table_file_id;
     TableIDs table_message_id;
 
-    TableFileChunk table_file_chunk;
+    TableFileBlock table_file_block;
 
 }ServerBuffers;
 
 typedef struct {
 
     HANDLE recv_send_frame[SERVER_MAX_THREADS_RECV_SEND_FRAME];
-    HANDLE file_chunk_written[MAX_SERVER_ACTIVE_FSTREAMS];
+    HANDLE file_chunk_written_test[SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT];
     HANDLE process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
 
     HANDLE send_sack_frame[SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES];
@@ -365,7 +384,7 @@ extern ServerThreads Threads;
 
 // Thread functions
 static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam);
-static DWORD WINAPI func_thread_file_chunk_written(LPVOID lpParam);
+static DWORD WINAPI func_thread_file_chunk_written_test(LPVOID lpParam);
 static DWORD WINAPI func_thread_process_frame(LPVOID lpParam);
 
 static DWORD WINAPI fthread_send_sack_frame(LPVOID lpParam);
@@ -378,7 +397,6 @@ static DWORD WINAPI fthread_send_prio_frame(LPVOID lpParam);
 static DWORD WINAPI fthread_send_ctrl_frame(LPVOID lpParam);
 
 static DWORD WINAPI fthread_client_timeout(LPVOID lpParam);
-static DWORD WINAPI fthread_process_file_stream(LPVOID lpParam);
 static DWORD WINAPI fthread_server_command(LPVOID lpParam);
 
 // Client management functions

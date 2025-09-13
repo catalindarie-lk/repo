@@ -9,7 +9,7 @@
 
 // To mark a fragment as received
 void mark_fragment_received(uint64_t bitmap[], uint64_t fragment_offset, uint32_t fragment_size) {
-    uint64_t bitmap_index = fragment_offset / fragment_size;
+    uint64_t bitmap_index = fragment_offset / (uint64_t)fragment_size;
     bitmap[bitmap_index / 64ULL] |= (1ULL << (bitmap_index % 64ULL));
     //fprintf(stdout, "Marking fragment received %llu, bitmap index: %llu\n", fragment_offset, bitmap_index);
     //fprintf(stdout, "bitmap[%llu] = %llX\n", bitmap_index / 64ULL, bitmap[bitmap_index / 64ULL]);
@@ -19,13 +19,13 @@ void mark_fragment_received(uint64_t bitmap[], uint64_t fragment_offset, uint32_
 // To check if already received
 BOOL check_fragment_received(uint64_t bitmap[], uint64_t fragment_offset, uint32_t fragment_size) {
   
-    uint64_t index = fragment_offset / fragment_size;  
+    uint64_t index = fragment_offset / (uint64_t)fragment_size;  
     //fprintf(stdout, "Check fragment received %llu, bitmap index: %llu\n", fragment_offset, bitmap_index);
     return (bitmap[index / 64ULL] & (1ULL << (index % 64ULL))) != 0ULL;
 }
 
 // Check if bitmap is full (all fragments received)
-BOOL check_bitmap(uint64_t bitmap[], uint32_t fragment_count){
+BOOL check_bitmap(uint64_t bitmap[], uint64_t fragment_count){
 
     // Edge case: An empty file has no fragments, so it's considered complete.
     if (fragment_count == 0) {
@@ -34,7 +34,7 @@ BOOL check_bitmap(uint64_t bitmap[], uint32_t fragment_count){
 
     // Calculate the total number of uint64_t entries needed for the bitmap
     // This is equivalent to bitmap_entries_count in file_init_recv_slot
-    uint64_t num_bitmap_entries = (uint64_t)(fragment_count + 64ULL - 1ULL) / 64ULL;
+    uint64_t num_bitmap_entries =((fragment_count - 1ULL) / 64ULL) + 1ULL;
 
     uint64_t full_chunk_mask = ~0ULL; // Mask for a completely full 64-bit chunk
 
@@ -76,24 +76,24 @@ BOOL check_bitmap(uint64_t bitmap[], uint32_t fragment_count){
     return TRUE;
 }
 
-BOOL check_flag(uint8_t flag[], uint32_t fragment_count){
+// BOOL check_flag(uint8_t flag[], uint32_t fragment_count){
 
-    // Edge case: An empty file has no fragments, so it's considered complete.
-    if (fragment_count == 0) {
-        return TRUE;
-    }
+//     // Edge case: An empty file has no fragments, so it's considered complete.
+//     if (fragment_count == 0) {
+//         return TRUE;
+//     }
 
-    // Calculate the total number of uint64_t entries needed for the bitmap
-    // This is equivalent to bitmap_entries_count in file_init_recv_slot
-    uint64_t num_bitmap_entries = (uint64_t)(fragment_count + 64ULL - 1ULL) / 64ULL;
+//     // Calculate the total number of uint64_t entries needed for the bitmap
+//     // This is equivalent to bitmap_entries_count in file_init_recv_slot
+//     uint64_t num_bitmap_entries = (uint64_t)(fragment_count + 64ULL - 1ULL) / 64ULL;
 
-    for(uint64_t i = 0; i < num_bitmap_entries - 1ULL; i++){
-        if(flag[i] != 1){
-            fprintf(stderr, "Bitmap NOK: Flag missing %llu\n", i);
-            return FALSE;
-        }
-    }
+//     for(uint64_t i = 0; i < num_bitmap_entries - 1ULL; i++){
+//         if(flag[i] != 1){
+//             fprintf(stderr, "Bitmap NOK: Flag missing %llu\n", i);
+//             return FALSE;
+//         }
+//     }
     
-    // If all checks pass, the bitmap indicates all fragments are received.
-    return TRUE;
-}
+//     // If all checks pass, the bitmap indicates all fragments are received.
+//     return TRUE;
+// }

@@ -128,10 +128,10 @@ static uint8_t init_mstream(ServerMessageStream *mstream, const uint32_t session
     mstream->mlen = message_len;
 
     // Calculate total fragments
-    mstream->fragment_count = (mstream->mlen + (uint64_t)TEXT_FRAGMENT_SIZE - 1ULL) / (uint64_t)TEXT_FRAGMENT_SIZE;
+    mstream->fragment_count = ((mstream->mlen - 1) / TEXT_FRAGMENT_SIZE) + 1;
 
     // Calculate number of 64-bit bitmap entries (chunks)
-    mstream->bitmap_entries_count = (mstream->fragment_count + FRAGMENTS_PER_CHUNK - 1ULL) / FRAGMENTS_PER_CHUNK;  
+    mstream->bitmap_entries_count = ((mstream->fragment_count - 1ULL) / 64ULL) + 1;  
     //fprintf(stdout, "Bitmap 64bits entries needed: %llu\n", mstream->bitmap_entries_count);
 
     mstream->bitmap = malloc(mstream->bitmap_entries_count * sizeof(uint64_t));
