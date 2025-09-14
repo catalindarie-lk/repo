@@ -69,6 +69,7 @@ static int init_server_session(){
     server->server_status = STATUS_NONE;
     server->session_timeout = DEFAULT_SESSION_TIMEOUT_SEC;
     server->session_id_counter = 0;
+    server->file_block_count = 0;
     snprintf(server->name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, SERVER_NAME);
 
     return RET_VAL_SUCCESS;
@@ -111,14 +112,10 @@ static int init_server_config(){
         fprintf(stderr, "CreateIoCompletionPort failed socket_handle: %lu\n", GetLastError());
         return RET_VAL_ERROR;
     }
+
     server->iocp_file_handle = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
     if (!server->iocp_file_handle) {
         fprintf(stderr, "CreateIoCompletionPort failed server_file_handle: %lu\n", GetLastError());
-        return RET_VAL_ERROR;
-    }
-    server->iocp_file_handle_test = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 0);
-    if (!server->iocp_file_handle_test) {
-        fprintf(stderr, "CreateIoCompletionPort failed server_file_handle_test: %lu\n", GetLastError());
         return RET_VAL_ERROR;
     }
     return RET_VAL_SUCCESS;
@@ -127,9 +124,6 @@ static int init_server_config(){
 static int init_server_buffers(){
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-    InitializeSRWLock(&server->lock_fragment_key);
-    server->fragment_key = 0;
 
     for(int i = 0; i < MAX_CLIENTS; i++){
         Client *client = &client_list->client[i];
@@ -152,22 +146,22 @@ static int init_server_buffers(){
     init_client_pool(pool_clients, MAX_CLIENTS);
 
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
-    init_pool(pool_iocp_recv_context, sizeof(IOCP_CONTEXT), SERVER_POOL_SIZE_IOCP_RECV);
-    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 256);
+    init_pool(pool_iocp_recv_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_RECV);
+    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 1024);
         
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
 
     init_queue_ptr(queue_process_fstream, MAX_SERVER_ACTIVE_FSTREAMS);
-    init_table_id(table_file_id, 1024, 32768);
+    init_table_id(table_file_id, 1024, 1048576);
     init_table_id(table_message_id, 1024, 32768);
 
-    init_table_fblock(table_file_block, 128, 256);
+    init_table_fblock(table_file_block, 1014, 1024);
     
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
 
     init_pool(pool_send_udp_frame, sizeof(PoolEntrySendFrame), SERVER_POOL_SIZE_SEND);
-    init_pool(pool_iocp_send_context, sizeof(IOCP_CONTEXT), SERVER_POOL_SIZE_IOCP_SEND);
+    init_pool(pool_iocp_send_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_SEND);
     init_queue_ptr(queue_send_udp_frame, SERVER_QUEUE_SIZE_SEND_FRAME);
     init_queue_ptr(queue_send_prio_udp_frame, SERVER_QUEUE_SIZE_SEND_PRIO_FRAME);
     init_queue_ptr(queue_send_ctrl_udp_frame, SERVER_QUEUE_SIZE_SEND_CTRL_FRAME);
@@ -177,12 +171,12 @@ static int init_server_buffers(){
     }
 
     for (int i = 0; i < SERVER_POOL_SIZE_IOCP_RECV; ++i) {
-        IOCP_CONTEXT* recv_context = (IOCP_CONTEXT*)pool_alloc(pool_iocp_recv_context);
+        SocketContext* recv_context = (SocketContext*)pool_alloc(pool_iocp_recv_context);
         if (recv_context == NULL) {
             fprintf(stderr, "Failed to allocate receive context from pool %d. Exiting.\n", i);
             return RET_VAL_ERROR;
         }
-        init_iocp_context(recv_context, OP_RECV); // Initialize the context
+        init_socket_context(recv_context, OP_RECV); // Initialize the context
 
         if (udp_recv_from(server->socket, recv_context) == RET_VAL_ERROR) {
             fprintf(stderr, "Failed to post initial receive operation %d. Exiting.\n", i);
@@ -208,14 +202,6 @@ static int start_threads() {
         }
         SetThreadPriority(threads->recv_send_frame[i], THREAD_PRIORITY_ABOVE_NORMAL);
     }
-    for(int i = 0; i < SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT; i++){
-        threads->file_chunk_written_test[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_file_chunk_written_test, NULL, 0, NULL);
-        if (threads->file_chunk_written_test[i] == NULL) {
-            fprintf(stderr, "Failed to create file_chunk_written_test thread. Error: %d\n", GetLastError());
-            return RET_VAL_ERROR;
-        }
-        SetThreadPriority(threads->file_chunk_written_test[i], THREAD_PRIORITY_ABOVE_NORMAL);
-    }
 
     for(int i = 0; i < SERVER_MAX_THREADS_PROCESS_FRAME; i++){
         threads->process_frame[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_frame, NULL, 0, NULL);
@@ -224,6 +210,15 @@ static int start_threads() {
             return RET_VAL_ERROR;
         }
         SetThreadPriority(threads->process_frame[i], THREAD_PRIORITY_ABOVE_NORMAL);
+    }
+
+    for(int i = 0; i < SERVER_MAX_THREADS_WRITE_FILE_BLOCK; i++){
+        threads->file_block_written[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_file_block_written, NULL, 0, NULL);
+        if (threads->file_block_written[i] == NULL) {
+            fprintf(stderr, "Failed to create 'file_block_written' thread. Error: %d\n", GetLastError());
+            return RET_VAL_ERROR;
+        }
+        SetThreadPriority(threads->file_block_written[i], THREAD_PRIORITY_ABOVE_NORMAL);
     }
 
     for(int i = 0; i < SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES; i++){
@@ -495,7 +490,7 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
             continue;
         }
 
-        IOCP_CONTEXT* context = (IOCP_CONTEXT*)lpOverlapped;
+        SocketContext* socket_context = (SocketContext*)lpOverlapped;
 
          // --- Handle GetQueuedCompletionStatus failures (non-NULL lpOverlapped) ---
         if (!getqcompl_result) {
@@ -506,18 +501,18 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
             } else {
                 fprintf(stderr, "GetQueuedCompletionStatus failed with error: %d\n", wsa_error);
                 // If it's a real error on a specific operation
-                if (context->type == OP_SEND) {
-                    pool_free(pool_iocp_send_context, context);
-                } else if (context->type == OP_RECV) {
-                    // Critical error on a receive context -"retire" this context from the pool.
-                    fprintf(stderr, "Server: Error in RECV operation, attempting re-post context %p...\n", (void*)context);
-                    pool_free(pool_iocp_recv_context, context);
+                if (socket_context->type == OP_SEND) {
+                    pool_free(pool_iocp_send_context, socket_context);
+                } else if (socket_context->type == OP_RECV) {
+                    // Critical error on a receive socket_context -"retire" this socket_context from the pool.
+                    fprintf(stderr, "Server: Error in RECV operation, attempting re-post socket_context %p...\n", (void*)socket_context);
+                    pool_free(pool_iocp_recv_context, socket_context);
                 }
                 continue; // Continue loop to get next completion
             }
         }
         
-        switch(context->type){
+        switch(socket_context->type){
             case OP_RECV:
                 // Validate and dispatch frame
                 if (NrOfBytesTransferred > 0 && NrOfBytesTransferred <= sizeof(UdpFrame)) {
@@ -528,8 +523,8 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                         break;
                     }
                     memset(recv_frame_entry, 0, sizeof(PoolEntryRecvFrame));
-                    memcpy(&recv_frame_entry->frame, context->buffer, NrOfBytesTransferred);
-                    memcpy(&recv_frame_entry->src_addr, &context->addr, sizeof(struct sockaddr_in));
+                    memcpy(&recv_frame_entry->frame, socket_context->buffer, NrOfBytesTransferred);
+                    memcpy(&recv_frame_entry->src_addr, &socket_context->addr, sizeof(struct sockaddr_in));
                     recv_frame_entry->frame_size = NrOfBytesTransferred;
                     
                     GetSystemTimePreciseAsFileTime(&ft);
@@ -555,123 +550,57 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                         }
                     }
 
-                    // if (inet_ntop(AF_INET, &(context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
+                    // if (inet_ntop(AF_INET, &(socket_context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
                     //     strcpy(ip_string_buffer, "UNKNOWN_IP");
                     // }
                     // printf("Server: Received %lu bytes from %s:%d. Type: %u\n",
-                    //        NrOfBytesTransferred, ip_string_buffer, ntohs(context->addr.sin_port), frame_entry.frame.header.frame_type);
+                    //        NrOfBytesTransferred, ip_string_buffer, ntohs(socket_context->addr.sin_port), frame_entry.frame.header.frame_type);
 
                 } else {
                     // 0 bytes transferred (e.g., graceful shutdown, empty packet)
-                    fprintf(stdout, "Server: Receive operation completed with 0 bytes for context %p. Re-posting.\n", (void*)context);
+                    fprintf(stdout, "Server: Receive operation completed with 0 bytes for socket_context %p. Re-posting.\n", (void*)socket_context);
                 }
 
-                // *** CRITICAL: Re-post the receive operation using the SAME context ***
+                // *** CRITICAL: Re-post the receive operation using the SAME socket_context ***
                 // This ensures the buffer is continuously available for incoming data.
-                if (udp_recv_from(server->socket, context) == RET_VAL_ERROR){
-                    fprintf(stderr, "Critical: WSARecvFrom re-issue failed for context %p: %d. Freeing.\n", (void*)context, WSAGetLastError());
-                    // This is a severe problem. Retire the context from the pool.
-                    pool_free(pool_iocp_recv_context, context); // Return to pool if it fails
+                if (udp_recv_from(server->socket, socket_context) == RET_VAL_ERROR){
+                    fprintf(stderr, "Critical: WSARecvFrom re-issue failed for socket_context %p: %d. Freeing.\n", (void*)socket_context, WSAGetLastError());
+                    // This is a severe problem. Retire the socket_context from the pool.
+                    pool_free(pool_iocp_recv_context, socket_context); // Return to pool if it fails
                     break;
                 }
-                // refill the recv context mem pool when it drops bellow half
+                // refill the recv socket_context mem pool when it drops bellow half
                 if(pool_iocp_recv_context->free_blocks < (pool_iocp_recv_context->block_count / 2)){
                     refill_recv_iocp_pool(server->socket, pool_iocp_recv_context);
                 }
                 break; // End of OP_RECV case
 
             case OP_SEND:
-                // For send completions, simply free the context
+                // For send completions, simply free the socket_context
                 if (NrOfBytesTransferred > 0) {
-                    // if (inet_ntop(AF_INET, &(context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
+                    // if (inet_ntop(AF_INET, &(socket_context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
                     //     strcpy(ip_string_buffer, "UNKNOWN_IP");
                     // }
                     // printf("Server: Sent %lu bytes to %s:%d (Message: '%s')\n",
-                    //        NrOfBytesTransferred, ip_string_buffer, ntohs(context->addr.sin_port), context->buffer);
+                    //        NrOfBytesTransferred, ip_string_buffer, ntohs(socket_context->addr.sin_port), socket_context->buffer);
                 } else {
                     fprintf(stderr, "Server: Send operation completed with 0 bytes or error.\n");
                 }
-                pool_free(pool_iocp_send_context, context);
+                pool_free(pool_iocp_send_context, socket_context);
                 break;
 
             default:
                 fprintf(stderr, "Server: Unknown operation type in completion.\n");
-                // Free context if it's unknown and shouldn't be re-used, to prevent leak
-                pool_free(pool_iocp_send_context, context);
+                // Free socket_context if it's unknown and shouldn't be re-used, to prevent leak
+                pool_free(pool_iocp_send_context, socket_context);
                 break;
-        } // end of switch(context->type)
+        } // end of switch(socket_context->type)
     } // end of while (server->server_status == STATUS_READY)
            
     fprintf(stdout, "recv thread exiting\n");
     _endthreadex(0);
     return 0;
 }
-
-// --- IOCP Write block ---
-static DWORD WINAPI func_thread_file_chunk_written_test(LPVOID lpParam) {
-
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-    
-    HANDLE CompletitionPort = server->iocp_file_handle_test;
-    DWORD NrOfBytesWritten;
-    ULONG_PTR lpCompletitionKey;
-    LPOVERLAPPED lpOverlapped;
-    
-    while (server->server_status == STATUS_READY) {
-
-        BOOL getqcompl_result = GetQueuedCompletionStatus(
-            CompletitionPort,
-            &NrOfBytesWritten,
-            &lpCompletitionKey,
-            &lpOverlapped,
-            INFINITE// WSARECV_TIMEOUT_MS
-        );
-
-        if (!getqcompl_result) {
-            DWORD err = GetLastError();
-            fprintf(stderr, "I/O failed with error: %lu\n", err);
-            continue;
-        }
-        if (!lpOverlapped) {
-            fprintf(stderr, "ERROR: NULL pOverlapped received. IOCP may be shutting down.\n");
-            continue;
-        }
-        
-        NodeTableFileBlock *node = (NodeTableFileBlock*)lpOverlapped;
-        ServerFileStream *fstream = (ServerFileStream*)lpCompletitionKey;
-
-        if (!node) {
-            fprintf(stderr, "ERROR: NULL node received in file write completion. Skipping.\n");
-            continue;
-        }
-        if (!fstream) {
-            fprintf(stderr, "ERROR: NULL fstream received in file write completion. Skipping.\n");
-            continue;
-        }
-        
-        if(node->type == OP_WR){
-            AcquireSRWLockExclusive(&fstream->lock);
-            // if(!ht_search_fblock(table_file_block, node->key)){
-            //     fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
-            // }
-            // uint64_t block_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
-            // uint64_t block_nr = block_offset / SERVER_FILE_BLOCK_SIZE;
-            ht_remove_fblock(table_file_block, node->key, pool_file_block);
-
-            fstream->written_bytes_count_test += NrOfBytesWritten;
-            if(/*fstream->fstream_busy &&*/ fstream->written_bytes_count_test == fstream->file_size){
-                check_bitmap(fstream->received_file_bitmap, fstream->fragment_count);
-                ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
-                close_fstream(fstream);
-            }
-            ReleaseSRWLockExclusive(&fstream->lock);
-        }
-    }
-    fprintf(stdout, "recv thread exiting\n");
-    _endthreadex(0);
-    return 0;
-}
-
 // --- Processes a received frame ---
 static DWORD WINAPI func_thread_process_frame(LPVOID lpParam) {
 
@@ -902,6 +831,70 @@ static DWORD WINAPI func_thread_process_frame(LPVOID lpParam) {
                 break;
         }
     }
+    _endthreadex(0);
+    return 0;
+}
+// --- IOCP Write file block ---
+static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
+
+    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    
+    HANDLE CompletitionPort = server->iocp_file_handle;
+    DWORD NrOfBytesWritten;
+    ULONG_PTR lpCompletitionKey;
+    LPOVERLAPPED lpOverlapped;
+    
+    while (server->server_status == STATUS_READY) {
+
+        BOOL getqcompl_result = GetQueuedCompletionStatus(
+            CompletitionPort,
+            &NrOfBytesWritten,
+            &lpCompletitionKey,
+            &lpOverlapped,
+            INFINITE// WSARECV_TIMEOUT_MS
+        );
+
+        if (!getqcompl_result) {
+            DWORD err = GetLastError();
+            fprintf(stderr, "I/O failed with error: %lu\n", err);
+            continue;
+        }
+        if (!lpOverlapped) {
+            fprintf(stderr, "ERROR: NULL pOverlapped received. IOCP may be shutting down.\n");
+            continue;
+        }
+        
+        NodeTableFileBlock *node = (NodeTableFileBlock*)lpOverlapped;
+        ServerFileStream *fstream = (ServerFileStream*)lpCompletitionKey;
+
+        if (!node) {
+            fprintf(stderr, "ERROR: NULL node received in file write completion. Skipping.\n");
+            continue;
+        }
+        if (!fstream) {
+            fprintf(stderr, "ERROR: NULL fstream received in file write completion. Skipping.\n");
+            continue;
+        }
+        
+        if(node->type == OP_WR){
+            AcquireSRWLockExclusive(&fstream->lock);
+            // if(!ht_search_fblock(table_file_block, node->key)){
+            //     fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
+            // }
+            // uint64_t block_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
+            // uint64_t block_nr = block_offset / SERVER_FILE_BLOCK_SIZE;
+            ht_remove_fblock(table_file_block, node->key, pool_file_block);
+
+            fstream->written_bytes_count += NrOfBytesWritten;
+            if(fstream->written_bytes_count == fstream->file_size){
+                check_bitmap(fstream->received_file_bitmap, fstream->fragment_count);
+                ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
+                close_fstream(fstream);
+            }
+            ReleaseSRWLockExclusive(&fstream->lock);
+        }
+    }
+    fprintf(stdout, "recv thread exiting\n");
     _endthreadex(0);
     return 0;
 }

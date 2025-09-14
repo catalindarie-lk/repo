@@ -111,6 +111,7 @@ void pool_free(MemPool* pool, void* ptr) {
     ReleaseSRWLockExclusive(&pool->lock);
     return;
 }
+
 void pool_destroy(MemPool* pool) {
     // Check for NULL pool pointer
     if (pool == NULL) {

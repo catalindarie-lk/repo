@@ -216,7 +216,7 @@ void close_mstream(ServerMessageStream *mstream) {
         mstream->bitmap = NULL; // Set the pointer to NULL to prevent dangling pointers.
     }
     mstream->busy = FALSE; // Reset the busy flag.
-    mstream->stream_err = STREAM_ERR_NONE; // Reset error status.
+    mstream->stream_err = 0; // Reset error status.
     mstream->sid = 0; // Reset session ID.
     mstream->mid = 0; // Reset message ID.
     mstream->mlen = 0; // Reset message length.

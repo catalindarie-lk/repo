@@ -210,7 +210,7 @@ typedef struct{
     HANDLE hevent_connection_established;       // Event handle for connection established state
     HANDLE hevent_connection_closed;            // Event handle for connection closed state
 
-    IOCP_CONTEXT iocp_context;                  // IOCP context structure
+    SocketContext iocp_context;                  // IOCP context structure
     HANDLE iocp_handle;                         // Handle to the IOCP port
 
     ClientFileStream fstream[CLIENT_MAX_ACTIVE_FSTREAMS]; // Array of active file streams
@@ -273,7 +273,6 @@ extern ClientThreads Threads;                   // Global instance of client thr
 
 // --- Function Prototypes ---
 // Functions related to sequence number generation and session management
-uint64_t get_new_seq_num();                     // Generates and returns a new unique sequence number for frames
 int init_client_session();                      // Initializes the client session, sockets, pools, queues, etc.
 int reset_client_session();                     // Resets the client session to a clean state
 

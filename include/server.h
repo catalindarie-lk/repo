@@ -46,7 +46,7 @@
 // --- Server Worker Thread Configuration ---
 #define SERVER_MAX_THREADS_RECV_SEND_FRAME          1
 #define SERVER_MAX_THREADS_PROCESS_FRAME            20
-#define SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT      1
+#define SERVER_MAX_THREADS_WRITE_FILE_BLOCK         1
 
 #define SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES    1
 #define SERVER_MAX_THREADS_SEND_MESSAGE_ACK_FRAMES  1
@@ -102,10 +102,6 @@
     ServerClientPool *pool_clients = &((server_obj).pool_clients); \
 // end of #define PARSE_GLOBAL_DATA // End marker for the macro definition
 
-// QueuePtr *queue_message_ack_frame = &((buffers_obj).queue_message_ack_frame); \
-    // MemPool *pool_ack_frame = &((buffers_obj).pool_ack_frame); \
-    // QueuePtr *queue_ack_frame = &((buffers_obj).queue_ack_frame); \
-
 enum Status{
     STATUS_NONE = 0,
     STATUS_BUSY = 1,
@@ -117,33 +113,6 @@ typedef uint8_t ClientConnection;
 enum ClientConnection {
     CLIENT_DISCONNECTED = 0,
     CLIENT_CONNECTED = 1
-};
-
-typedef uint8_t StreamChannelError;
-enum StreamChannelError{
-    STREAM_ERR_NONE = 0,
-    STREAM_ERR_FP = 1,
-    STREAM_ERR_FSEEK = 2,
-    STREAM_ERR_FWRITE = 3,
-    STREAM_ERR_FREAD = 4,
-
-    STREAM_ERR_SHA256_MISMATCH = 7,
-
-    STREAM_ERR_BITMAP_MALLOC = 10,
-    STREAM_ERR_FLAG_MALLOC = 11,
-    STREAM_ERR_CHUNK_PTR_MALLOC = 12,
-
-    STREAM_ERR_MALFORMED_DATA = 13,
-    STREAM_ERR_INTERNAL_COPY  = 14,
-
-    // STREAM_ERR_FILENAME = 20,
-    STREAM_ERR_DRIVE_PARTITION = 20,
-    STREAM_ERR_ROOT_FOLDER_CREATE = 22,
-    STREAM_ERR_FILENAME_EXIST = 21,
-
-    STREAM_ERR_QUEUE_PUSH = 30,
-    STREAM_ERR_QUEUE_POP = 31
-    
 };
 
 typedef uint8_t ClientSlotStatus;
@@ -206,25 +175,11 @@ typedef struct{
     uint64_t *recv_block_bytes;          // Total bytes received for this file so far.
     uint64_t *recv_block_status;
 
-
-    // uint64_t file_end_frame_seq_num;
     uint64_t fragment_count;            // Total number of fragments in the entire file.
     uint64_t block_count;
 
-    // uint64_t written_bytes_count;       // Total bytes written to disk for this file so far.
-    uint64_t written_bytes_count_test;       // Total bytes written to disk for this file so far.
+    uint64_t written_bytes_count;       // Total bytes written to disk for this file so far.
     
-    // uint64_t hashed_chunks_count;
- 
-    // BOOL fstream_busy;                  // Indicates if this stream channel is currently in use for a transfer.
-    uint8_t fstream_err;                // Stores an error code if something goes wrong with the stream.
-    // BOOL file_complete;                 // True if the entire file has been received, written and sha256 validated.
-    // BOOL file_bytes_received;           // True if all file bytes have been received.
-    // BOOL file_bytes_written;            // True if all file bytes were written to disk
-    // BOOL file_hash_received;            // True if end frame with sha256 received from the client
-    // BOOL file_hash_calculated;          // True if sha256 was calculated by the server
-    // BOOL file_hash_validated;           // True if received sha256 is equal to calculated sha256
-
     uint8_t received_sha256[32];        // Buffer for sha256 received from the client
     uint8_t calculated_sha256[32];      // Buffer for sha256 calculated by the server
 
@@ -232,12 +187,9 @@ typedef struct{
     uint32_t rpath_len;
     char fname[MAX_PATH];               // Array to store the file name+path.
     uint32_t fname_len;
-
+    
     char iocp_full_path[MAX_PATH];
     HANDLE iocp_file_handle;
-    
-    char iocp_full_path_test[MAX_PATH];
-    HANDLE iocp_file_handle_test;
 
     SRWLOCK lock;              // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.
 
@@ -315,16 +267,13 @@ typedef struct {
     uint8_t server_status;                // Status of the server (e.g., busy, ready, error)
     uint32_t session_timeout;           // Timeout period for client inactivity
     volatile uint32_t session_id_counter;   // Global counter for unique session IDs
+    volatile uint64_t file_block_count;   // Global counter for unique file block IDs
     char name[MAX_NAME_SIZE];               // Human-readable server name
     
-    IOCP_CONTEXT iocp_context;
     HANDLE iocp_socket_handle;
-
     HANDLE iocp_file_handle;
-    HANDLE iocp_file_handle_test;
 
-    uint64_t fragment_key;
-    SRWLOCK lock_fragment_key;
+    
 
     ServerFstreamPool pool_fstreams;
     ServerMstreamPool pool_mstreams;
@@ -360,7 +309,7 @@ typedef struct {
 typedef struct {
 
     HANDLE recv_send_frame[SERVER_MAX_THREADS_RECV_SEND_FRAME];
-    HANDLE file_chunk_written_test[SERVER_MAX_THREADS_WRITE_IOCP_FRAGMENT];
+    HANDLE file_block_written[SERVER_MAX_THREADS_WRITE_FILE_BLOCK];
     HANDLE process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
 
     HANDLE send_sack_frame[SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES];
@@ -384,8 +333,8 @@ extern ServerThreads Threads;
 
 // Thread functions
 static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam);
-static DWORD WINAPI func_thread_file_chunk_written_test(LPVOID lpParam);
 static DWORD WINAPI func_thread_process_frame(LPVOID lpParam);
+static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam);
 
 static DWORD WINAPI fthread_send_sack_frame(LPVOID lpParam);
 static DWORD WINAPI fthread_scan_for_trailing_sack(LPVOID lpParam);

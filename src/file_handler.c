@@ -121,6 +121,11 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
 
+    if(!fstream || !frame || !client_addr){
+        fprintf(stderr, "ERROR: init_fstream - Invalid NULL parameter(s)!\n");
+        return RET_VAL_ERROR;
+    }
+
     AcquireSRWLockExclusive(&fstream->lock);
 
     // fstream->fstream_busy = TRUE;
@@ -136,7 +141,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     if (received_rpath_len >= MAX_PATH) {
         fprintf(stderr, "ERROR: init_fstream - Received rpath length (%u) is too large for buffer (max %d).\n",
                 received_rpath_len, MAX_PATH - 1);
-        fstream->fstream_err = STREAM_ERR_MALFORMED_DATA; // Define a new error for this
         fstream->rpath_len = 0;
         fstream->rpath[0] = '\0'; // Ensure it's null-terminated even on error
         goto exit_err; // Exit function on critical error
@@ -150,7 +154,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         if (result < 0 || (size_t)result != received_rpath_len) {
             fprintf(stderr, "ERROR: init_fstream - Failed to copy rpath: snprintf returned %d, expected %u.\n",
                     result, received_rpath_len);
-            fstream->fstream_err = STREAM_ERR_INTERNAL_COPY; // Define a new error
             fstream->rpath_len = 0;
             fstream->rpath[0] = '\0';
             goto exit_err;
@@ -166,7 +169,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     if (received_fname_len >= MAX_PATH) {
         fprintf(stderr, "ERROR: init_fstream - Received fname length (%u) is too large for buffer (max %d).\n",
                 received_fname_len, MAX_PATH - 1);
-        fstream->fstream_err = STREAM_ERR_MALFORMED_DATA;
         fstream->fname_len = 0;
         fstream->fname[0] = '\0';
         goto exit_err;
@@ -177,7 +179,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         if (result < 0 || (size_t)result != received_fname_len) {
             fprintf(stderr, "ERROR: init_fstream - Failed to copy fname: snprintf returned %d, expected %u.\n",
                     result, received_fname_len);
-            fstream->fstream_err = STREAM_ERR_INTERNAL_COPY;
             fstream->fname_len = 0;
             fstream->fname[0] = '\0';
             goto exit_err;
@@ -187,7 +188,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     }
     // --- End of string copy and validation ---
 
-    fstream->fstream_err = STREAM_ERR_NONE;
     memcpy(&fstream->client_addr, client_addr, sizeof(struct sockaddr_in));
 
     // Calculate total fragments
@@ -203,7 +203,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     // Allocate memory for bitmap
     fstream->received_file_bitmap = malloc(fstream->file_bitmap_size * sizeof(uint64_t));
     if(fstream->received_file_bitmap == NULL){
-        fstream->fstream_err = STREAM_ERR_BITMAP_MALLOC;
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file bitmap mem!!!\n");
         goto exit_err;
     }
@@ -211,7 +210,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
 
     fstream->file_block = malloc(fstream->block_count * sizeof(char*));
     if(fstream->file_block == NULL){
-        fstream->fstream_err = STREAM_ERR_CHUNK_PTR_MALLOC;
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file block mem!!!\n");
         goto exit_err;
     }
@@ -219,7 +217,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
 
     fstream->recv_block_bytes = malloc(fstream->block_count * sizeof(uint64_t));
     if(fstream->recv_block_bytes == NULL){
-        fstream->fstream_err = STREAM_ERR_CHUNK_PTR_MALLOC;
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file recv block bytes!!!\n");
         goto exit_err;
     }
@@ -227,7 +224,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
 
     fstream->recv_block_status = malloc(fstream->block_count * sizeof(uint64_t));
     if(fstream->recv_block_status == NULL){
-        fstream->fstream_err = STREAM_ERR_CHUNK_PTR_MALLOC;
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file recv block status!!!\n");
         goto exit_err;
     }
@@ -235,7 +231,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
 
     if(!DriveExists(SERVER_PARTITION_DRIVE)){
         fprintf(stderr, "ERROR: init_fstream - Drive Partition \"%s\" doesn't exit\n", SERVER_PARTITION_DRIVE);
-        fstream->fstream_err = STREAM_ERR_DRIVE_PARTITION;
         goto exit_err;
     }
 
@@ -253,18 +248,17 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         goto exit_err;
     }
 
-    snprintf(fstream->iocp_full_path_test, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);
+    snprintf(fstream->iocp_full_path, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);
 
-    #ifdef FILE_OVERWRITE
-        if(FileExists(fstream->iocp_full_path_test)){
-            fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->iocp_full_path_test);
-            fstream->fstream_err = STREAM_ERR_FILENAME_EXIST;
+    #ifndef FILE_OVERWRITE
+        if(FileExists(fstream->iocp_full_path)){
+            fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->iocp_full_path);
             goto exit_err;
         }
     #endif
     
-    fstream->iocp_file_handle_test = CreateFile(
-        fstream->iocp_full_path_test,            // File path
+    fstream->iocp_file_handle = CreateFile(
+        fstream->iocp_full_path,            // File path
         GENERIC_WRITE,                      // Access: write
         0,                                  // No sharing
         NULL,                               // Default security
@@ -273,12 +267,11 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         NULL                                // No template
     );
     
-    if (fstream->iocp_file_handle_test == INVALID_HANDLE_VALUE) {
-        fstream->fstream_err = STREAM_ERR_FWRITE;
-        fprintf(stderr, "ERROR: init_fstream - Failed to open file \"%s\". Error code: %lu\n", fstream->iocp_full_path_test, GetLastError());
+    if (fstream->iocp_file_handle == INVALID_HANDLE_VALUE) {
+        fprintf(stderr, "ERROR: init_fstream - Failed to open file \"%s\". Error code: %lu\n", fstream->iocp_full_path, GetLastError());
         goto exit_err;
     }
-    if (!CreateIoCompletionPort(fstream->iocp_file_handle_test, server->iocp_file_handle_test, (uintptr_t)fstream, 0)) {
+    if (!CreateIoCompletionPort(fstream->iocp_file_handle, server->iocp_file_handle, (uintptr_t)fstream, 0)) {
         fprintf(stderr, "Failed to associate file_test with IOCP: %lu\n", GetLastError());
         goto exit_err;
     }
@@ -288,19 +281,12 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
 
 exit_err:
 
-    if(fstream->fstream_err == STREAM_ERR_FILENAME_EXIST){
-        close_fstream(fstream);
-        ReleaseSRWLockExclusive(&fstream->lock);
-        return ERR_EXISTING_FILE;
-    } else {
-        close_fstream(fstream);
-        ReleaseSRWLockExclusive(&fstream->lock);
-        return ERR_STREAM_INIT;
-    }
+    close_fstream(fstream);
+    ReleaseSRWLockExclusive(&fstream->lock);
+    return RET_VAL_ERROR;
 }
 void free_fstream(ServerFstreamPool* pool, ServerFileStream* fstream) {
-    // Handle NULL pointer case
-
+    
     if (!pool) {
         fprintf(stderr, "ERROR: Attempt to free_fstream() in an unallocated pool!\n");
         return;
@@ -312,7 +298,6 @@ void free_fstream(ServerFstreamPool* pool, ServerFileStream* fstream) {
     AcquireSRWLockExclusive(&pool->lock);
     // Calculate the index of the block to be freed
     uint64_t index = (uint64_t)(((char*)fstream - (char*)pool->fstream) / sizeof(ServerFileStream));
-    // uint64_t index = (uint64_t)(fstream - pool->fstream);
     // Validate the index and usage flag for safety and debugging
     if (index >= pool->block_count || pool->used[index] == FREE_BLOCK) {       
         fprintf(stderr, "CRITICAL ERROR: Attempt to free invalid fstream from pool!\n");
@@ -336,13 +321,19 @@ void close_fstream(ServerFileStream *fstream) {
         fprintf(stderr, "ERROR: Trying to clean a NULL pointer file stream\n");
         return;
     }
+
     if(fstream->received_file_bitmap){
         free(fstream->received_file_bitmap);
         fstream->received_file_bitmap = NULL;
     }
+
     if(fstream->block_count > 0){
         if(fstream->file_block){
             for(uint64_t i = 0; i < fstream->block_count; i++){
+                if(!fstream->file_block[i]){
+                    continue;
+                }
+                pool_free(pool_file_block, fstream->file_block[i]);
                 fstream->file_block[i] = NULL;
             }
         }
@@ -369,30 +360,14 @@ void close_fstream(ServerFileStream *fstream) {
     CloseHandle(fstream->iocp_file_handle);
     fstream->iocp_file_handle = NULL;
     memset(&fstream->iocp_full_path, 0, MAX_PATH);
-    CloseHandle(fstream->iocp_file_handle_test);
-    memset(&fstream->iocp_full_path_test, 0, MAX_PATH);
-    fstream->iocp_file_handle_test = NULL;
     fstream->sid = 0;                                   // Session ID associated with this file stream.
     fstream->fid = 0;                                   // File ID, unique identifier for the file associated with this file stream.
     fstream->file_size = 0;                                 // Total size of the file being transferred.
-    // fstream->file_end_frame_seq_num = 0;
     fstream->fragment_count = 0;                    // Total number of fragments in the entire file.
     fstream->block_count = 0;
-    // fstream->recv_bytes_count = 0;                  // Total bytes received for this file so far.
-    
-    // fstream->written_bytes_count = 0;               // Total bytes written to disk for this file so far.
-    fstream->written_bytes_count_test = 0;               // Total bytes written to disk for this file so far.
-
     fstream->file_bitmap_size = 0;              // Number of uint64_t entries in the bitmap array.
-    // fstream->hashed_chunks_count = 0;
- 
-    fstream->fstream_err = STREAM_ERR_NONE;         // Stores an error code if something goes wrong with the stream.
-    // fstream->file_complete = FALSE;                 // True if the entire file has been received and written.
-    // fstream->file_bytes_received = FALSE;
-    // fstream->file_bytes_written = FALSE;
-    // fstream->file_hash_received = FALSE;
-    // fstream->file_hash_calculated = FALSE;
-    // fstream->file_hash_validated = FALSE;
+
+    fstream->written_bytes_count = 0;       // Total bytes written to disk for this file so far.
 
     memset(&fstream->received_sha256, 0, 32);
     memset(&fstream->calculated_sha256, 0, 32);
@@ -401,8 +376,6 @@ void close_fstream(ServerFileStream *fstream) {
     fstream->fname_len = 0;
     memset(&fstream->fname, 0, MAX_PATH);
     memset(&fstream->client_addr, 0, sizeof(struct sockaddr_in));
-    // fstream->file_end_frame_seq_num = 0;
-    // fstream->fstream_busy = FALSE;                  // Indicates if this stream channel is currently in use for a transfer.    
     free_fstream(pool_fstreams, fstream);
     return;
 }
@@ -489,14 +462,12 @@ int handle_file_metadata(Client *client, UdpFrame *frame) {
         goto exit_err;
     }
 
-    op_code = init_fstream(fstream, frame, &client->client_addr);
-    if(op_code != RET_VAL_SUCCESS){
-        fprintf(stderr, "Error initializing file stream for fID: %u sID: %u\n", recv_file_id, recv_session_id);
+    if(init_fstream(fstream, frame, &client->client_addr) == RET_VAL_ERROR){
+        op_code = ERR_STREAM_INIT;
         goto exit_err;
     }
 
     if(ht_insert_id(table_file_id, recv_session_id, recv_file_id, ID_WAITING_FRAGMENTS) == RET_VAL_ERROR){
-        fprintf(stderr, "Failed to allocate memory for file ID in hash table\n");
         op_code = ERR_MEMORY_ALLOCATION;
         goto exit_err;
     }
@@ -610,14 +581,13 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
     if(fstream->recv_block_status[block_nr] == BLOCK_STATUS_NONE && fstream->recv_block_bytes[block_nr] == 0){
         fstream->file_block[block_nr] = NULL;
         fstream->file_block[block_nr] = pool_alloc(pool_file_block);
-        if(fstream->file_block[block_nr]){
-            fstream->recv_block_status[block_nr] = BLOCK_STATUS_RECEIVEING;
-        } else {
+        if(!fstream->file_block[block_nr]){
             ReleaseSRWLockExclusive(&fstream->lock);
             fprintf(stderr, "Failed to allocate memory for file block from pool\n");
             op_code = ERR_RESOURCE_LIMIT;
-            goto exit_err;
+            goto exit_err;    
         }
+        fstream->recv_block_status[block_nr] = BLOCK_STATUS_RECEIVEING;
     }
 
     memcpy(fstream->file_block[block_nr] + block_fragment_offset, frame->payload.file_fragment.bytes, recv_fragment_size);
@@ -630,10 +600,7 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
     } else if (fstream->recv_block_bytes[block_nr] == block_size){
         // fprintf(stderr, "Received full block nr: %llu; Block Offset: %llu; Block size: %llu\n", block_nr, block_offset, block_size);
 
-        AcquireSRWLockExclusive(&server->lock_fragment_key);
-        server->fragment_key++;
-        NodeTableFileBlock *node_test = ht_insert_fblock(table_file_block, server->fragment_key, OP_WR, fstream->file_block[block_nr], block_size);
-        ReleaseSRWLockExclusive(&server->lock_fragment_key);
+        NodeTableFileBlock *node_test = ht_insert_fblock(table_file_block, InterlockedIncrement64(&server->file_block_count), fstream->sid, fstream->fid, OP_WR, fstream->file_block[block_nr], block_size);
         
         fstream->file_block[block_nr] = NULL;
         fstream->recv_block_bytes[block_nr] = 0;
@@ -651,8 +618,8 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
         node_test->overlapped.OffsetHigh = (DWORD)(block_offset >> 32);       // Upper 32 bits
 
         BOOL result = WriteFile(
-            fstream->iocp_file_handle_test,
-            node_test->pool_node,
+            fstream->iocp_file_handle,
+            node_test->block_data,
             node_test->block_size,
             NULL,
             &node_test->overlapped
@@ -661,7 +628,7 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
             DWORD err = GetLastError();
             if (err != ERROR_IO_PENDING) {
                 fprintf(stderr, "ERROR: Initiating async write to test file: %lu\n", err);
-                ht_remove_fblock(table_file_block, server->fragment_key, pool_file_block);
+                ht_remove_fblock(table_file_block, server->file_block_count, pool_file_block);
                 op_code = ERR_INTERNAL_ERROR;
                 goto exit_err;
             }

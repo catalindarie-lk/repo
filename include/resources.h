@@ -51,12 +51,12 @@ __declspec(align(64))typedef struct{
     uint64_t timestamp; // Timestamp when the frame was received
 }PoolEntryRecvFrame;
 
-__declspec(align(64))typedef struct{
-    union{
-        PoolEntrySendFrame send;
-        PoolEntryRecvFrame recv;
-    } entry;
-}FRAME_CONTEXT;
+// __declspec(align(64))typedef struct{
+//     union{
+//         PoolEntrySendFrame send;
+//         PoolEntryRecvFrame recv;
+//     } entry;
+// }FRAME_CONTEXT;
  
 // Enumeration for operation type within IOCP_CONTEXT
 
@@ -67,19 +67,15 @@ __declspec(align(64))typedef struct {
     struct sockaddr_in addr;  // Source/Destination address
     int addr_len;
     uint8_t type;      // To distinguish between send and receive operations
-} IOCP_CONTEXT;
+} SocketContext;
 //--------------------------------------------------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------------------------------------------------
-void init_iocp_context(IOCP_CONTEXT *iocp_context, uint8_t type);
-int udp_recv_from(const SOCKET src_socket, IOCP_CONTEXT *iocp_context);
+void init_socket_context(SocketContext *socket_context, uint8_t type);
+int udp_recv_from(const SOCKET src_socket, SocketContext *socket_context);
 int udp_send_to(const char *data, size_t data_len, const SOCKET src_socket, const struct sockaddr_in *dest_addr, MemPool *mem_pool);
-
 void refill_recv_iocp_pool(const SOCKET src_socket, MemPool *mem_pool);
-
 int send_pool_frame(PoolEntrySendFrame *entry, MemPool *mem_pool);
-
 void wait_usec(const long long time_usec);
-
 uint64_t calculate_period_usec(const double speed_mbps, const int bytes_per_packet);
 
 

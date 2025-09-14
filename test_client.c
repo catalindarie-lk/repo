@@ -38,10 +38,6 @@ const char *client_ip = "192.168.0.240";
 // const char *client_ip = "127.0.0.1";
 
 
-static uint64_t get_new_seq_num(){
-    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
-    return InterlockedIncrement64(&client->frame_count);
-}
 int init_client_session(){
 
     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
@@ -129,7 +125,7 @@ static int init_client_buffers(){
 
     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
 
-    init_pool(pool_send_iocp_context, sizeof(IOCP_CONTEXT), CLIENT_POOL_SIZE_IOCP_SEND);
+    init_pool(pool_send_iocp_context, sizeof(SocketContext), CLIENT_POOL_SIZE_IOCP_SEND);
     s_init_pool(pool_send_udp_frame, sizeof(PoolEntrySendFrame), CLIENT_POOL_SIZE_SEND);
 
     s_init_queue_ptr(queue_send_udp_frame, CLIENT_QUEUE_SIZE_SEND_FRAME);
@@ -137,7 +133,7 @@ static int init_client_buffers(){
     s_init_queue_ptr(queue_send_ctrl_udp_frame, CLIENT_QUEUE_SIZE_SEND_CTRL_FRAME);
     init_table_send_frame(table_send_udp_frame, CLIENT_POOL_SIZE_SEND, CLIENT_POOL_SIZE_SEND * 4);
 
-    init_pool(pool_recv_iocp_context, sizeof(IOCP_CONTEXT), CLIENT_POOL_SIZE_IOCP_RECV);
+    init_pool(pool_recv_iocp_context, sizeof(SocketContext), CLIENT_POOL_SIZE_IOCP_RECV);
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), CLIENT_POOL_SIZE_RECV);
     init_queue_ptr(queue_recv_udp_frame, CLIENT_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME);
@@ -167,12 +163,12 @@ static int init_client_buffers(){
     }
 
     for (int i = 0; i < CLIENT_POOL_SIZE_IOCP_RECV; ++i) {
-        IOCP_CONTEXT* recv_context = (IOCP_CONTEXT*)pool_alloc(pool_recv_iocp_context);
+        SocketContext* recv_context = (SocketContext*)pool_alloc(pool_recv_iocp_context);
         if (recv_context == NULL) {
             fprintf(stderr, "CRITICAL ERROR: Failed to allocate receive context from pool %d. Exiting.\n", i);
             return RET_VAL_ERROR;
         }
-        init_iocp_context(recv_context, OP_RECV); // Initialize the context
+        init_socket_context(recv_context, OP_RECV); // Initialize the context
 
         if (udp_recv_from(client->socket, recv_context) == RET_VAL_ERROR) {
             fprintf(stderr, "CRITICAL ERROR: Failed to post initial receive operation %d. Exiting.\n", i);
@@ -428,7 +424,7 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
                 continue;
             }
 
-            IOCP_CONTEXT* context = (IOCP_CONTEXT*)lpOverlapped;
+            SocketContext* socket_context = (SocketContext*)lpOverlapped;
 
             // --- Handle GetQueuedCompletionStatus failures (non-NULL lpOverlapped) ---
             if (!getqcompl_result) {
@@ -440,19 +436,19 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
                     snprintf(log_message, sizeof(log_message), "GetQueuedCompletionStatus failed with error: %d.", wsa_error);
                     log_to_file(log_message);
                     // If it's a real error on a specific operation
-                    if (context->type == OP_SEND) {
-                        pool_free(pool_send_iocp_context, context);
-                    } else if (context->type == OP_RECV) {
-                        // Critical error on a receive context -"retire" this context from the pool.
-                        snprintf(log_message, sizeof(log_message), "ERROR: RECV operation, attempting re-post context.");
+                    if (socket_context->type == OP_SEND) {
+                        pool_free(pool_send_iocp_context, socket_context);
+                    } else if (socket_context->type == OP_RECV) {
+                        // Critical error on a receive socket_context -"retire" this socket_context from the pool.
+                        snprintf(log_message, sizeof(log_message), "ERROR: RECV operation, attempting re-post socket_context.");
                         log_to_file(log_message);
-                        pool_free(pool_recv_iocp_context, context);
+                        pool_free(pool_recv_iocp_context, socket_context);
                     }
                     continue; // Continue loop to get next completion
                 }
             }
 
-            switch(context->type){
+            switch(socket_context->type){
                 case OP_RECV:
                     // Validate and dispatch frame
                     if (NrOfBytesTransferred > 0 && NrOfBytesTransferred <= sizeof(UdpFrame)) {
@@ -464,8 +460,8 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
                             break;
                         }
                         memset(recv_frame_entry, 0, sizeof(PoolEntryRecvFrame));
-                        memcpy(&recv_frame_entry->frame, context->buffer, NrOfBytesTransferred);
-                        memcpy(&recv_frame_entry->src_addr, &context->addr, sizeof(struct sockaddr_in));
+                        memcpy(&recv_frame_entry->frame, socket_context->buffer, NrOfBytesTransferred);
+                        memcpy(&recv_frame_entry->src_addr, &socket_context->addr, sizeof(struct sockaddr_in));
                         recv_frame_entry->frame_size = NrOfBytesTransferred;
                         recv_frame_entry->timestamp = time(NULL);
 
@@ -489,25 +485,25 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
                             }
                         }
 
-                        // if (inet_ntop(AF_INET, &(context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
+                        // if (inet_ntop(AF_INET, &(socket_context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
                         //     strcpy(ip_string_buffer, "UNKNOWN_IP");
                         // }
                         // printf("Server: Received %lu bytes from %s:%d. Type: %u\n",
-                        //        NrOfBytesTransferred, ip_string_buffer, ntohs(context->addr.sin_port), frame_entry.frame.header.frame_type);
+                        //        NrOfBytesTransferred, ip_string_buffer, ntohs(socket_context->addr.sin_port), frame_entry.frame.header.frame_type);
 
                     } else {
                         // 0 bytes transferred (e.g., graceful shutdown, empty packet)
-                        snprintf(log_message, sizeof(log_message), "ERROR: Receive operation completed with 0 bytes for iocp context. Re-posting.");
+                        snprintf(log_message, sizeof(log_message), "ERROR: Receive operation completed with 0 bytes for iocp socket_context. Re-posting.");
                         log_to_file(log_message);
                     }
 
-                    // *** CRITICAL: Re-post the receive operation using the SAME context ***
+                    // *** CRITICAL: Re-post the receive operation using the SAME socket_context ***
                     // This ensures the buffer is continuously available for incoming data.
-                    if (udp_recv_from(client->socket, context) == RET_VAL_ERROR){
-                        snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: WSARecvFrom re-issue failed for context %p: errno: %d. Freeing.", (void*)context, WSAGetLastError());
+                    if (udp_recv_from(client->socket, socket_context) == RET_VAL_ERROR){
+                        snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: WSARecvFrom re-issue failed for socket_context %p: errno: %d. Freeing.", (void*)socket_context, WSAGetLastError());
                         log_to_file(log_message);
-                        // This is a severe problem. Retire the context from the pool.
-                        pool_free(pool_recv_iocp_context, context); // Return to pool if it fails
+                        // This is a severe problem. Retire the socket_context from the pool.
+                        pool_free(pool_recv_iocp_context, socket_context); // Return to pool if it fails
                     }
                     if(pool_recv_iocp_context->free_blocks > (pool_recv_iocp_context->block_count / 2)){
                         refill_recv_iocp_pool(client->socket, pool_recv_iocp_context);
@@ -515,9 +511,9 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
                     break; // End of OP_RECV case
 
                 case OP_SEND:
-                    // For send completions, simply free the context
+                    // For send completions, simply free the socket_context
                     if (NrOfBytesTransferred > 0) {
-                        // if (inet_ntop(AF_INET, &(context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
+                        // if (inet_ntop(AF_INET, &(socket_context->addr.sin_addr), ip_string_buffer, INET_ADDRSTRLEN) == NULL) {
                         //     strcpy(ip_string_buffer, "UNKNOWN_IP");
                         // }
                         // printf("Client: Sent %lu bytes to %s:%d (Message: '%s')\n",
@@ -526,16 +522,16 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
                         snprintf(log_message, sizeof(log_message), "ERROR: Send operation completed with 0 bytes or error.");
                         log_to_file(log_message);
                     }
-                    pool_free(pool_send_iocp_context, context);
+                    pool_free(pool_send_iocp_context, socket_context);
                     break;
 
                 default:
                     snprintf(log_message, sizeof(log_message), "ERROR: Unknown operation type in completion.");
                     log_to_file(log_message);
-                    pool_free(pool_send_iocp_context, context);
+                    pool_free(pool_send_iocp_context, socket_context);
                     break;
 
-            } // end of switch(context->type)
+            } // end of switch(socket_context->type)
         } // end of while(true)
     } // end of while(client.client_status == STATUS_READY)
 
@@ -787,7 +783,7 @@ static DWORD WINAPI fthread_resend_frame(LPVOID lpParam){
             continue;
         }
         for(int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++){
-            EnterCriticalSection(&table_send_udp_frame->mutex);
+            AcquireSRWLockExclusive(&table_send_udp_frame->mutex);
             for (int i = 0; i < table_send_udp_frame->size; i++) {
                 TableNodeSendFrame *table_node = table_send_udp_frame->node[i];
                 while (table_node) {
@@ -803,7 +799,7 @@ static DWORD WINAPI fthread_resend_frame(LPVOID lpParam){
                     table_node = table_node->next;
                 }                                         
             }
-            LeaveCriticalSection(&table_send_udp_frame->mutex);
+            ReleaseSRWLockExclusive(&table_send_udp_frame->mutex);
         }
         Sleep(100);
     }
@@ -1036,7 +1032,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
  
         fstream->fid = InterlockedIncrement(&client->fid_count);
 
-        fstream->pending_metadata_seq_num = get_new_seq_num();
+        fstream->pending_metadata_seq_num = InterlockedIncrement64(&client->frame_count);
         
         entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
         if(!entry_send){
@@ -1122,7 +1118,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                     goto clean;
                 }
                 construct_file_fragment(entry_send, 
-                                            get_new_seq_num(),
+                                            InterlockedIncrement64(&client->frame_count),
                                             client->sid,
                                             fstream->fid,
                                             frame_fragment_offset,
@@ -1152,7 +1148,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
         //     goto clean;
         // }
         // construct_file_end(entry_send,
-        //                     get_new_seq_num(), 
+        //                     InterlockedIncrement64(&client->frame_count), 
         //                     client->sid, 
         //                     fstream->fid, 
         //                     fstream->fsize, 
@@ -1270,7 +1266,7 @@ static DWORD WINAPI fthread_process_mstream(LPVOID lpParam){
             }
 
             res = construct_text_fragment(entry_send,
-                                            get_new_seq_num(), 
+                                            InterlockedIncrement64(&client->frame_count), 
                                             client->sid, 
                                             mstream->message_id, 
                                             mstream->message_len, 

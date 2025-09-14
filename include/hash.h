@@ -33,7 +33,7 @@ typedef struct NodeTableIDs{
 
 typedef struct{
     NodeTableIDs **entry;
-    CRITICAL_SECTION mutex;
+    SRWLOCK mutex;
     size_t size;
     size_t count;
     MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated from this pre-allocated mem pool;
@@ -47,8 +47,6 @@ void ht_remove_all_sid(TableIDs *table, const uint32_t sid);
 BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
 int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
 void ht_clean_id(TableIDs *table);
-void ht_print_id(TableIDs *table);
-
 
 //--------------------------------------------------------------------------------------------------------------------------
 
@@ -63,7 +61,7 @@ __declspec(align(64))typedef struct{
     size_t size;                            // size of the hash table base array. each index in array is a pointer to a linked list 
                                             // of nodes which have overlapping hash for the sequence number
     TableNodeSendFrame **node;              // array of pointers to TableNodeSendFrame
-    CRITICAL_SECTION mutex;                 // mutex for shared data access
+    SRWLOCK mutex;                 // mutex for shared data access
     size_t count;                           // nr of inserted frmes in the table
     MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated
                                             // from this pre-allocated mem pool;
@@ -79,9 +77,11 @@ uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num)
 typedef struct NodeTableFileBlock{
     OVERLAPPED overlapped;
     uint64_t key;
+    uint32_t fid;
+    uint32_t sid;
     size_t block_size;
     uint8_t type;
-    char* pool_node;
+    char* block_data;
     struct NodeTableFileBlock *next;
 }NodeTableFileBlock;
 
@@ -95,8 +95,9 @@ typedef struct{
 
 void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_nodes);
 uint64_t ht_get_hash_fblock(const uint64_t key, const size_t size);
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint8_t type, char* pool_node, size_t node_size);
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, const uint8_t type, char* pool_node, size_t node_size);
 void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool);
+void ht_clean_fblock(TableFileBlock *table, const uint32_t sid, const uint32_t fid, MemPool *pool);
 BOOL ht_search_fblock(TableFileBlock *table, const uint64_t key);
- 
+
 #endif // FRAMES_HASH_H
