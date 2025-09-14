@@ -1,0 +1,6 @@
+# Ignore the bin directory at the root of the project
+bin/
+
+# You can also add other patterns
+# Ignore all .log files anywhere
+*.log
