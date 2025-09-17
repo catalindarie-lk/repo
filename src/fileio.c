@@ -4,31 +4,34 @@
 #include <stdio.h>
 #include "include/fileio.h"
 
-long long get_file_size(const char *_FileName){
+long long get_file_size(const char *filepath, FILE **fp){
 
-    FILE *fp = fopen(_FileName, "rb"); // Open in binary mode
-    if (fp == NULL) {
+    FILE *fptr = fopen(filepath, "rb"); // Open in binary mode
+    if (!fptr) {
         fprintf(stderr, "Error: Could not open file!\n");
         return RET_VAL_ERROR;
     }
     // Seek to end to determine file size
-    if (_fseeki64(fp, 0, SEEK_END) != 0) {
+    if (_fseeki64(fptr, 0, SEEK_END) != 0) {
         fprintf(stderr, "Failed to seek");
-        fclose(fp);
+        fclose(fptr);
         return RET_VAL_ERROR;
     }
-    long long size = _ftelli64(fp);
+    long long size = _ftelli64(fptr);
     if(size == 0){
         fprintf(stderr, "Error file is empty (size 0)! _ftelli64()\n");
-        fclose(fp);
+        fclose(fptr);
         return RET_VAL_ERROR;
     }
     if(size == RET_VAL_ERROR){
         fprintf(stderr, "Error reading file size! _ftelli64()\n");
-        fclose(fp);
+        fclose(fptr);
         return RET_VAL_ERROR;
     }
-    fclose(fp);
+    rewind(fptr); // Optional: reset file pointer to beginning
+    *fp = fptr; // Return the open file pointer
+
+    // fclose(fptr);
     return(size);
 }
 

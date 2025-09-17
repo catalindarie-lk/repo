@@ -19,7 +19,7 @@
 #endif
 
 #define SERVER_PORT                         53567               // Port the server listens on
-#define MAX_FRAME_SIZE                      1024
+#define MAX_FRAME_SIZE                      1400
 #define FRAME_DELIMITER                     0xAABB             // A magic number to identify valid frames
 
 

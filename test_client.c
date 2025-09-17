@@ -203,9 +203,9 @@ static int init_client_buffers(){
             fprintf(stderr, "CRITICAL ERROR: Failed to create fstream metadata events. Error: %d\n", GetLastError());
             return RET_VAL_ERROR;
         }
-        InitializeCriticalSection(&client->fstream[index].lock);
+        InitializeSRWLock(&client->fstream[index].lock);
     }
-    InitializeCriticalSection(&client->fstreams_lock);
+    InitializeSRWLock(&client->fstreams_lock);
     // Initialize mstreams
     for(int index = 0; index < CLIENT_MAX_ACTIVE_MSTREAMS; index++){
         InitializeCriticalSection(&client->mstream[index].lock);
@@ -275,7 +275,7 @@ static int start_threads(){
         fprintf(stderr, "CreateSemaphore failed (fstreams_semaphore): error %d\n", GetLastError());
         return RET_VAL_ERROR;
     }
-    for(int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++){
+    for(int i = 0; i < (CLIENT_MAX_ACTIVE_FSTREAMS); i++){
         threads->process_fstream[i] = (HANDLE)_beginthreadex(NULL, 0, fthread_process_fstream, NULL, 0, NULL);
         if (threads->process_fstream[i] == NULL){
             fprintf(stderr, "CRITICAL ERROR: Failed to create thread (fstream). Error: %d\n", GetLastError());
@@ -284,18 +284,18 @@ static int start_threads(){
     }
     //-------------------------------------------------------------------------------------------------------------------
     // START MSTREAM WORKER THREADS
-    client->mstreams_semaphore = CreateSemaphore(NULL, CLIENT_MAX_ACTIVE_MSTREAMS, LONG_MAX, NULL);
-    if (client->mstreams_semaphore == NULL) {
-        fprintf(stderr, "CreateSemaphore failed (mstreams_semaphore): error %d\n", GetLastError());
-        return RET_VAL_ERROR;
-    }
-    for(int index = 0; index < CLIENT_MAX_ACTIVE_MSTREAMS; index++){
-        threads->process_mstream[index] = (HANDLE)_beginthreadex(NULL, 0, fthread_process_mstream, NULL, 0, NULL);
-        if (threads->process_mstream[index] == NULL){
-            fprintf(stderr, "CRITICAL ERROR: Failed to create thread (mstream). Error: %d\n", GetLastError());
-            return RET_VAL_ERROR;
-        }
-    }
+    // client->mstreams_semaphore = CreateSemaphore(NULL, CLIENT_MAX_ACTIVE_MSTREAMS, LONG_MAX, NULL);
+    // if (client->mstreams_semaphore == NULL) {
+    //     fprintf(stderr, "CreateSemaphore failed (mstreams_semaphore): error %d\n", GetLastError());
+    //     return RET_VAL_ERROR;
+    // }
+    // for(int index = 0; index < CLIENT_MAX_ACTIVE_MSTREAMS; index++){
+    //     threads->process_mstream[index] = (HANDLE)_beginthreadex(NULL, 0, fthread_process_mstream, NULL, 0, NULL);
+    //     if (threads->process_mstream[index] == NULL){
+    //         fprintf(stderr, "CRITICAL ERROR: Failed to create thread (mstream). Error: %d\n", GetLastError());
+    //         return RET_VAL_ERROR;
+    //     }
+    // }
     //-------------------------------------------------------------------------------------------------------------------
     threads->client_command = (HANDLE)_beginthreadex(NULL, 0, fthread_client_command, NULL, 0, NULL);
     if (threads->client_command == NULL) {
@@ -353,7 +353,7 @@ int log_to_file(const char* log_message) {
 }
 // --- Cleanup functions for streams ---
 void close_file_stream(ClientFileStream *fstream){
-    EnterCriticalSection(&fstream->lock);
+    // EnterCriticalSection(&fstream->lock);
     memset(&fstream->calculated_sha256, 0, 32);
     if(fstream->fp){
         fclose(fstream->fp);
@@ -371,7 +371,7 @@ void close_file_stream(ClientFileStream *fstream){
     fstream->pending_metadata_seq_num = 0;
     memset(fstream->chunk_buffer, 0, CLIENT_FILE_BLOCK_SIZE);
     fstream->fstream_busy = FALSE;
-    LeaveCriticalSection(&fstream->lock);
+    // LeaveCriticalSection(&fstream->lock);
     return;
 }
 void close_message_stream(ClientMessageStream *mstream){
@@ -676,7 +676,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                         fstream->pending_metadata_seq_num = 0; 
                         SetEvent(fstream->hevent_metadata_response_ok);
                     
-                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_EXISTING_FILE) {
+                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && (recv_op_code == ERR_EXISTING_FILE || recv_op_code == ERR_STREAM_INIT)) {
                         fstream->pending_metadata_seq_num = 0;
                         SetEvent(fstream->hevent_metadata_response_nok);
                         snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file '%s%s'. File already exists on server.", fstream->dirpath, fstream->fname);
@@ -695,9 +695,9 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                         recv_op_code == STS_CONFIRM_FILE_END ||
                         recv_op_code == ERR_DUPLICATE_FRAME || 
                         recv_op_code == ERR_EXISTING_FILE ||
-                        recv_op_code == ERR_EXISTING_MESSAGE //||
+                        recv_op_code == ERR_EXISTING_MESSAGE ||
                         // recv_op_code == ERR_MISSING_METADATA ||
-                        /*recv_op_code == ERR_STREAM_INIT*/){
+                        recv_op_code == ERR_STREAM_INIT){
                     
                     uintptr_t entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
                     if(!entry){
@@ -956,7 +956,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
         }
          
         ClientFileStream *fstream = NULL;
-        EnterCriticalSection(&client->fstreams_lock);
+        AcquireSRWLockExclusive(&client->fstreams_lock);
         for(int index = 0; index < CLIENT_MAX_ACTIVE_FSTREAMS; index++){
             fstream = &client->fstream[index];
             if(!fstream->fstream_busy){
@@ -964,7 +964,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                 break;
             }
         }
-        LeaveCriticalSection(&client->fstreams_lock);
+        ReleaseSRWLockExclusive(&client->fstreams_lock);
 
         if(!fstream){
             snprintf(log_message, sizeof(log_message), "WARNING: All fstreams are busy.");
@@ -972,7 +972,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             continue;
         }
         
-        EnterCriticalSection(&fstream->lock);
+        AcquireSRWLockExclusive(&fstream->lock);
        
         // Safely copy paths using the lengths from the queue entry
         // fpath
@@ -1016,20 +1016,20 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
         char full_path[MAX_PATH] = {0};
         snprintf(full_path, MAX_PATH, "%s%s", fstream->dirpath, fstream->fname);
 
-        fstream->fsize = get_file_size(full_path);
+        fstream->fsize = get_file_size(full_path, &fstream->fp);
         if(fstream->fsize == RET_VAL_ERROR){
             goto clean;
         }
         fstream->pending_bytes = fstream->fsize;
 
-        fstream->fp = fopen(full_path, "rb");
-        if(fstream->fp == NULL){
-            snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - failed to open file %s.", full_path);
+        // fstream->fp = fopen(full_path, "rb");
+        if(!fstream->fp){
+            snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - failed to open file %s", full_path);
             log_to_file(log_message);
             fprintf(stderr, "%s\n", log_message);
             goto clean;
         }
- 
+
         fstream->fid = InterlockedIncrement(&client->fid_count);
 
         fstream->pending_metadata_seq_num = InterlockedIncrement64(&client->frame_count);
@@ -1049,7 +1049,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                                         fstream->rpath_len, 
                                         fstream->fname, 
                                         fstream->fname_len,
-                                        FILE_FRAGMENT_SIZE,
+                                        // FILE_FRAGMENT_SIZE,
                                         client->socket, &client->server_addr);
         if(res == RET_VAL_ERROR){
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: construct_file_metadata() returned RET_VAL_ERROR. Should not happen since inputs are validated before calling.");
@@ -1164,7 +1164,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
     clean:
         s_pool_free(pool_send_command, (void*)entry);
         close_file_stream(fstream);
-        LeaveCriticalSection(&fstream->lock);
+        ReleaseSRWLockExclusive(&fstream->lock);
         ReleaseSemaphore(client->fstreams_semaphore, 1, NULL);
     }
     _endthreadex(0);

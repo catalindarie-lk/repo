@@ -280,7 +280,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     return RET_VAL_SUCCESS;
 
 exit_err:
-
     close_fstream(fstream);
     ReleaseSRWLockExclusive(&fstream->lock);
     return RET_VAL_ERROR;

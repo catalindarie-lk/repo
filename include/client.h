@@ -181,7 +181,7 @@ typedef struct{
 
     HANDLE hevent_metadata_response_ok;         // Event handle for successful metadata response
     HANDLE hevent_metadata_response_nok;        // Event handle for unsuccessful metadata response
-    CRITICAL_SECTION lock;                      // Critical section for protecting access to this stream's data
+    SRWLOCK lock;                      // Critical section for protecting access to this stream's data
 }ClientFileStream;
 
 // Main structure holding global client data and state
@@ -215,7 +215,7 @@ typedef struct{
 
     ClientFileStream fstream[CLIENT_MAX_ACTIVE_FSTREAMS]; // Array of active file streams
     HANDLE fstreams_semaphore;                  // Semaphore to control access to file stream slots
-    CRITICAL_SECTION fstreams_lock;             // Critical section for protecting access to the fstream array
+    SRWLOCK fstreams_lock;             // Critical section for protecting access to the fstream array
 
     ClientMessageStream mstream[CLIENT_MAX_ACTIVE_MSTREAMS]; // Array of active message streams
     HANDLE mstreams_semaphore;                  // Semaphore to control access to message stream slots

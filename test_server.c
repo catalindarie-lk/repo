@@ -147,16 +147,16 @@ static int init_server_buffers(){
 
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_RECV);
-    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 1024);
+    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 256);
         
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
 
     init_queue_ptr(queue_process_fstream, MAX_SERVER_ACTIVE_FSTREAMS);
-    init_table_id(table_file_id, 1024, 1048576);
-    init_table_id(table_message_id, 1024, 32768);
+    init_table_id(table_file_id, 256, 1048576);
+    init_table_id(table_message_id, 256, 32768);
 
-    init_table_fblock(table_file_block, 1014, 1024);
+    init_table_fblock(table_file_block, 256, 256);
     
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
 
@@ -876,7 +876,7 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
             continue;
         }
         
-        if(node->type == OP_WR){
+        if(NrOfBytesWritten > 0 && node->type == OP_WR){
             AcquireSRWLockExclusive(&fstream->lock);
             // if(!ht_search_fblock(table_file_block, node->key)){
             //     fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
@@ -1224,8 +1224,6 @@ void init_client_pool(ServerClientPool* pool, const uint64_t block_count) {
     InitializeSRWLock(&pool->lock);
     return;
 }
-
-
 
 
 int main() {

@@ -40,7 +40,7 @@ int construct_file_metadata(PoolEntrySendFrame *entry,
                             const uint32_t rpath_len,
                             const char *fname,
                             const uint32_t fname_len,
-                            const uint32_t file_fragment_size,
+                            // const uint32_t file_fragment_size,
                             const SOCKET src_socket, const struct sockaddr_in *dest_addr);
                         
 int construct_file_end(PoolEntrySendFrame *entry,
