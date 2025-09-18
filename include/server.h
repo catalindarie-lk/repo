@@ -40,12 +40,12 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server Stream Configuration ---
-#define MAX_SERVER_ACTIVE_FSTREAMS                  20
+#define MAX_SERVER_ACTIVE_FSTREAMS                  32
 #define MAX_SERVER_ACTIVE_MSTREAMS                  10
 
 // --- Server Worker Thread Configuration ---
 #define SERVER_MAX_THREADS_RECV_SEND_FRAME          1
-#define SERVER_MAX_THREADS_PROCESS_FRAME            20
+#define SERVER_MAX_THREADS_PROCESS_FRAME            4
 #define SERVER_MAX_THREADS_WRITE_FILE_BLOCK         1
 
 #define SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES    1
@@ -53,7 +53,7 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server SEND Buffer Sizes ---
-#define SERVER_QUEUE_SIZE_SEND_FRAME                (4096 + 256 * MAX_SERVER_ACTIVE_FSTREAMS)
+#define SERVER_QUEUE_SIZE_SEND_FRAME                (4096)
 #define SERVER_QUEUE_SIZE_SEND_PRIO_FRAME           128
 #define SERVER_QUEUE_SIZE_SEND_CTRL_FRAME           16
 
@@ -65,12 +65,14 @@
                                                     SERVER_QUEUE_SIZE_SEND_CTRL_FRAME)
 #define SERVER_POOL_SIZE_IOCP_SEND                  (SERVER_POOL_SIZE_SEND * 2) // Total size for IOCP send contexts
 // --- SERVER RECV Buffer Sizes ---
-#define SERVER_QUEUE_SIZE_RECV_FRAME                (4096 + 256 * MAX_SERVER_ACTIVE_FSTREAMS)
+#define SERVER_QUEUE_SIZE_RECV_FRAME                (4096)
 #define SERVER_QUEUE_SIZE_RECV_PRIO_FRAME           128
 // --- Server RECV Memory Pool Sizes ---
 #define SERVER_POOL_SIZE_RECV                       (SERVER_QUEUE_SIZE_RECV_FRAME + \
                                                     SERVER_QUEUE_SIZE_RECV_PRIO_FRAME)
 #define SERVER_POOL_SIZE_IOCP_RECV                  (SERVER_POOL_SIZE_RECV * 2)
+
+#define SERVER_POOL_SIZE_FILE_BLOCKS                (256)
 
 
 
@@ -164,6 +166,7 @@ typedef struct{
     uint32_t sid;                       // Session ID associated with this file stream.
     uint32_t fid;                       // File ID, unique identifier for the file associated with this file stream.
     uint64_t file_size;                     // Total size of the file being transferred.
+    uint8_t file_status;
 
     uint64_t *received_file_bitmap;     // Pointer to an array of uint64_t, where each bit represents a file fragment.
     uint64_t *written_file_bitmap;      // Pointer to an array of uint64_t, where each bit represents a file fragment.
@@ -188,7 +191,11 @@ typedef struct{
     char fname[MAX_PATH];               // Array to store the file name+path.
     uint32_t fname_len;
     
-    char iocp_full_path[MAX_PATH];
+    char ansi_path[MAX_PATH];
+    wchar_t unicode_path[MAX_PATH];
+    char temp_ansi_path[MAX_PATH];
+    wchar_t temp_unicode_path[MAX_PATH];
+    
     HANDLE iocp_file_handle;
 
     SRWLOCK lock;              // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.

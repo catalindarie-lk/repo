@@ -21,6 +21,7 @@ size_t safe_fwrite(FILE *fp, const void *buffer, size_t total_size);
 // Reads large data from file into buffer in chunks. Returns total bytes read.
 size_t safe_fread(FILE *fp, void *buffer, size_t total_size);
 
-
+BOOL RenameFileByHandle(HANDLE hFile, const wchar_t* newPath);
+BOOL DeleteFileByHandle(HANDLE hFile);
 
 #endif // SAFEFILEIO_H

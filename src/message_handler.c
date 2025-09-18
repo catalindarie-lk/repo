@@ -323,7 +323,7 @@ static uint8_t check_completion_and_record(ServerMessageStream *mstream) {
         return ERR_MEMORY_ALLOCATION;
     }
 
-    ht_update_id_status(table_message_id, mstream->sid, mstream->mid, ID_RECV_COMPLETE);
+    ht_update_id_status(table_message_id, mstream->sid, mstream->mid, FILE_RECV_COMPLETE);
     
     close_mstream(mstream);
  
@@ -354,7 +354,7 @@ int handle_message_fragment(Client *client, UdpFrame *frame){
 
     uint8_t op_code = 0;
 
-    if(ht_search_id(table_message_id, recv_session_id, recv_message_id, ID_RECV_COMPLETE) == TRUE){
+    if(ht_search_id(table_message_id, recv_session_id, recv_message_id, FILE_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received message frame for completed message Seq: %llu; sID: %u; mID: %u;\n", recv_seq_num, recv_session_id, recv_message_id);
         op_code = ERR_EXISTING_MESSAGE;
         goto exit_err;
@@ -429,7 +429,7 @@ int handle_message_fragment(Client *client, UdpFrame *frame){
 
         attach_fragment(mstream, frame->payload.text_fragment.chars, recv_fragment_offset, recv_fragment_len);       
 
-        if(ht_insert_id(table_message_id, recv_session_id, recv_message_id, ID_WAITING_FRAGMENTS) == RET_VAL_ERROR){
+        if(ht_insert_id(table_message_id, recv_session_id, recv_message_id, FILE_WAITING_FRAGMENTS) == RET_VAL_ERROR){
             fprintf(stderr, "Failed to allocate memory for message ID in hash table\n");
             op_code = ERR_MEMORY_ALLOCATION;
             goto exit_err;

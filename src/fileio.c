@@ -1,3 +1,4 @@
+#include <windows.h>
 #include <stdio.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -95,3 +96,53 @@ size_t safe_fread(FILE *fp, void *buffer, size_t total_size) {
 
     return total_read;
 }
+
+
+BOOL RenameFileByHandle(HANDLE hFile, const wchar_t* newPath) {
+    if (!hFile || hFile == INVALID_HANDLE_VALUE || !newPath) {
+        return FALSE;
+    }
+
+    DWORD nameLen = (DWORD)(wcslen(newPath) * sizeof(wchar_t));
+    if (nameLen > MAX_PATH * sizeof(wchar_t)) {
+        // Path too long for static buffer
+        return FALSE;
+    }
+
+    // Static buffer sized for FILE_RENAME_INFO + MAX_PATH
+    BYTE buffer[sizeof(FILE_RENAME_INFO) + MAX_PATH * sizeof(wchar_t)];
+    FILE_RENAME_INFO* renameInfo = (FILE_RENAME_INFO*)buffer;
+
+    ZeroMemory(buffer, sizeof(buffer));
+    renameInfo->ReplaceIfExists = TRUE;
+    renameInfo->RootDirectory = NULL;
+    renameInfo->FileNameLength = nameLen;
+    memcpy(renameInfo->FileName, newPath, nameLen);
+
+    BOOL result = SetFileInformationByHandle(
+        hFile,
+        FileRenameInfo,
+        renameInfo,
+        sizeof(FILE_RENAME_INFO) + nameLen
+    );
+
+    if(!result){
+        fwprintf(stderr, L"CRITICAL ERROR: failed to rename temp file to: %ls\n", newPath);
+    }
+
+    return result;
+}
+
+BOOL DeleteFileByHandle(HANDLE hFile) {
+    FILE_DISPOSITION_INFO disposition = { TRUE };
+
+    BOOL result = SetFileInformationByHandle(
+        hFile,
+        FileDispositionInfo,
+        &disposition,
+        sizeof(disposition)
+    );
+
+    return result;
+}
+

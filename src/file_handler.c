@@ -133,6 +133,7 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     fstream->sid = _ntohl(frame->header.session_id);
     fstream->fid = _ntohl(frame->payload.file_metadata.file_id);
     fstream->file_size = _ntohll(frame->payload.file_metadata.file_size);
+    fstream->file_status = FILE_STATUS_NONE;
 
     // --- Proper string copy and validation for rpath ---
     uint32_t received_rpath_len = _ntohl(frame->payload.file_metadata.rpath_len);
@@ -248,19 +249,49 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         goto exit_err;
     }
 
-    snprintf(fstream->iocp_full_path, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);
-
+    snprintf(fstream->ansi_path, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);
+    
     #ifndef FILE_OVERWRITE
-        if(FileExists(fstream->iocp_full_path)){
-            fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->iocp_full_path);
+        if(FileExists(fstream->ansi_path)){
+            fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->ansi_path);
             goto exit_err;
         }
-    #endif
+    #endif 
     
-    fstream->iocp_file_handle = CreateFile(
-        fstream->iocp_full_path,            // File path
-        GENERIC_WRITE,                      // Access: write
-        0,                                  // No sharing
+    int result = MultiByteToWideChar(
+        CP_ACP,                         // ANSI code page
+        0,                              // No special flags
+        fstream->ansi_path,             // Source string
+        -1,                             // Null-terminated
+        fstream->unicode_path,          // Destination buffer
+        MAX_PATH                        // Buffer size
+    );
+
+    if (result == 0) {
+        fprintf(stderr, "Path conversion from ansi to unicode failed: %lu\n", GetLastError());
+        goto exit_err;
+    }
+    
+    snprintf(fstream->temp_ansi_path, MAX_PATH, "%s%s%s%s", rootFolder, fstream->rpath, fstream->fname, ".temp");
+
+    result = MultiByteToWideChar(
+        CP_ACP,                         // ANSI code page
+        0,                              // No special flags
+        fstream->temp_ansi_path,        // Source string
+        -1,                             // Null-terminated
+        fstream->temp_unicode_path,     // Destination buffer
+        MAX_PATH                        // Buffer size
+    );
+
+    if (result == 0) {
+        fprintf(stderr, "Temp path conversion from ansi to unicode failed: %lu\n", GetLastError());
+        goto exit_err;
+    }
+
+    fstream->iocp_file_handle = CreateFileW(
+        fstream->temp_unicode_path,            // File path
+        GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL,                               // Default security
         CREATE_ALWAYS,                      // Create or overwrite
         FILE_FLAG_OVERLAPPED,               // Enable async I/O
@@ -268,13 +299,15 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     );
     
     if (fstream->iocp_file_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "ERROR: init_fstream - Failed to open file \"%s\". Error code: %lu\n", fstream->iocp_full_path, GetLastError());
+        fprintf(stderr, "ERROR: init_fstream - Failed to open file \"%s\". Error code: %lu\n", fstream->temp_ansi_path, GetLastError());
         goto exit_err;
     }
     if (!CreateIoCompletionPort(fstream->iocp_file_handle, server->iocp_file_handle, (uintptr_t)fstream, 0)) {
         fprintf(stderr, "Failed to associate file_test with IOCP: %lu\n", GetLastError());
         goto exit_err;
     }
+
+    fstream->file_status = FILE_WAITING_FRAGMENTS;
 
     ReleaseSRWLockExclusive(&fstream->lock);
     return RET_VAL_SUCCESS;
@@ -355,10 +388,20 @@ void close_fstream(ServerFileStream *fstream) {
         free(fstream->recv_block_status);
         fstream->recv_block_status = NULL;
     }
+    if(fstream->file_status == FILE_RECV_COMPLETE){
+        RenameFileByHandle(fstream->iocp_file_handle, fstream->unicode_path);
+    } else {
+        DeleteFileByHandle(fstream->iocp_file_handle);
+        ht_remove_id(table_file_id, fstream->sid, fstream->fid);
+    }
 
     CloseHandle(fstream->iocp_file_handle);
     fstream->iocp_file_handle = NULL;
-    memset(&fstream->iocp_full_path, 0, MAX_PATH);
+    fstream->file_status = FILE_STATUS_NONE;
+    memset(&fstream->ansi_path, 0, MAX_PATH);
+    memset(&fstream->temp_ansi_path, 0, MAX_PATH);
+    memset(&fstream->unicode_path, 0, MAX_PATH);
+    memset(&fstream->temp_unicode_path, 0, MAX_PATH);
     fstream->sid = 0;                                   // Session ID associated with this file stream.
     fstream->fid = 0;                                   // File ID, unique identifier for the file associated with this file stream.
     fstream->file_size = 0;                                 // Total size of the file being transferred.
@@ -429,13 +472,13 @@ int handle_file_metadata(Client *client, UdpFrame *frame) {
     uint8_t op_code = 0;
     PoolEntrySendFrame *entry_send_frame = NULL;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_WAITING_FRAGMENTS) == TRUE){
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_WAITING_FRAGMENTS) == TRUE){
         fprintf(stderr, "Received duplicated metadata frame Seq: %llu for fID: %u sID %u\n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_DUPLICATE_FRAME;
         goto exit_err;
     }
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received metadata frame Seq: %llu for completed fID: %u sID %u\n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_EXISTING_FILE;
         goto exit_err;
@@ -466,20 +509,20 @@ int handle_file_metadata(Client *client, UdpFrame *frame) {
         goto exit_err;
     }
 
-    if(ht_insert_id(table_file_id, recv_session_id, recv_file_id, ID_WAITING_FRAGMENTS) == RET_VAL_ERROR){
-        op_code = ERR_MEMORY_ALLOCATION;
+    if(ht_insert_id(table_file_id, recv_session_id, recv_file_id, FILE_WAITING_FRAGMENTS) == RET_VAL_ERROR){
+        op_code = ERR_RESOURCE_LIMIT;
         goto exit_err;
     }
 
     entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
     if(!entry_send_frame){
-        op_code = ERR_MEMORY_ALLOCATION;
+        op_code = ERR_RESOURCE_LIMIT;
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for metadata ack frame\n");
         goto exit_err;
     }
     construct_ack_frame(entry_send_frame, recv_seq_num, recv_session_id, STS_CONFIRM_FILE_METADATA, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
-        op_code = ERR_MEMORY_ALLOCATION;
+        op_code = ERR_RESOURCE_LIMIT;
         pool_free(pool_send_udp_frame, entry_send_frame);
         fprintf(stderr, "ERROR: Failed to push file metadata ack frame to queue\n");
         goto exit_err;
@@ -524,7 +567,7 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
 
     uint8_t op_code = 0;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_EXISTING_FILE;
         goto exit_err;
@@ -688,7 +731,7 @@ int handle_file_end(Client *client, UdpFrame *frame){
 
     uint8_t op_code = 0;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received file end frame for completed file Seq: %llu; sID: %u; fID: %u;\n", recv_seq_num, recv_session_id, recv_file_id);
         op_code = ERR_EXISTING_FILE;
         goto exit_err;
@@ -722,4 +765,5 @@ exit_err:
     }
     return RET_VAL_ERROR;
 }
+
 

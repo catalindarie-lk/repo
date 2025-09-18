@@ -147,16 +147,16 @@ static int init_server_buffers(){
 
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_RECV);
-    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 256);
+    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, SERVER_POOL_SIZE_FILE_BLOCKS);
         
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
 
     init_queue_ptr(queue_process_fstream, MAX_SERVER_ACTIVE_FSTREAMS);
-    init_table_id(table_file_id, 256, 1048576);
-    init_table_id(table_message_id, 256, 32768);
+    init_table_id(table_file_id, 1024, 1048576);
+    init_table_id(table_message_id, 1024, 32768);
 
-    init_table_fblock(table_file_block, 256, 256);
+    init_table_fblock(table_file_block, SERVER_POOL_SIZE_FILE_BLOCKS, SERVER_POOL_SIZE_FILE_BLOCKS);
     
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
 
@@ -887,8 +887,10 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
 
             fstream->written_bytes_count += NrOfBytesWritten;
             if(fstream->written_bytes_count == fstream->file_size){
-                check_bitmap(fstream->received_file_bitmap, fstream->fragment_count);
-                ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
+                if(check_bitmap(fstream->received_file_bitmap, fstream->fragment_count)){
+                    fstream->file_status = FILE_RECV_COMPLETE;
+                    ht_update_id_status(table_file_id, fstream->sid, fstream->fid, FILE_RECV_COMPLETE);
+                }
                 close_fstream(fstream);
             }
             ReleaseSRWLockExclusive(&fstream->lock);
