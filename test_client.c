@@ -673,36 +673,46 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
 
                 for(int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++){
                     ClientFileStream *fstream = &client->fstream[i];
-                    if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == STS_CONFIRM_FILE_METADATA) {
+                    if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == STS_CONFIRM_FILE_METADATA) { 
                         fstream->pending_metadata_seq_num = 0; 
                         SetEvent(fstream->hevent_metadata_response_ok);
-                    
-                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && (recv_op_code == ERR_EXISTING_FILE || recv_op_code == ERR_STREAM_INIT)) {
+                    } else if (recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_CONFIRM_DUPLICATE_FILE_METADATA) {
+                        fstream->pending_metadata_seq_num = 0;
+                        SetEvent(fstream->hevent_metadata_response_ok);
+                        snprintf(log_message, sizeof(log_message), "WARNING: Received ERR_CONFIRM_DUPLICATE_FILE_METADATA for file '%s%s'. Duplicate metadata frame.", fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_EXISTING_FILE ) {
                         fstream->pending_metadata_seq_num = 0;
                         SetEvent(fstream->hevent_metadata_response_nok);
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file '%s%s'. File already exists on server.", fstream->dirpath, fstream->fname);
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file '%s%s'. Droping metadata frame.", fstream->dirpath, fstream->fname);
                         log_to_file(log_message);
-                        
-                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_DUPLICATE_FRAME) {
+                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_STREAM_INIT) {
                         fstream->pending_metadata_seq_num = 0;
-                        snprintf(log_message, sizeof(log_message), "DEBUG: Received ERR_DUPLICATE_FRAME for file '%s%s'. Duplicate metadata frame.", fstream->dirpath, fstream->fname);
+                        SetEvent(fstream->hevent_metadata_response_nok);
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_STREAM_INIT for file '%s%s'. Droping metadata frame.", fstream->dirpath, fstream->fname);
                         log_to_file(log_message);
-                    
+                    } else if (recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_INTERNAL_ERROR){
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_INTERNAL_ERROR for file '%s%s'.", fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                    } else if (recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_UNKNOWN_ERROR){
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_ERROR for file '%s%s'.", fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
                     }
                 }
 
                 if(recv_op_code == STS_CONFIRM_MESSAGE_FRAGMENT ||
                         recv_op_code == STS_CONFIRM_FILE_METADATA ||
+                        recv_op_code == ERR_CONFIRM_DUPLICATE_FILE_METADATA ||
                         recv_op_code == STS_CONFIRM_FILE_END ||
                         recv_op_code == ERR_DUPLICATE_FRAME || 
                         recv_op_code == ERR_EXISTING_FILE ||
-                        recv_op_code == ERR_EXISTING_MESSAGE ||
-                        // recv_op_code == ERR_MISSING_METADATA ||
-                        recv_op_code == ERR_STREAM_INIT){
+                        recv_op_code == ERR_EXISTING_MESSAGE
+                        
+                    ){
                     
                     uintptr_t entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
                     if(!entry){
-                        snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
                         log_to_file(log_message);
                         break;
                     }

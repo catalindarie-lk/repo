@@ -32,11 +32,6 @@
 #define SERVER_MESSAGE_TEXT_FILES_FOLDER            "H:\\_test\\messages_root\\"
 #define SERVER_SID_FOLDER_NAME_FOR_CLIENT           "SID_"
 
-#define CHUNK_TRAILING                              (1u << 7) // 0b10000000
-#define CHUNK_BODY                                  (1u << 6) // 0b01000000
-#define CHUNK_HASHED                                (1u << 5) // 0b00100000
-#define CHUNK_WRITTEN                               (1u << 0) // 0b00000001
-#define CHUNK_NONE                                  (0)       // 0b00000000
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server Stream Configuration ---

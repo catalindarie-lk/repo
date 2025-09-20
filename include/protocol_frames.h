@@ -92,13 +92,31 @@ enum AckErrorCode {
     ERR_STREAM_INIT = 106,    
     ERR_MALFORMED_FRAME = 107,     // Frame structure or size invalid
     ERR_RESOURCE_LIMIT = 108,      // Server ran out of memory or slots
-       
+    ERR_CONFIRM_DUPLICATE_FILE_METADATA = 109, // Client sent duplicate metadata
+
     ERR_INVALID_SESSION = 120,     // Session ID not recognized
     ERR_TIMEOUT = 121,             // Session timed out due to inactivity
     ERR_UNSUPPORTED_FRAME = 122,   // Frame type not supported
     ERR_UNAUTHORIZED = 123,        // Authentication/authorization failed
-    ERR_INTERNAL_ERROR = 124       // Catch-all for unexpected server fault
-    
+    ERR_INTERNAL_ERROR = 124,       // Catch-all for unexpected server fault
+    ERR_UNKNOWN_ERROR = 125
+};
+
+typedef uint8_t StreamErrorCode;
+enum StreamErrorCode {
+    STS_STREAM_UNDEFINED = 0,
+    STS_STREAM_SUCCESS = 10,
+
+    ERR_STREAM_MEMORY_ALLOCATION = 100,
+    ERR_STREAM_INVALID_PARAMETERS = 101,
+    ERR_STREAM_INVALID_PAYLOAD_DATA = 102,
+    ERR_STREAM_PATH_CREATE = 103,
+    ERR_STREAM_FILE_EXIST = 104,
+    ERR_STREAM_TEMP_FILE_EXIST = 105,
+    ERR_STREAM_TABLE_INSERT = 106,
+    ERR_STREAM_FILE_HANDLE_INIT = 107,
+    ERR_STREAM_FILE_HANDLE_ASSOCIATE = 108
+
 };
 
 #pragma pack(push, 1) 
