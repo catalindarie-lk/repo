@@ -19,9 +19,9 @@
 
 typedef uint8_t TableStatus;
 enum TableStatus{
-    FILE_STATUS_NONE = 0,
-    FILE_WAITING_FRAGMENTS = 1,
-    FILE_RECV_COMPLETE = 2
+    ID_STATUS_NONE = 0,
+    ID_WAITING_FRAGMENTS = 1,
+    ID_RECV_COMPLETE= 2
 };
 
 typedef struct NodeTableIDs{

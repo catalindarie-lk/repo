@@ -115,7 +115,7 @@ static int init_client_config(){
         return RET_VAL_ERROR;
     }
 
-    InitializeCriticalSection(&client->send_lock);
+    // InitializeCriticalSection(&client->send_lock);
     client->send_speed_mbps = 0; //Mbps
     client->send_period_usec = calculate_period_usec(client->send_speed_mbps, FILE_FRAGMENT_SIZE); //microsec
 
@@ -403,7 +403,8 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
         WaitForSingleObject(client->hevent_connection_pending, INFINITE);       
 
         client->session_status = CONNECTION_PENDING;
-        while(true){
+        
+        while(1){
 
             if(client->session_status == CONNECTION_CLOSED){
                 fprintf(stderr, "Stopped listening...\n");
@@ -709,8 +710,8 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                 }
 
                 if(recv_seq_num == DEFAULT_KEEP_ALIVE_SEQ && recv_op_code == STS_KEEP_ALIVE){
-                    snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_KEEP_ALIVE - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
-                    log_to_file(log_message);
+                    // snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_KEEP_ALIVE - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
+                    // log_to_file(log_message);
                     break;
                 }
                 break;
@@ -797,7 +798,8 @@ static DWORD WINAPI fthread_resend_frame(LPVOID lpParam){
                         table_node->sent_time = current_time;
                     }
                     table_node = table_node->next;
-                }                                         
+                }
+                
             }
             ReleaseSRWLockExclusive(&table_send_udp_frame->mutex);
         }
@@ -874,14 +876,14 @@ static DWORD WINAPI fthread_send_frame(LPVOID lpParam){
             log_to_file(log_message);
             continue;
         }
-                // Enter the critical section to acquire the right to send.
-        EnterCriticalSection(&client->send_lock);
+        // Enter the critical section to acquire the right to send.
+        // EnterCriticalSection(&client->send_lock);
         if(client->send_period_usec > 0){
             wait_usec(client->send_period_usec);
         }
         insert_table_send_frame(table_send_udp_frame, (uintptr_t)entry_send);
         send_pool_frame(entry_send, pool_send_iocp_context);
-        LeaveCriticalSection(&client->send_lock);
+        // LeaveCriticalSection(&client->send_lock);
    }
     _endthreadex(0);    
     return 0;
@@ -1094,7 +1096,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             sha256_update(&sha256_ctx, (const uint8_t *)fstream->chunk_buffer, chunk_bytes_to_send);
  
             chunk_fragment_offset = 0;
-
+            
             while (chunk_bytes_to_send > 0){
 
                 if(chunk_bytes_to_send > FILE_FRAGMENT_SIZE){
@@ -1103,13 +1105,13 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                     frame_fragment_size = chunk_bytes_to_send;
                 }
                 
-                char buffer[FILE_FRAGMENT_SIZE];
+                // char buffer[FILE_FRAGMENT_SIZE];
 
-                const char *offset = fstream->chunk_buffer + chunk_fragment_offset;
-                memcpy(buffer, offset, frame_fragment_size);
-                if(frame_fragment_size < FILE_FRAGMENT_SIZE){
-                    memset(buffer + frame_fragment_size, 0, FILE_FRAGMENT_SIZE - frame_fragment_size);
-                }
+                // const char *offset = fstream->chunk_buffer + chunk_fragment_offset;
+                // memcpy(buffer, offset, frame_fragment_size);
+                // if(frame_fragment_size < FILE_FRAGMENT_SIZE){
+                //     memset(buffer + frame_fragment_size, 0, FILE_FRAGMENT_SIZE - frame_fragment_size);
+                // }
                 
                 entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
                 if(!entry_send){
@@ -1122,7 +1124,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                                             client->sid,
                                             fstream->fid,
                                             frame_fragment_offset,
-                                            buffer, 
+                                            (fstream->chunk_buffer + chunk_fragment_offset), //buffer, 
                                             frame_fragment_size, 
                                             client->socket, &client->server_addr);
 
@@ -1393,7 +1395,7 @@ static DWORD WINAPI fthread_client_command(LPVOID lpParam) {
             
         }
     Sleep(100);
-    }        
+    }
     fprintf(stdout, "client command thread exiting...\n");
     _endthreadex(0);    
     return 0;
@@ -1440,10 +1442,47 @@ static DWORD WINAPI fthread_error_log_write(LPVOID lpParam){
 
 
 
+double get_cpu_time_ms(HANDLE thread) {
+    FILETIME creation, exit, kernel, user;
+    if (!GetThreadTimes(thread, &creation, &exit, &kernel, &user)) {
+        return -1.0;
+    }
+
+    ULARGE_INTEGER k, u;
+    k.LowPart = kernel.dwLowDateTime;
+    k.HighPart = kernel.dwHighDateTime;
+    u.LowPart = user.dwLowDateTime;
+    u.HighPart = user.dwHighDateTime;
+
+    return (k.QuadPart + u.QuadPart) / 10000.0; // Convert to milliseconds
+}
+
+double measure_thread_cpu_usage(HANDLE thread, DWORD interval_ms) {
+    double start_cpu = get_cpu_time_ms(thread);
+    DWORD start_time = GetTickCount();
+
+    Sleep(interval_ms); // Wait for interval
+
+    double end_cpu = get_cpu_time_ms(thread);
+    DWORD end_time = GetTickCount();
+
+    if (start_cpu < 0 || end_cpu < 0) return -1.0;
+
+    double cpu_delta = end_cpu - start_cpu;
+    double time_delta = (double)(end_time - start_time);
+
+    return (cpu_delta / time_delta) * 100.0; // CPU usage percentage
+}
+
+
+
+
+
 
 // --- Main function ---
 int main() {
-    
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
     init_client_session();
     init_client_config();
     init_client_buffers();
@@ -1462,6 +1501,11 @@ int main() {
         //                     Buffers.table_send_frame.count,
         //                     Buffers.pool_send_frame.free_blocks
         //                     );
+        // fprintf(stdout, "\r\033[2K-- recv_send_frame: %.2f, process_frame: %.2f, resent_frame: %.2f",                    
+        //                         measure_thread_cpu_usage(threads->send_frame[0], 1000),
+        //                         measure_thread_cpu_usage(threads->send_ctrl_frame, 1000),
+        //                         measure_thread_cpu_usage(threads->send_prio_frame, 1000)
+        //                         );
         fflush(stdout);
         Sleep(250); // Simulate some delay between messages        
     }

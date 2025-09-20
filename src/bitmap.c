@@ -29,7 +29,8 @@ BOOL check_bitmap(uint64_t bitmap[], uint64_t fragment_count){
 
     // Edge case: An empty file has no fragments, so it's considered complete.
     if (fragment_count == 0) {
-        return TRUE;
+        fprintf(stderr, "CRITICAL ERROR: Attempting to check bitmap for zero fragments!\n");
+        return FALSE;
     }
 
     // Calculate the total number of uint64_t entries needed for the bitmap

@@ -143,6 +143,9 @@ BOOL DeleteFileByHandle(HANDLE hFile) {
         sizeof(disposition)
     );
 
+    if(!result){
+        fprintf(stderr, "Failed to delete file!\n");
+    }
+
     return result;
 }
-

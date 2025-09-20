@@ -17,6 +17,11 @@
 #define FREE_BLOCK 0
 #define USED_BLOCK 1
 
+// typedef struct ListNode{
+//     char *block;
+//     struct ListNode *next;
+// }ListNode;
+
 //--------------------------------------------------------------------------------------------------------------------------
 __declspec(align(64)) typedef struct {
     char* memory;               // Raw memory buffer
@@ -27,6 +32,8 @@ __declspec(align(64)) typedef struct {
     uint64_t block_count;       // Total number of blocks in the pool
     uint64_t free_blocks;
     SRWLOCK lock;
+    // ListNode *list_free;
+    // ListNode *list_used;
     // HANDLE semaphore;
 } MemPool;
 

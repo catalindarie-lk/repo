@@ -54,7 +54,7 @@ void init_fstream_pool(ServerFstreamPool* pool, const uint64_t block_count) {
     memset(pool->fstream, 0, sizeof(ServerFileStream) * pool->block_count);
     
     // Initialize the free list: all blocks are initially free
-    pool->free_head = 0;                                        // The first block is the head of the free list
+    pool->free_head = 0;     // The first block is the head of the free list
     // Link all blocks together and mark them as unused
     for (uint64_t index = 0; index < pool->block_count - 1; index++) {
         pool->next[index] = index + 1;                          // Link to the next block
@@ -64,6 +64,7 @@ void init_fstream_pool(ServerFstreamPool* pool, const uint64_t block_count) {
     // The last block points to END_BLOCK, indicating the end of the free list
     pool->next[pool->block_count - 1] = END_BLOCK;              // Use END_BLOCK to indicate end of list
     pool->used[pool->block_count - 1] = FREE_BLOCK;             // Last block is also unused
+   
     InitializeSRWLock(&pool->fstream[pool->block_count - 1].lock);
     pool->free_blocks = pool->block_count;
     // Initialize the critical section for thread safety
@@ -72,24 +73,25 @@ void init_fstream_pool(ServerFstreamPool* pool, const uint64_t block_count) {
 }
 ServerFileStream* find_fstream(ServerFstreamPool* pool, const uint32_t sid, const uint32_t fid) {
 
+    ServerFileStream *fstream = NULL;
+
     if(!pool) {
         fprintf(stderr, "ERROR: Attempt to find_fstream() in an unallocated pool!\n");
         return NULL;
     }
 
-    ServerFileStream *fstream = NULL;
+    AcquireSRWLockShared(&pool->lock);
     for(uint64_t index = 0; index < pool->block_count; index++){
         if(!pool->used[index]) {
             continue;
         }
         fstream = &pool->fstream[index];
-        // AcquireSRWLockShared(&fstream->lock);
-        if(/*fstream->fstream_busy &&*/ fstream->sid == sid && fstream->fid == fid){
-            // ReleaseSRWLockShared(&fstream->lock);
+        if(fstream->sid == sid && fstream->fid == fid){
+            ReleaseSRWLockShared(&pool->lock);
             return fstream;
         }
-        // ReleaseSRWLockShared(&fstream->lock);
     }
+    ReleaseSRWLockShared(&pool->lock);
     return NULL;
 }
 ServerFileStream* alloc_fstream(ServerFstreamPool* pool) {
@@ -112,9 +114,6 @@ ServerFileStream* alloc_fstream(ServerFstreamPool* pool) {
     pool->used[index] = USED_BLOCK;
     pool->free_blocks--;
     ReleaseSRWLockExclusive(&pool->lock);
-    // AcquireSRWLockExclusive(&pool->fstream[index].lock);
-    // pool->fstream[index].fstream_busy = TRUE;
-    // ReleaseSRWLockExclusive(&pool->fstream[index].lock);
     return &pool->fstream[index];
 }
 static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct sockaddr_in *client_addr) {
@@ -133,7 +132,6 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
     fstream->sid = _ntohl(frame->header.session_id);
     fstream->fid = _ntohl(frame->payload.file_metadata.file_id);
     fstream->file_size = _ntohll(frame->payload.file_metadata.file_size);
-    fstream->file_status = FILE_STATUS_NONE;
 
     // --- Proper string copy and validation for rpath ---
     uint32_t received_rpath_len = _ntohl(frame->payload.file_metadata.rpath_len);
@@ -249,15 +247,10 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         goto exit_err;
     }
 
+    // ANSI PATH
     snprintf(fstream->ansi_path, MAX_PATH, "%s%s%s", rootFolder, fstream->rpath, fstream->fname);
     
-    #ifndef FILE_OVERWRITE
-        if(FileExists(fstream->ansi_path)){
-            fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->ansi_path);
-            goto exit_err;
-        }
-    #endif 
-    
+    // UNICODE PATH
     int result = MultiByteToWideChar(
         CP_ACP,                         // ANSI code page
         0,                              // No special flags
@@ -272,8 +265,10 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         goto exit_err;
     }
     
+    // TEMP ANSI PATH
     snprintf(fstream->temp_ansi_path, MAX_PATH, "%s%s%s%s", rootFolder, fstream->rpath, fstream->fname, ".temp");
 
+    // TEMP UNICODE PATH
     result = MultiByteToWideChar(
         CP_ACP,                         // ANSI code page
         0,                              // No special flags
@@ -288,26 +283,39 @@ static int init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct
         goto exit_err;
     }
 
+    if(FileExists(fstream->ansi_path)){
+        fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->ansi_path);
+        goto exit_err;
+    }
+    if(FileExists(fstream->temp_ansi_path)){
+        fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->temp_ansi_path);
+        goto exit_err;
+    }
+
+    // CREATE FILE AT TEMP UNICODE PATH
     fstream->iocp_file_handle = CreateFileW(
         fstream->temp_unicode_path,            // File path
-        GENERIC_READ | GENERIC_WRITE | DELETE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        GENERIC_WRITE | DELETE,
+        FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         NULL,                               // Default security
-        CREATE_ALWAYS,                      // Create or overwrite
+        CREATE_NEW,                         // Create or overwrite
         FILE_FLAG_OVERLAPPED,               // Enable async I/O
         NULL                                // No template
     );
     
+    if(ht_insert_id(table_file_id, fstream->sid, fstream->fid, ID_WAITING_FRAGMENTS) == RET_VAL_ERROR){
+        fprintf(stderr, "ERROR: init_fstream - Error updating status of file in hash table!!!\n");
+        goto exit_err;
+    }
+
     if (fstream->iocp_file_handle == INVALID_HANDLE_VALUE) {
-        fprintf(stderr, "ERROR: init_fstream - Failed to open file \"%s\". Error code: %lu\n", fstream->temp_ansi_path, GetLastError());
+        fprintf(stderr, "ERROR: init_fstream - Failed to create file \"%ls\". Error code: %lu\n", fstream->temp_unicode_path, GetLastError());
         goto exit_err;
     }
     if (!CreateIoCompletionPort(fstream->iocp_file_handle, server->iocp_file_handle, (uintptr_t)fstream, 0)) {
         fprintf(stderr, "Failed to associate file_test with IOCP: %lu\n", GetLastError());
         goto exit_err;
     }
-
-    fstream->file_status = FILE_WAITING_FRAGMENTS;
 
     ReleaseSRWLockExclusive(&fstream->lock);
     return RET_VAL_SUCCESS;
@@ -388,16 +396,14 @@ void close_fstream(ServerFileStream *fstream) {
         free(fstream->recv_block_status);
         fstream->recv_block_status = NULL;
     }
-    if(fstream->file_status == FILE_RECV_COMPLETE){
+    if(ht_search_id(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE)){
         RenameFileByHandle(fstream->iocp_file_handle, fstream->unicode_path);
     } else {
         DeleteFileByHandle(fstream->iocp_file_handle);
         ht_remove_id(table_file_id, fstream->sid, fstream->fid);
     }
-
     CloseHandle(fstream->iocp_file_handle);
     fstream->iocp_file_handle = NULL;
-    fstream->file_status = FILE_STATUS_NONE;
     memset(&fstream->ansi_path, 0, MAX_PATH);
     memset(&fstream->temp_ansi_path, 0, MAX_PATH);
     memset(&fstream->unicode_path, 0, MAX_PATH);
@@ -472,31 +478,32 @@ int handle_file_metadata(Client *client, UdpFrame *frame) {
     uint8_t op_code = 0;
     PoolEntrySendFrame *entry_send_frame = NULL;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_WAITING_FRAGMENTS) == TRUE){
-        fprintf(stderr, "Received duplicated metadata frame Seq: %llu for fID: %u sID %u\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_DUPLICATE_FRAME;
-        goto exit_err;
-    }
-
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_RECV_COMPLETE) == TRUE){
-        fprintf(stderr, "Received metadata frame Seq: %llu for completed fID: %u sID %u\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_EXISTING_FILE;
-        goto exit_err;
-    }
     if(recv_file_size == 0ULL){
         fprintf(stderr, "Received metadata frame Seq: %llu for fID: %u sID %u with zero file size\n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_MALFORMED_FRAME;
         goto exit_err;
     }
 
-    AcquireSRWLockShared(&pool_fstreams->lock);
-    if(pool_fstreams->free_blocks == 0){
-        ReleaseSRWLockShared(&pool_fstreams->lock);
-        // fprintf(stderr, "All fstreams are busy\n");
-        op_code = ERR_RESOURCE_LIMIT;
-        goto exit_err; 
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_WAITING_FRAGMENTS) == TRUE){
+        fprintf(stderr, "Received duplicated metadata frame Seq: %llu for fID: %u sID %u\n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = ERR_DUPLICATE_FRAME;
+        goto exit_err;
     }
-    ReleaseSRWLockShared(&pool_fstreams->lock);
+
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
+        fprintf(stderr, "Received metadata frame Seq: %llu for completed fID: %u sID %u\n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = ERR_EXISTING_FILE;
+        goto exit_err;
+    }
+
+    // AcquireSRWLockShared(&pool_fstreams->lock);
+    // if(pool_fstreams->free_blocks == 0){
+    //     ReleaseSRWLockShared(&pool_fstreams->lock);
+    //     // fprintf(stderr, "All fstreams are busy\n");
+    //     op_code = ERR_RESOURCE_LIMIT;
+    //     goto exit_err; 
+    // }
+    // ReleaseSRWLockShared(&pool_fstreams->lock);
 
     ServerFileStream *fstream = alloc_fstream(pool_fstreams);
     if(!fstream){
@@ -509,20 +516,15 @@ int handle_file_metadata(Client *client, UdpFrame *frame) {
         goto exit_err;
     }
 
-    if(ht_insert_id(table_file_id, recv_session_id, recv_file_id, FILE_WAITING_FRAGMENTS) == RET_VAL_ERROR){
-        op_code = ERR_RESOURCE_LIMIT;
-        goto exit_err;
-    }
-
     entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
     if(!entry_send_frame){
-        op_code = ERR_RESOURCE_LIMIT;
+        op_code = ERR_MEMORY_ALLOCATION;
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for metadata ack frame\n");
         goto exit_err;
     }
     construct_ack_frame(entry_send_frame, recv_seq_num, recv_session_id, STS_CONFIRM_FILE_METADATA, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
-        op_code = ERR_RESOURCE_LIMIT;
+        op_code = ERR_MEMORY_ALLOCATION;
         pool_free(pool_send_udp_frame, entry_send_frame);
         fprintf(stderr, "ERROR: Failed to push file metadata ack frame to queue\n");
         goto exit_err;
@@ -567,7 +569,7 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
 
     uint8_t op_code = 0;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_RECV_COMPLETE) == TRUE){
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_EXISTING_FILE;
         goto exit_err;
@@ -731,7 +733,7 @@ int handle_file_end(Client *client, UdpFrame *frame){
 
     uint8_t op_code = 0;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, FILE_RECV_COMPLETE) == TRUE){
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received file end frame for completed file Seq: %llu; sID: %u; fID: %u;\n", recv_seq_num, recv_session_id, recv_file_id);
         op_code = ERR_EXISTING_FILE;
         goto exit_err;
@@ -765,5 +767,4 @@ exit_err:
     }
     return RET_VAL_ERROR;
 }
-
 

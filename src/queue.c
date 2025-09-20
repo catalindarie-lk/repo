@@ -70,9 +70,9 @@ int s_push_ptr(s_QueuePtr *queue,  const uintptr_t ptr){
 
     // Move the tail index forward    
     queue->tail = next_tail;
-    InterlockedIncrement64(&queue->pending);
-    ReleaseSemaphore(queue->pop_semaphore, 1, NULL);
+    queue->pending++;
     ReleaseSRWLockExclusive(&queue->lock);
+    ReleaseSemaphore(queue->pop_semaphore, 1, NULL);
     return RET_VAL_SUCCESS;
 }
 uintptr_t s_pop_ptr(s_QueuePtr *queue){       
@@ -80,11 +80,11 @@ uintptr_t s_pop_ptr(s_QueuePtr *queue){
     uintptr_t pool_entry = 0;
     if (!queue) {
         fprintf(stderr, "CRITICAL ERROR: Pop - s_queue ptr not initialized.\n");
-        return pool_entry;
+        return 0;
     }
     if(queue->size <= 0){
         fprintf(stderr, "CRITICAL ERROR: Pop - s_queue ptr invalid queue size\n");
-        return pool_entry;
+        return 0;
     }
 
     WaitForSingleObject(queue->pop_semaphore, INFINITE);
@@ -92,16 +92,16 @@ uintptr_t s_pop_ptr(s_QueuePtr *queue){
     // Check if the queue is empty before removing
     if (queue->head == queue->tail) {
         ReleaseSRWLockExclusive(&queue->lock);
-        return pool_entry;
+        return 0;
     }
     pool_entry = queue->ptr[queue->head];
     queue->ptr[queue->head] = 0;
 
     // Move the head index forward
     queue->head = (queue->head + 1) % queue->size;
-    InterlockedDecrement64(&queue->pending);
-    ReleaseSemaphore(queue->push_semaphore, 1, NULL);
+    queue->pending--;
     ReleaseSRWLockExclusive(&queue->lock);
+    ReleaseSemaphore(queue->push_semaphore, 1, NULL);
     return pool_entry;
 }
 

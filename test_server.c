@@ -147,7 +147,7 @@ static int init_server_buffers(){
 
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_RECV);
-    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, SERVER_POOL_SIZE_FILE_BLOCKS);
+    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 1024);
         
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
@@ -156,7 +156,7 @@ static int init_server_buffers(){
     init_table_id(table_file_id, 1024, 1048576);
     init_table_id(table_message_id, 1024, 32768);
 
-    init_table_fblock(table_file_block, SERVER_POOL_SIZE_FILE_BLOCKS, SERVER_POOL_SIZE_FILE_BLOCKS);
+    init_table_fblock(table_file_block, 1014, 1024);
     
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
 
@@ -293,18 +293,19 @@ static Client* find_client(const uint32_t session_id) {
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     // Search for a client within the provided ClientList that matches the given session ID.
-    // EnterCriticalSection(&client_list->lock);
     for (int slot = 0; slot < MAX_CLIENTS; slot++) {
         Client *client = &client_list->client[slot];
+        AcquireSRWLockShared(&client->lock);
         if(client->slot_status == SLOT_FREE){
+            ReleaseSRWLockShared(&client->lock);
             continue; // Move to the next slot in the loop.
         }
         if(client->sid == session_id){
-            // LeaveCriticalSection(&client_list->lock);
+            ReleaseSRWLockShared(&client->lock);
             return client;
         }
+        ReleaseSRWLockShared(&client->lock);
     }
-    // LeaveCriticalSection(&client_list->lock);
     return NULL;
 }
 // Add a new client
@@ -839,7 +840,6 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
 
     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
     
-    HANDLE CompletitionPort = server->iocp_file_handle;
     DWORD NrOfBytesWritten;
     ULONG_PTR lpCompletitionKey;
     LPOVERLAPPED lpOverlapped;
@@ -847,7 +847,7 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
     while (server->server_status == STATUS_READY) {
 
         BOOL getqcompl_result = GetQueuedCompletionStatus(
-            CompletitionPort,
+            server->iocp_file_handle,
             &NrOfBytesWritten,
             &lpCompletitionKey,
             &lpOverlapped,
@@ -887,9 +887,11 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
 
             fstream->written_bytes_count += NrOfBytesWritten;
             if(fstream->written_bytes_count == fstream->file_size){
+                if(fstream->written_bytes_count == 0){
+                    fprintf(stderr, "CRITICAL ERROR: File write finished with zero bytes written: %s\n", fstream->ansi_path);
+                }
                 if(check_bitmap(fstream->received_file_bitmap, fstream->fragment_count)){
-                    fstream->file_status = FILE_RECV_COMPLETE;
-                    ht_update_id_status(table_file_id, fstream->sid, fstream->fid, FILE_RECV_COMPLETE);
+                    ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
                 }
                 close_fstream(fstream);
             }

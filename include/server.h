@@ -53,7 +53,7 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server SEND Buffer Sizes ---
-#define SERVER_QUEUE_SIZE_SEND_FRAME                (4096)
+#define SERVER_QUEUE_SIZE_SEND_FRAME                (4096 + 256 * MAX_SERVER_ACTIVE_FSTREAMS)
 #define SERVER_QUEUE_SIZE_SEND_PRIO_FRAME           128
 #define SERVER_QUEUE_SIZE_SEND_CTRL_FRAME           16
 
@@ -65,14 +65,12 @@
                                                     SERVER_QUEUE_SIZE_SEND_CTRL_FRAME)
 #define SERVER_POOL_SIZE_IOCP_SEND                  (SERVER_POOL_SIZE_SEND * 2) // Total size for IOCP send contexts
 // --- SERVER RECV Buffer Sizes ---
-#define SERVER_QUEUE_SIZE_RECV_FRAME                (4096)
+#define SERVER_QUEUE_SIZE_RECV_FRAME                (4096 + 256 * MAX_SERVER_ACTIVE_FSTREAMS)
 #define SERVER_QUEUE_SIZE_RECV_PRIO_FRAME           128
 // --- Server RECV Memory Pool Sizes ---
 #define SERVER_POOL_SIZE_RECV                       (SERVER_QUEUE_SIZE_RECV_FRAME + \
                                                     SERVER_QUEUE_SIZE_RECV_PRIO_FRAME)
 #define SERVER_POOL_SIZE_IOCP_RECV                  (SERVER_POOL_SIZE_RECV * 2)
-
-#define SERVER_POOL_SIZE_FILE_BLOCKS                (256)
 
 
 
@@ -166,13 +164,11 @@ typedef struct{
     uint32_t sid;                       // Session ID associated with this file stream.
     uint32_t fid;                       // File ID, unique identifier for the file associated with this file stream.
     uint64_t file_size;                     // Total size of the file being transferred.
-    uint8_t file_status;
 
     uint64_t *received_file_bitmap;     // Pointer to an array of uint64_t, where each bit represents a file fragment.
     uint64_t *written_file_bitmap;      // Pointer to an array of uint64_t, where each bit represents a file fragment.
                                         // A bit set to 1 means the fragment has been received.
     uint64_t file_bitmap_size;          // Number of uint64_t entries in the bitmap array.
-
 
     char **file_block;
     uint64_t *recv_block_bytes;          // Total bytes received for this file so far.
@@ -195,7 +191,7 @@ typedef struct{
     wchar_t unicode_path[MAX_PATH];
     char temp_ansi_path[MAX_PATH];
     wchar_t temp_unicode_path[MAX_PATH];
-    
+
     HANDLE iocp_file_handle;
 
     SRWLOCK lock;              // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.
@@ -238,7 +234,7 @@ typedef struct {
     CRITICAL_SECTION lock;          // For thread-safe access to connected_clients
 }ClientListData;
 
-typedef struct {
+__declspec(align(64)) typedef struct {
     ServerFileStream *fstream;               // Raw memory buffer
     uint64_t free_head;         // Index of the first free block
     uint64_t *next;             // Next free block indices
@@ -246,7 +242,7 @@ typedef struct {
     uint64_t block_count;       // Total number of blocks in the pool
     uint64_t free_blocks;
     SRWLOCK lock;               // Mutex for thread safety
-} ServerFstreamPool;
+}ServerFstreamPool;
 
 typedef struct {
     ServerMessageStream *mstream;               // Raw memory buffer
@@ -279,8 +275,6 @@ typedef struct {
     
     HANDLE iocp_socket_handle;
     HANDLE iocp_file_handle;
-
-    
 
     ServerFstreamPool pool_fstreams;
     ServerMstreamPool pool_mstreams;

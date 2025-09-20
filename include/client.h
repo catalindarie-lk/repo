@@ -222,7 +222,7 @@ typedef struct{
 
     double send_speed_mbps;                     //Mbps
     uint64_t send_period_usec;                  //microsec
-    CRITICAL_SECTION send_lock;
+    // CRITICAL_SECTION send_lock;
 
 } ClientData;
 

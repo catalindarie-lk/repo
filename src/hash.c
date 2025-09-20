@@ -214,8 +214,10 @@ int ht_insert_id(TableIDs *table, const uint32_t sid, const uint32_t id, const u
 }
 void ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id) {
     
-    AcquireSRWLockExclusive(&table->mutex);
     uint64_t index = ht_get_hash_id(id, table->size);
+    
+    AcquireSRWLockExclusive(&table->mutex);
+    
     NodeTableIDs *curr = table->entry[index];
     NodeTableIDs *prev = NULL;
     while (curr) {     
@@ -266,8 +268,10 @@ void ht_remove_all_sid(TableIDs *table, const uint32_t sid) {
 }
 BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status) {
     
-    AcquireSRWLockExclusive(&table->mutex);
     uint64_t index = ht_get_hash_id(id, table->size);
+
+    AcquireSRWLockExclusive(&table->mutex);
+    
     NodeTableIDs *node = table->entry[index];
     while (node) {
         if (node->sid == sid && node->id == id && node->status == status){
@@ -281,8 +285,10 @@ BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const 
 }
 int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status) {
     
-    AcquireSRWLockExclusive(&table->mutex);
     uint64_t index = ht_get_hash_id(id, table->size);
+
+    AcquireSRWLockExclusive(&table->mutex);
+    
     NodeTableIDs *node = table->entry[index];
     while (node) {
         if (node->id == id && node->sid == sid){
@@ -297,8 +303,10 @@ int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, 
 }
 void ht_clean_id(TableIDs *table) {
     
-    AcquireSRWLockExclusive(&table->mutex);
     NodeTableIDs *head = NULL;
+
+    AcquireSRWLockExclusive(&table->mutex);
+    
     for (int index = 0; index < HASH_SIZE_ID; index++) {
         if(table->entry[index]){       
             NodeTableIDs *node = table->entry[index];
