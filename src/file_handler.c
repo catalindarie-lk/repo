@@ -15,7 +15,7 @@
 #include "include/queue.h"
 #include "include/hash.h"
 #include "include/bitmap.h"
-#include "include/checksum.h"
+#include "include/crc32.h"
 #include "include/mem_pool.h"
 #include "include/fileio.h"
 #include "include/folders.h"
@@ -439,6 +439,7 @@ void close_fstream(ServerFileStream *fstream) {
     fstream->written_bytes_count = 0;       // Total bytes written to disk for this file so far.
 
     memset(&fstream->received_sha256, 0, 32);
+    fstream->end_of_file = FALSE;
     memset(&fstream->calculated_sha256, 0, 32);
     fstream->rpath_len = 0;
     memset(&fstream->rpath, 0, MAX_PATH);
@@ -446,6 +447,26 @@ void close_fstream(ServerFileStream *fstream) {
     memset(&fstream->fname, 0, MAX_PATH);
     memset(&fstream->client_addr, 0, sizeof(struct sockaddr_in));
     free_fstream(pool_fstreams, fstream);
+    return;
+}
+void check_file_completition(ServerFileStream *fstream) {
+
+    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+
+    if(!fstream){
+        fprintf(stderr, "ERROR: Trying to end a NULL pointer file stream\n");
+        return;
+    }
+
+    if(fstream->end_of_file && (fstream->written_bytes_count == fstream->file_size)){
+        if(fstream->written_bytes_count == 0){
+            fprintf(stderr, "CRITICAL ERROR: File write finished with zero bytes written: %s\n", fstream->ansi_path);
+        }
+        if(check_bitmap(fstream->received_file_bitmap, fstream->fragment_count)){
+            ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
+        }
+        close_fstream(fstream);
+    }
     return;
 }
 // Deallocate all memory associated with the fstream pool
@@ -626,19 +647,13 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
     ServerFileStream *fstream = find_fstream(pool_fstreams, recv_session_id, recv_file_id);
     if(!fstream){
         fprintf(stderr, "Received fragment frame Seq: %llu for unknown fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_MISSING_METADATA;
+        op_code = ERR_UNKNOWN_FILE_ID;
         goto exit_err;
     }
 
     if(recv_fragment_offset + recv_fragment_size > fstream->file_size){
         fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid fragment offset + size exceeding max file size\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_MALFORMED_FRAME;
-        goto exit_err;
-    }
-
-    if(check_fragment_received(fstream->received_file_bitmap, recv_fragment_offset, FILE_FRAGMENT_SIZE)){
-        fprintf(stderr, "Received duplicate file fragment Seq: %llu; fID: %u; sID: %u; \n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_DUPLICATE_FRAME;
+        op_code = ERR_MALFORMED_FRAME;     
         goto exit_err;
     }
 
@@ -653,13 +668,20 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
         block_size = fstream->file_size - ((fstream->block_count - 1) * SERVER_FILE_BLOCK_SIZE);
     } else {
         fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid block number: %llu\n", recv_seq_num, recv_file_id, recv_session_id, block_nr);
+        op_code = ERR_MALFORMED_FRAME;
+        goto exit_err;
+    }
+
+    AcquireSRWLockExclusive(&fstream->lock);
+
+    if(check_fragment_received(fstream->received_file_bitmap, recv_fragment_offset, FILE_FRAGMENT_SIZE)){
+        ReleaseSRWLockExclusive(&fstream->lock);
+        fprintf(stderr, "Received duplicate file fragment Seq: %llu; fID: %u; sID: %u; \n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = ERR_DUPLICATE_FRAME;
         goto exit_err;
     }
     
-    AcquireSRWLockExclusive(&fstream->lock);
-
     if(fstream->recv_block_status[block_nr] == BLOCK_STATUS_NONE && fstream->recv_block_bytes[block_nr] == 0){
-        fstream->file_block[block_nr] = NULL;
         fstream->file_block[block_nr] = pool_alloc(pool_file_block);
         if(!fstream->file_block[block_nr]){
             ReleaseSRWLockExclusive(&fstream->lock);
@@ -678,48 +700,71 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
     if(fstream->recv_block_bytes[block_nr] < block_size){
         ReleaseSRWLockExclusive(&fstream->lock);
     } else if (fstream->recv_block_bytes[block_nr] == block_size){
-        // fprintf(stderr, "Received full block nr: %llu; Block Offset: %llu; Block size: %llu\n", block_nr, block_offset, block_size);
 
-        NodeTableFileBlock *node_test = ht_insert_fblock(table_file_block, InterlockedIncrement64(&server->file_block_count), fstream->sid, fstream->fid, OP_WR, fstream->file_block[block_nr], block_size);
-        
-        fstream->file_block[block_nr] = NULL;
-        fstream->recv_block_bytes[block_nr] = 0;
-        fstream->recv_block_status[block_nr] = BLOCK_STATUS_RECEIVED;
-        ReleaseSRWLockExclusive(&fstream->lock);
+        NodeTableFileBlock *node = ht_insert_fblock(table_file_block, InterlockedIncrement64(&server->file_block_count), fstream->sid, fstream->fid, fstream->file_block[block_nr], block_size);
 
-        if(!node_test){
-            fprintf(stderr, "Failed to allocate memory for file_test chunk in hash table\n");
-            op_code = ERR_RESOURCE_LIMIT;
+        // IMPORTANT NOTE: the size of the table should be atleast the size of pool_file_block. this will ensure node will be allocated
+        // TODO: at the moment can't safely clean the stream if this fails, need to implement a safe way to handle this
+        if(!node){
+            // close_fstream(fstream);
+            ReleaseSRWLockExclusive(&fstream->lock);
+            fprintf(stderr, "CRITICAL ERROR: Failed to allocate memory for file block in hash table. Terminate file stream (TODO)!\n");
+            op_code = ERR_SERVER_TERMINATED_STREAM;
             goto exit_err;
         }
 
-        memset(&node_test->overlapped, 0, sizeof(OVERLAPPED));
-        node_test->overlapped.Offset = (DWORD)(block_offset);                 // Lower 32 bits
-        node_test->overlapped.OffsetHigh = (DWORD)(block_offset >> 32);       // Upper 32 bits
-
-        BOOL result = WriteFile(
-            fstream->iocp_file_handle,
-            node_test->block_data,
-            node_test->block_size,
-            NULL,
-            &node_test->overlapped
-        );
-        if (!result) {
-            DWORD err = GetLastError();
-            if (err != ERROR_IO_PENDING) {
-                fprintf(stderr, "ERROR: Initiating async write to test file: %lu\n", err);
-                ht_remove_fblock(table_file_block, server->file_block_count, pool_file_block);
-                op_code = ERR_INTERNAL_ERROR;
-                goto exit_err;
-            }
-        }
-    } else {
-        fprintf(stderr, "CRITICAL ERROR: Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid block received bytes: %llu\n", recv_seq_num, recv_file_id, recv_session_id, fstream->recv_block_bytes[block_nr]);
         ReleaseSRWLockExclusive(&fstream->lock);
-        op_code = ERR_INTERNAL_ERROR;
+
+        memset(&node->overlapped, 0, sizeof(OVERLAPPED));
+        node->overlapped.Offset = (DWORD)(block_offset);                 // Lower 32 bits
+        node->overlapped.OffsetHigh = (DWORD)(block_offset >> 32);       // Upper 32 bits
+
+        // BOOL result = WriteFile(
+        //     fstream->iocp_file_handle,
+        //     node->block_data,
+        //     node->block_size,
+        //     NULL,
+        //     &node->overlapped
+        // );
+        // if (!result) {
+        //     DWORD err = GetLastError();
+        //     if (err != ERROR_IO_PENDING) {
+        //         // fprintf(stderr, "ERROR: Initiating async write to test file: %lu\n", err);
+        //         //------------------------------------------
+        //         char *msg_buf = NULL;
+        //         FormatMessage(
+        //             FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        //             NULL,
+        //             err,
+        //             MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        //             (LPSTR)&msg_buf,
+        //             0,
+        //             NULL
+        //         );
+        //         fprintf(stderr, "ERROR: Async write failed (%lu): %s\n", err, msg_buf);
+        //         LocalFree(msg_buf);
+        //         //------------------------------------------
+        //         ht_remove_fblock(table_file_block, server->file_block_count, pool_file_block);
+        //         op_code = ERR_SERVER_TERMINATED_STREAM;
+        //         goto exit_err;
+        //     }
+        // }
+
+        if (retry_async_write(fstream->iocp_file_handle, node->block_data, node->block_size, &node->overlapped) == RET_VAL_ERROR) {
+            fprintf(stderr, "CRITICAL ERROR: Terminate file stream (TODO)!\n");
+            ht_remove_fblock(table_file_block, server->file_block_count, pool_file_block);
+            op_code = ERR_SERVER_TERMINATED_STREAM;
+            goto exit_err;
+        }
+
+    } else {
+        ReleaseSRWLockExclusive(&fstream->lock);
+        fprintf(stderr, "CRITICAL ERROR: Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid block received bytes: %llu; Terminate file stream (TODO)!\n", recv_seq_num, recv_file_id, recv_session_id, fstream->recv_block_bytes[block_nr]);
+        op_code = ERR_SERVER_TERMINATED_STREAM;
         goto exit_err;
     }
 
+    // The fragment frames are cumulated to a sack frame before sending
     if(push_seq(&client->queue_ack_seq, frame->header.seq_num) == RET_VAL_ERROR){
         fprintf(stderr, "ERROR: Failed to push file fragment ack seq to queue\n");
         return RET_VAL_ERROR;
@@ -767,31 +812,35 @@ int handle_file_end(Client *client, UdpFrame *frame){
     uint32_t recv_session_id = _ntohl(frame->header.session_id);
     uint32_t recv_file_id = _ntohl(frame->payload.file_fragment.file_id);
 
-    uint8_t op_code = 0;
+    uint8_t op_code = STS_ACK_UNDEFINED;
 
     if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
         fprintf(stderr, "Received file end frame for completed file Seq: %llu; sID: %u; fID: %u;\n", recv_seq_num, recv_session_id, recv_file_id);
         op_code = ERR_EXISTING_FILE;
-        goto exit_err;
+        goto exit;
     }
 
     ServerFileStream *fstream = find_fstream(pool_fstreams, recv_session_id, recv_file_id);
     if(!fstream){
         fprintf(stderr, "Received end frame Seq: %llu for unknown fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_MISSING_METADATA;
-        goto exit_err;
+        op_code = ERR_UNKNOWN_FILE_ID;
+        goto exit;
     }
 
-    // AcquireSRWLockExclusive(&fstream->lock);
-    // for(int i = 0; i < 32; i++){   
-    //     fstream->received_sha256[i] = frame->payload.file_end.file_hash[i];
-    // }
+    AcquireSRWLockExclusive(&fstream->lock);
+    for(int i = 0; i < 32; i++){   
+        fstream->received_sha256[i] = frame->payload.file_end.file_hash[i];
+    }
     // fstream->file_end_frame_seq_num = recv_seq_num;
-    // fstream->file_hash_received = TRUE;
-    // ReleaseSRWLockExclusive(&fstream->lock);
-    return RET_VAL_SUCCESS;
+    fstream->end_of_file = TRUE;
+    op_code = STS_CONFIRM_FILE_END;
 
-exit_err:
+    check_file_completition(fstream);
+
+    ReleaseSRWLockExclusive(&fstream->lock);
+    goto exit;
+
+exit:
     PoolEntrySendFrame *entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
     if(!entry_send_frame){
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for file end ack error frame\n");
@@ -800,7 +849,13 @@ exit_err:
     construct_ack_frame(entry_send_frame, recv_seq_num, recv_session_id, op_code, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
         pool_free(pool_send_udp_frame, entry_send_frame);
+        fprintf(stderr, "ERROR: Failed to push file end ack error frame to queue\n");
+        return RET_VAL_ERROR;
     }
-    return RET_VAL_ERROR;
+    
+    if(op_code != STS_CONFIRM_FILE_END){
+        return RET_VAL_ERROR;
+    }
+    return RET_VAL_SUCCESS;
 }
 

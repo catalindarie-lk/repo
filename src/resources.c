@@ -8,7 +8,7 @@
 
 #include "include/resources.h"
 #include "include/protocol_frames.h"
-#include "include/checksum.h"
+#include "include/crc32.h"
 #include "include/netendians.h"
 #include "include/mem_pool.h"
 

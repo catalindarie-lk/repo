@@ -80,7 +80,6 @@ typedef struct NodeTableFileBlock{
     uint32_t fid;
     uint32_t sid;
     size_t block_size;
-    uint8_t type;
     char* block_data;
     struct NodeTableFileBlock *next;
 }NodeTableFileBlock;
@@ -95,9 +94,8 @@ typedef struct{
 
 void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_nodes);
 uint64_t ht_get_hash_fblock(const uint64_t key, const size_t size);
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, const uint8_t type, char* pool_node, size_t node_size);
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* pool_node, size_t node_size);
 void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool);
-void ht_clean_fblock(TableFileBlock *table, const uint32_t sid, const uint32_t fid, MemPool *pool);
 BOOL ht_search_fblock(TableFileBlock *table, const uint64_t key);
 
 #endif // FRAMES_HASH_H

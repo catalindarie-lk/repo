@@ -16,7 +16,7 @@
 #include "include/protocol_frames.h"    // For protocol frame definitions
 #include "include/resources.h"
 #include "include/netendians.h"         // For network byte order conversions
-#include "include/checksum.h"           // For checksum validation
+#include "include/crc32.h"           // For checksum validation
 #include "include/sha256.h"
 #include "include/mem_pool.h"           // For memory pool management
 #include "include/fileio.h"             // For file transfer functions
@@ -555,7 +555,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
     uint16_t recv_delimiter = 0;
     uint8_t  recv_frame_type = 0;
     uint64_t recv_seq_num = 0;
-    uint32_t recv_session_id = 0;    
+    uint32_t recv_session_id = 0;
 
     uint32_t recv_session_timeout;
     uint8_t recv_server_status;
@@ -603,7 +603,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
         recv_frame_type = frame->header.frame_type;
         recv_seq_num = _ntohll(frame->header.seq_num);
         recv_session_id = _ntohl(frame->header.session_id);
-
+ 
         inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
         src_port = _ntohs(src_addr->sin_port);
 
@@ -700,14 +700,30 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                     }
                 }
 
+                if(recv_seq_num == DEFAULT_FILE_END_SEQ && recv_op_code == STS_CONFIRM_FILE_END){
+                    // snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_FILE_END - session ID: %lu", recv_session_id);
+                    // log_to_file(log_message);
+                } else if (recv_seq_num == DEFAULT_FILE_END_SEQ && recv_op_code == ERR_EXISTING_FILE){
+                    snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file end frame - - session ID: %lu", recv_session_id);
+                    log_to_file(log_message);
+                } else if (recv_seq_num == DEFAULT_FILE_END_SEQ && recv_op_code == ERR_UNKNOWN_FILE_ID){
+                    snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_FILE_ID for file end frame - - session ID: %lu", recv_session_id);
+                    log_to_file(log_message);
+                }
+
+                if(recv_op_code == ERR_SERVER_TERMINATED_STREAM){
+                    snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM for seq num: %llu", recv_seq_num);
+                    log_to_file(log_message);
+                }
+
                 if(recv_op_code == STS_CONFIRM_MESSAGE_FRAGMENT ||
                         recv_op_code == STS_CONFIRM_FILE_METADATA ||
                         recv_op_code == ERR_CONFIRM_DUPLICATE_FILE_METADATA ||
                         recv_op_code == STS_CONFIRM_FILE_END ||
                         recv_op_code == ERR_DUPLICATE_FRAME || 
                         recv_op_code == ERR_EXISTING_FILE ||
-                        recv_op_code == ERR_EXISTING_MESSAGE
-                        
+                        recv_op_code == ERR_EXISTING_MESSAGE ||
+                        recv_op_code == ERR_UNKNOWN_FILE_ID
                     ){
                     
                     uintptr_t entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
@@ -1083,8 +1099,8 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             // metadata response ok event
         } else if (wait_result == WAIT_OBJECT_0 + 1){
             // metadata response nok event 
-            snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - response nok from server.");
-            log_to_file(log_message);
+            // snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - response nok from server.");
+            // log_to_file(log_message);
             goto clean;
         } else {
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Unexpected result for wait metadata frame event: %lu.", GetLastError());
@@ -1153,25 +1169,25 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
 
         sha256_final(&sha256_ctx, (uint8_t *)&fstream->calculated_sha256);
 
-        // entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
-        // if(!entry_send){
-        //     snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: s_pool_alloc() returned null pointer when allocating for end frame. Should never happen since queue is blocking on push/pop semaphores.");
-        //     log_to_file(log_message);
-        //     goto clean;
-        // }
-        // construct_file_end(entry_send,
-        //                     InterlockedIncrement64(&client->frame_count), 
-        //                     client->sid, 
-        //                     fstream->fid, 
-        //                     fstream->fsize, 
-        //                     (uint8_t *)&fstream->calculated_sha256,
-        //                     client->socket, &client->server_addr);
-        // if(s_push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
-        //     snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file end frame to 'queue_send_prio_udp_frame'. Should never happen since queue is blocking on push/pop semaphores.");
-        //     log_to_file(log_message);
-        //     s_pool_free(pool_send_udp_frame, (void*)entry_send);
-        //     goto clean;
-        // }
+        entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
+        if(!entry_send){
+            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: s_pool_alloc() returned null pointer when allocating for end frame. Should never happen since queue is blocking on push/pop semaphores.");
+            log_to_file(log_message);
+            goto clean;
+        }
+        construct_file_end(entry_send,
+                            DEFAULT_FILE_END_SEQ, 
+                            client->sid, 
+                            fstream->fid, 
+                            fstream->fsize, 
+                            (uint8_t *)&fstream->calculated_sha256,
+                            client->socket, &client->server_addr);
+        if(s_push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
+            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file end frame to 'queue_send_prio_udp_frame'. Should never happen since queue is blocking on push/pop semaphores.");
+            log_to_file(log_message);
+            s_pool_free(pool_send_udp_frame, (void*)entry_send);
+            goto clean;
+        }
 
     clean:
         s_pool_free(pool_send_command, (void*)entry);

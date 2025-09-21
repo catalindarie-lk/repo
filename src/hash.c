@@ -356,7 +356,7 @@ uint64_t ht_get_hash_fblock(const uint64_t key, const size_t size) {
     }
     return ((uint64_t)key % (uint64_t)size);
 }
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, const uint8_t type, char* pool_node, size_t node_size) {
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* pool_node, size_t block_size) {
 
     if(!table){
         fprintf(stderr, "ERROR: Invalid pointer(s) passed to insert file block from hash table\n");
@@ -387,9 +387,8 @@ NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, 
     table_node->key = key;
     table_node->sid = sid;
     table_node->fid = fid;
-    table_node->type = type;
     table_node->block_data = pool_node;
-    table_node->block_size = node_size;
+    table_node->block_size = block_size;
     // memcpy(node->buffer, buffer, buffer_size);
     table_node->next = (NodeTableFileBlock *)table->entry[index];  // Insert at the head (linked list)
     table->entry[index] = table_node;
@@ -421,10 +420,9 @@ void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool) 
             curr->key = 0;
             curr->sid = 0;
             curr->fid = 0;
-            curr->type = 0;
             curr->block_size = 0;
-            pool_free(pool, (void*)curr->block_data);
-            curr->block_data = NULL;
+            // pool_free(pool, (void*)curr->block_data);
+            // curr->block_data = NULL;
             pool_free(&table->pool_nodes, (void*)curr);
             curr = NULL;
             table->count--;
@@ -434,45 +432,6 @@ void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool) 
         }
         prev = curr;
         curr = curr->next;
-    }
-    ReleaseSRWLockExclusive(&table->mutex);
-    return;
-}
-void ht_clean_fblock(TableFileBlock *table, const uint32_t sid, const uint32_t fid, MemPool *pool) {
-    
-    if(!table || !pool){
-        fprintf(stderr, "ERROR: Invalid pointer(s) passed to clean file block hash table\n");
-        return;
-    }
-
-    AcquireSRWLockExclusive(&table->mutex);
-    for (size_t i = 0; i < table->size; i++) {
-        NodeTableFileBlock *curr = table->entry[i];
-        NodeTableFileBlock *prev = NULL;
-
-        while (curr) {
-            if (curr->sid == sid && curr->fid == fid) {
-                // NodeTableFileBlock *to_remove = curr;
-                if (prev) {
-                    prev->next = curr->next;
-                } else {
-                    table->entry[i] = curr->next;
-                }
-                curr->key = 0;
-                curr->sid = 0;
-                curr->fid = 0;
-                curr->type = 0;
-                curr->block_size = 0;
-                pool_free(pool, (void*)curr->block_data);
-                curr->block_data = NULL;
-                pool_free(&table->pool_nodes, (void*)curr);
-                curr = NULL;
-                table->count--;
-            } else {
-                prev = curr;
-                curr = curr->next;
-            }
-        }
     }
     ReleaseSRWLockExclusive(&table->mutex);
     return;

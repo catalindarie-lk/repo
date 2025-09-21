@@ -5,6 +5,10 @@
 #include <stdio.h>
 #include "include/fileio.h"
 
+#define MAX_IOCP_FILE_WRITE_RETRIES 3
+#define RETRY_BACKOFF_MS 10
+
+
 long long get_file_size(const char *filepath, FILE **fp){
 
     FILE *fptr = fopen(filepath, "rb"); // Open in binary mode
@@ -148,4 +152,47 @@ BOOL DeleteFileByHandle(HANDLE hFile) {
     }
 
     return result;
+}
+
+int retry_async_write(HANDLE file_handle, char* buffer, size_t size, OVERLAPPED *overlapped) {
+    int retry_count = 0;
+
+    while (retry_count < MAX_IOCP_FILE_WRITE_RETRIES) {
+        BOOL result = WriteFile(file_handle, (LPCVOID)buffer, (DWORD)size, NULL, overlapped);
+
+        if (result) {
+            return RET_VAL_SUCCESS; // Successfully queued
+        }
+
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            return RET_VAL_SUCCESS; // Successfully queued asynchronously
+        }
+
+        // Log error
+        char *msg_buf = NULL;
+        FormatMessage(
+            FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+            NULL,
+            err,
+            MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+            (LPSTR)&msg_buf,
+            0,
+            NULL
+        );
+
+        fprintf(stderr, "Async write attempt %d failed (%lu): %s\n", retry_count + 1, err, msg_buf ? msg_buf : "Unknown error");
+        if (msg_buf) LocalFree(msg_buf);
+
+        if(err != ERROR_NOT_ENOUGH_MEMORY &&
+           err != ERROR_NOT_ENOUGH_QUOTA &&
+           err != ERROR_WORKING_SET_QUOTA) {
+            break; // Fatal error, don't retry
+        }
+
+        Sleep(RETRY_BACKOFF_MS * (retry_count + 1)); // Exponential backoff
+        retry_count++;
+    }
+
+    return RET_VAL_ERROR; // All retries failed
 }

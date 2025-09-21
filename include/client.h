@@ -36,9 +36,6 @@
 #define CLIENT_ERROR_LOG_FILE                       "H:\\_test\\client_error_log.txt" // Path to the client log file
 #define CLIENT_DEBUG_LOG_FILE                       "H:\\_test\\client_debug_log.txt" // Path to the client debug log file
 
-
-
-
 #define CLIENT_LOG_MESSAGE_LEN                      256
 
 #define CONNECT_REQUEST_TIMEOUT_MS                  2500                  // Timeout for a connection request in milliseconds
@@ -53,7 +50,6 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Client Stream Configuration ---
-#define CLIENT_MAX_ACTIVE_FSTREAMS                  5                     // Maximum number of concurrent file streams (transfers)
 #define CLIENT_MAX_ACTIVE_MSTREAMS                  1                     // Maximum number of concurrent message streams (e.g., long text messages)
 
 // --- Client Worker Thread Configuration ---

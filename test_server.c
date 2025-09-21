@@ -14,7 +14,7 @@
 #include "include/protocol_frames.h"    // For protocol frame definitions
 #include "include/resources.h"
 #include "include/netendians.h"         // For network byte order conversions
-#include "include/checksum.h"           // For checksum validation
+#include "include/crc32.h"           // For checksum validation
 #include "include/sha256.h"
 #include "include/mem_pool.h"           // For memory pool management
 #include "include/fileio.h"             // For file transfer functions
@@ -147,7 +147,7 @@ static int init_server_buffers(){
 
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_RECV);
-    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, 1024);
+    init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, SERVER_POOL_SIZE_FILE_BLOCK);
         
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
@@ -156,7 +156,7 @@ static int init_server_buffers(){
     init_table_id(table_file_id, 1024, 1048576);
     init_table_id(table_message_id, 1024, 32768);
 
-    init_table_fblock(table_file_block, 1014, 1024);
+    init_table_fblock(table_file_block, SERVER_POOL_SIZE_FILE_BLOCK, SERVER_POOL_SIZE_FILE_BLOCK);
     
     init_queue_slot(queue_client_slot, SERVER_QUEUE_SIZE_CLIENT_SLOT);
 
@@ -876,25 +876,24 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
             continue;
         }
         
-        if(NrOfBytesWritten > 0 && node->type == OP_WR){
+        if(NrOfBytesWritten > 0 && NrOfBytesWritten <= SERVER_FILE_BLOCK_SIZE){
             AcquireSRWLockExclusive(&fstream->lock);
             // if(!ht_search_fblock(table_file_block, node->key)){
             //     fprintf(stdout,"ERROR: Key %llu not found in hash table!\n", node->key);
             // }
-            // uint64_t block_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
-            // uint64_t block_nr = block_offset / SERVER_FILE_BLOCK_SIZE;
+            uint64_t block_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
+            uint64_t block_nr = block_offset / SERVER_FILE_BLOCK_SIZE;
             ht_remove_fblock(table_file_block, node->key, pool_file_block);
+            pool_free(pool_file_block, fstream->file_block[block_nr]);
+
+            fstream->file_block[block_nr] = NULL;
+            fstream->recv_block_bytes[block_nr] = 0;
+            // *(fstream->recv_block_bytes + block_nr) = 0;
+            fstream->recv_block_status[block_nr] = BLOCK_STATUS_RECEIVED;
 
             fstream->written_bytes_count += NrOfBytesWritten;
-            if(fstream->written_bytes_count == fstream->file_size){
-                if(fstream->written_bytes_count == 0){
-                    fprintf(stderr, "CRITICAL ERROR: File write finished with zero bytes written: %s\n", fstream->ansi_path);
-                }
-                if(check_bitmap(fstream->received_file_bitmap, fstream->fragment_count)){
-                    ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
-                }
-                close_fstream(fstream);
-            }
+ 
+            check_file_completition(fstream);
             ReleaseSRWLockExclusive(&fstream->lock);
         }
     }

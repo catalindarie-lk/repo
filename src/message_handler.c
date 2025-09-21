@@ -13,7 +13,7 @@
 #include "include/queue.h"
 #include "include/hash.h"
 #include "include/bitmap.h"
-#include "include/checksum.h"
+#include "include/crc32.h"
 #include "include/mem_pool.h"
 #include "include/fileio.h"
 

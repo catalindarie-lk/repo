@@ -22,12 +22,11 @@
 #define MAX_FRAME_SIZE                      1400
 #define FRAME_DELIMITER                     0xAABB             // A magic number to identify valid frames
 
-
+#define CLIENT_MAX_ACTIVE_FSTREAMS          4                     // Maximum number of concurrent file streams (transfers) per client
 
 #define MAX_PAYLOAD_SIZE                    (MAX_FRAME_SIZE - sizeof(FrameHeader))
 #define TEXT_FRAGMENT_SIZE                  (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 4)
 #define FILE_FRAGMENT_SIZE                  (MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 2) - sizeof(uint64_t))
-
 
 #define MAX_SACK_COUNT                      ((MAX_PAYLOAD_SIZE - sizeof(uint8_t)) / sizeof(uint64_t)) // Maximum number of sequence numbers in a SACK frame                      
 #define MAX_NAME_SIZE                       255                 // Maximum size for client/server names
@@ -37,6 +36,8 @@
 #define DEFAULT_KEEP_ALIVE_SEQ              (UINT64_MAX - 3)
 #define DEFAULT_SACK_SEQ                    (UINT64_MAX - 4)
 #define DEFAULT_RTT_SEQ                     (UINT64_MAX - 5)
+#define DEFAULT_FILE_END_SEQ                (UINT64_MAX - 6)
+// #define DEFAULT_FILE_METADATA_SEQ           (UINT64_MAX - 7)
 
 #define DEFAULT_CONNECT_REQUEST_SID         (UINT32_MAX - 1)
 
@@ -48,9 +49,6 @@
 
 #define OP_RECV ((uint8_t)(1))
 #define OP_SEND ((uint8_t)(2))
-
-#define OP_WR ((uint8_t)(3))
-#define OP_RD ((uint8_t)(4))
 
 // --- Frame Types ---
 typedef uint8_t FrameType;
@@ -75,7 +73,7 @@ enum FrameType{
 typedef uint8_t AckErrorCode;
 enum AckErrorCode {
     // STS_FRAME_DATA_ACK = 11,
-
+    STS_ACK_UNDEFINED = 0,
     
     STS_KEEP_ALIVE = 12,  
     STS_CONFIRM_FILE_METADATA = 21,
@@ -85,7 +83,7 @@ enum AckErrorCode {
 
     ERR_EXISTING_FILE = 100,       // Server has completed this transfer
     ERR_DUPLICATE_FRAME = 101,     // Frame was already received
-    ERR_MISSING_METADATA = 102,
+    ERR_UNKNOWN_FILE_ID = 102,
     ERR_EXISTING_MESSAGE = 103,
     ERR_MESSAGE_FINAL_CHECK = 104,
     ERR_MEMORY_ALLOCATION = 105,
@@ -99,7 +97,10 @@ enum AckErrorCode {
     ERR_UNSUPPORTED_FRAME = 122,   // Frame type not supported
     ERR_UNAUTHORIZED = 123,        // Authentication/authorization failed
     ERR_INTERNAL_ERROR = 124,       // Catch-all for unexpected server fault
-    ERR_UNKNOWN_ERROR = 125
+    ERR_UNKNOWN_ERROR = 125,
+
+    ERR_SERVER_TERMINATED_STREAM = 126
+
 };
 
 typedef uint8_t StreamErrorCode;

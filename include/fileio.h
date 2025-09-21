@@ -24,4 +24,6 @@ size_t safe_fread(FILE *fp, void *buffer, size_t total_size);
 BOOL RenameFileByHandle(HANDLE hFile, const wchar_t* newPath);
 BOOL DeleteFileByHandle(HANDLE hFile);
 
+int retry_async_write(HANDLE file_handle, char* buffer, size_t size, OVERLAPPED *overlapped) ;
+
 #endif // SAFEFILEIO_H

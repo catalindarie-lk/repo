@@ -16,15 +16,16 @@
 #ifndef RET_VAL_ERROR
 #define RET_VAL_ERROR                               -1
 #endif
+
 ////////////////////////////////////////////////////
 
 #ifndef DEFAULT_SESSION_TIMEOUT_SEC
-#define DEFAULT_SESSION_TIMEOUT_SEC                 60
+#define DEFAULT_SESSION_TIMEOUT_SEC                 3600
 #endif
 
 // --- Constants 
 #define SERVER_NAME                                 "lkdc UDP Text/File Transfer Server"
-#define MAX_CLIENTS                                 10
+#define MAX_CLIENTS                                 8
 #define SACK_READY_FRAME_TIMEOUT_MS                 100
 
 #define SERVER_PARTITION_DRIVE                      "H:\\"
@@ -35,7 +36,7 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server Stream Configuration ---
-#define MAX_SERVER_ACTIVE_FSTREAMS                  32
+#define MAX_SERVER_ACTIVE_FSTREAMS                  ((MAX_CLIENTS + 1) * CLIENT_MAX_ACTIVE_FSTREAMS) // 5 file streams per client + 5 extra for safety
 #define MAX_SERVER_ACTIVE_MSTREAMS                  10
 
 // --- Server Worker Thread Configuration ---
@@ -66,7 +67,7 @@
 #define SERVER_POOL_SIZE_RECV                       (SERVER_QUEUE_SIZE_RECV_FRAME + \
                                                     SERVER_QUEUE_SIZE_RECV_PRIO_FRAME)
 #define SERVER_POOL_SIZE_IOCP_RECV                  (SERVER_POOL_SIZE_RECV * 2)
-
+#define SERVER_POOL_SIZE_FILE_BLOCK                 (256) // Number of file blocks in the pool
 
 
 // --- Macro to Parse Global Data to Threads ---
@@ -175,6 +176,8 @@ typedef struct{
     uint64_t written_bytes_count;       // Total bytes written to disk for this file so far.
     
     uint8_t received_sha256[32];        // Buffer for sha256 received from the client
+    BOOL end_of_file;                  // Flag indicating if the end of the file has been reached
+
     uint8_t calculated_sha256[32];      // Buffer for sha256 calculated by the server
 
     char rpath[MAX_PATH];

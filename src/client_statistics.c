@@ -78,7 +78,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             // Fstream Progress Blocks (Label | Value Edit | Progress Bar)
             // --- CHANGED: Use a for loop for fstream creation ---
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; ++i) {
                 char labelText[64];
                 sprintf_s(labelText, sizeof(labelText), "Fstream %d Progress:", i);
 
@@ -181,7 +181,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 
             // Update Fstream Progress Bars and Edit Controls
             // --- CHANGED: Use a for loop for fstream updates ---
-            for (int i = 0; i < 5; ++i) {
+            for (int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; ++i) {
                 double current_progress = g_clientStats.fstream_progress[i];
                 sprintf_s(buffer, _countof(buffer), "%.2f %%", current_progress);
                 SetWindowTextA(g_hFstreamEdit[i], buffer);

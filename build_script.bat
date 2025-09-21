@@ -14,7 +14,7 @@ set common=%workspace%\src\resources.c ^
 %workspace%\src\bitmap.c ^
 %workspace%\src\queue.c ^
 %workspace%\src\hash.c ^
-%workspace%\src\checksum.c ^
+%workspace%\src\crc32.c ^
 %workspace%\src\fileio.c ^
 %workspace%\src\folders.c
 

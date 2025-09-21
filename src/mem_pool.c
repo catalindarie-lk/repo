@@ -89,7 +89,7 @@ void pool_free(MemPool* pool, void* ptr) {
     // Validate the index and usage flag for safety and debugging
     if (index >= pool->block_count || pool->used[index] == FREE_BLOCK) {
         // Log critical errors with maximum detail
-        fprintf(stderr, "CRITICAL ERROR: Attempt to free invalid or already freed chunk!\n");
+        // fprintf(stderr, "CRITICAL ERROR: Attempt to free invalid or already freed chunk!\n");
         // fprintf(stderr, "   Pointer to free: %p\n", ptr);
         // fprintf(stderr, "   Calculated index: %llu\n", index);
         // fprintf(stderr, "   Pool base address: %p\n", pool->memory);

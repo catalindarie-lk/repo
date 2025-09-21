@@ -5,7 +5,7 @@
 #include <ws2tcpip.h>
 #include <windows.h>
 
-#include "include/checksum.h"
+#include "include/crc32.h"
 #include "include/netendians.h"
 #include "include/protocol_frames.h"
 
