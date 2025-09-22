@@ -49,22 +49,6 @@ uintptr_t s_pop_ptr(s_QueuePtr *queue);
 
 __declspec(align(64))typedef struct {
     size_t size;
-    uint32_t *slot;      // pointer to an array of uintptr_t
-    volatile size_t head;          
-    volatile size_t tail;
-    volatile size_t pending;
-    SRWLOCK lock;      // Mutex for thread-safe access to frame_buffer
-    HANDLE push_semaphore;      // this semaphore is released when frame is pushed on the queue
-}QueueClientSlot;
-
-//----------------------------------------------------------------------------------------------------------------
-
-int init_queue_slot(QueueClientSlot *queue, size_t slot);
-int push_slot(QueueClientSlot *queue,  const uint32_t slot);
-uint32_t pop_slot(QueueClientSlot *queue);
-
-__declspec(align(64))typedef struct {
-    size_t size;
     uint64_t *seq;      // pointer to an array of uintptr_t
     volatile size_t head;          
     volatile size_t tail;

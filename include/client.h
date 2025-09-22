@@ -54,7 +54,7 @@
 
 // --- Client Worker Thread Configuration ---
 #define CLIENT_MAX_THREADS_RECV_SEND_FRAME          1                     // Number of threads dedicated to receiving and sending frames
-#define CLIENT_MAX_TREADS_PROCESS_FRAME             5                     // Number of threads dedicated to processing received frames
+#define CLIENT_MAX_TREADS_PROCESS_FRAME             4                     // Number of threads dedicated to processing received frames
 #define CLIENT_MAX_THREADS_SEND_FRAME               1                     // Number of threads for popping normal send frames from queue
 //---------------------------------------------------------------------------------------------------------
 // --- Client SEND Buffer Sizes ---

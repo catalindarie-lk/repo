@@ -665,6 +665,10 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
 
                 if(recv_seq_num == DEFAULT_DISCONNECT_REQUEST_SEQ && recv_op_code == STS_CONFIRM_DISCONNECT){
                     SetEvent(client->hevent_connection_closed);
+                    client->session_status = CONNECTION_CLOSED;
+                    ///////////////////////////////////////////////
+                    // clean_table_send_frame(table_send_udp_frame);
+                    ///////////////////////////////////////////////
                     snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_DISCONNECT - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
                     log_to_file(log_message);
                     fprintf(stderr, "%s\n", log_message);
@@ -745,7 +749,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
             case FRAME_TYPE_DISCONNECT:
                 if(recv_session_id != client->sid){
                     break;                    
-                }
+                }                
                 snprintf(log_message, sizeof(log_message), "Received disconnect request frame. Session closed by server...");
                 log_to_file(log_message);
                 fprintf(stderr, "%s\n", log_message);
@@ -1164,6 +1168,12 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                 frame_fragment_offset += frame_fragment_size;                       
                 chunk_bytes_to_send -= frame_fragment_size;
                 fstream->pending_bytes -= frame_fragment_size;
+
+                if(client->session_status == CONNECTION_CLOSED){
+                    fprintf(stderr, "Disconnected from server...\n");
+                    goto clean;
+                }
+
             }     
         }                  
 
@@ -1403,15 +1413,15 @@ static DWORD WINAPI fthread_client_command(LPVOID lpParam) {
                 SendAllFilesInFolderAndSubfolders(_path, strlen(_path));
                 break;
             //--------------------------------------------------------------------------------------------------------------------------
-            case 't':
-            case 'T':
-                if(Client.session_status != CONNECTION_ESTABLISHED){
-                    break;
-                }
-                memset(_path, 0, MAX_PATH);
-                snprintf(_path, MAX_PATH, "%s%s", CLIENT_ROOT_FOLDER, "test_file.txt");
-                SendTextInFile(_path, strlen(_path));
-                break;
+            // case 't':
+            // case 'T':
+            //     if(Client.session_status != CONNECTION_ESTABLISHED){
+            //         break;
+            //     }
+            //     memset(_path, 0, MAX_PATH);
+            //     snprintf(_path, MAX_PATH, "%s%s", CLIENT_ROOT_FOLDER, "test_file.txt");
+            //     SendTextInFile(_path, strlen(_path));
+            //     break;
             //--------------------------------------------------------------------------------------------------------------------------
             case '\n':
                 break;

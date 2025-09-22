@@ -184,7 +184,7 @@ DWORD WINAPI GuiThread_Server(LPVOID lpParam) {
 // ------------------------------------------------------------------
 DWORD WINAPI MainLogicThread_Server(LPVOID lpParam) {
     
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
     
     HWND hDisplayWnd = (HWND)lpParam;
     uint64_t session_id_counter = 1000; // Dummy counter for session IDs
@@ -204,7 +204,7 @@ DWORD WINAPI MainLogicThread_Server(LPVOID lpParam) {
         EnterCriticalSection(&g_statsLock);
         g_serverStats.connected_clients = 0;
         for(int i = 0; i < MAX_CLIENTS; ++i){
-            if(client_list->client[i].slot_status == SLOT_BUSY){
+            if(pool_clients->used[i] == USED_BLOCK){
                 g_serverStats.connected_clients++;
             }
         }

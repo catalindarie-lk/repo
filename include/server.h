@@ -20,13 +20,13 @@
 ////////////////////////////////////////////////////
 
 #ifndef DEFAULT_SESSION_TIMEOUT_SEC
-#define DEFAULT_SESSION_TIMEOUT_SEC                 3600
+#define DEFAULT_SESSION_TIMEOUT_SEC                 30
 #endif
 
 // --- Constants 
 #define SERVER_NAME                                 "lkdc UDP Text/File Transfer Server"
-#define MAX_CLIENTS                                 8
-#define SACK_READY_FRAME_TIMEOUT_MS                 100
+#define MAX_CLIENTS                                 4
+#define SACK_READY_FRAME_TIMEOUT_MS                 10
 
 #define SERVER_PARTITION_DRIVE                      "H:\\"
 #define SERVER_ROOT_FOLDER                          "H:\\_test\\server_root\\"
@@ -54,7 +54,7 @@
 #define SERVER_QUEUE_SIZE_SEND_CTRL_FRAME           16
 
 #define SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ            (SERVER_QUEUE_SIZE_SEND_FRAME)
-#define SERVER_QUEUE_SIZE_CLIENT_SLOT               (SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ * MAX_SERVER_ACTIVE_FSTREAMS)
+#define SERVER_QUEUE_SIZE_CLIENT_PTR                (SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ * MAX_SERVER_ACTIVE_FSTREAMS)
 // --- Server SEND Memory Pool Sizes ---
 #define SERVER_POOL_SIZE_SEND                       (SERVER_QUEUE_SIZE_SEND_FRAME + \
                                                     SERVER_QUEUE_SIZE_SEND_PRIO_FRAME + \
@@ -69,13 +69,13 @@
 #define SERVER_POOL_SIZE_IOCP_RECV                  (SERVER_POOL_SIZE_RECV * 2)
 #define SERVER_POOL_SIZE_FILE_BLOCK                 (256) // Number of file blocks in the pool
 
+#define FILETIME_TO_UINT64(ft)                      ((((uint64_t)(ft).dwHighDateTime) << 32) | ((uint64_t)(ft).dwLowDateTime))
 
 // --- Macro to Parse Global Data to Threads ---
 // This macro simplifies passing pointers to global client data structures into thread functions.
 // It creates local pointers within the thread function's scope, pointing to the global instances.
-#define PARSE_SERVER_GLOBAL_DATA(server_obj, client_list_obj, buffers_obj, threads_obj) \
+#define PARSE_SERVER_GLOBAL_DATA(server_obj, buffers_obj, threads_obj) \
     ServerData *server = &(server_obj); \
-    ClientListData *client_list = &(client_list_obj); \
     ServerBuffers *buffers = &(buffers_obj); \
     ServerThreads *threads = &(threads_obj); \
     MemPool *pool_file_block = &((buffers_obj).pool_file_block); \
@@ -84,7 +84,6 @@
     MemPool *pool_recv_udp_frame = &((buffers_obj).pool_recv_udp_frame); \
     QueuePtr *queue_recv_udp_frame = &((buffers_obj).queue_recv_udp_frame); \
     QueuePtr *queue_recv_prio_udp_frame = &((buffers_obj).queue_recv_prio_udp_frame); \
-    QueuePtr *queue_process_fstream = &((buffers_obj).queue_process_fstream); \
     TableIDs *table_file_id = &((buffers_obj).table_file_id); \
     TableIDs *table_message_id = &((buffers_obj).table_message_id); \
     TableFileBlock *table_file_block = &((buffers_obj).table_file_block); \
@@ -92,7 +91,7 @@
     QueuePtr *queue_send_udp_frame = &((buffers_obj).queue_send_udp_frame); \
     QueuePtr *queue_send_prio_udp_frame = &((buffers_obj).queue_send_prio_udp_frame); \
     QueuePtr *queue_send_ctrl_udp_frame = &((buffers_obj).queue_send_ctrl_udp_frame); \
-    QueueClientSlot *queue_client_slot = &((buffers_obj).queue_client_slot); \
+    QueuePtr *queue_client_ptr = &((buffers_obj).queue_client_ptr); \
     ServerFstreamPool *pool_fstreams = &((server_obj).pool_fstreams); \
     ServerMstreamPool *pool_mstreams = &((server_obj).pool_mstreams); \
     ServerClientPool *pool_clients = &((server_obj).pool_clients); \
@@ -105,16 +104,9 @@ enum Status{
     STATUS_ERROR = 3
 };
 
-typedef uint8_t ClientConnection;
 enum ClientConnection {
     CLIENT_DISCONNECTED = 0,
     CLIENT_CONNECTED = 1
-};
-
-typedef uint8_t ClientSlotStatus;
-enum ClientSlotStatus {
-    SLOT_FREE = 0,
-    SLOT_BUSY = 1
 };
 
 enum FileBlockStatus{
@@ -152,7 +144,7 @@ typedef struct {
     char fname[MAX_NAME_SIZE];      // File Name: Buffer to store the name of the file associated with this message stream.
 
     SRWLOCK lock;              // Lock: Spinlock/Mutex to protect access to this MsgStream structure in multithreaded environments.
-} ServerMessageStream;
+}ServerMessageStream;
 
 typedef struct{
     struct sockaddr_in client_addr;
@@ -167,16 +159,16 @@ typedef struct{
     uint64_t file_bitmap_size;          // Number of uint64_t entries in the bitmap array.
 
     char **file_block;
-    uint64_t *recv_block_bytes;          // Total bytes received for this file so far.
+    uint64_t *recv_block_bytes;         // Total bytes received for this file so far.
     uint64_t *recv_block_status;
 
     uint64_t fragment_count;            // Total number of fragments in the entire file.
     uint64_t block_count;
 
     uint64_t written_bytes_count;       // Total bytes written to disk for this file so far.
-    
+
     uint8_t received_sha256[32];        // Buffer for sha256 received from the client
-    BOOL end_of_file;                  // Flag indicating if the end of the file has been reached
+    BOOL end_of_file;                   // Flag indicating if the end of the file has been reached
 
     uint8_t calculated_sha256[32];      // Buffer for sha256 calculated by the server
 
@@ -184,7 +176,7 @@ typedef struct{
     uint32_t rpath_len;
     char fname[MAX_PATH];               // Array to store the file name+path.
     uint32_t fname_len;
-    
+
     char ansi_path[MAX_PATH];
     wchar_t unicode_path[MAX_PATH];
     char temp_ansi_path[MAX_PATH];
@@ -192,7 +184,7 @@ typedef struct{
 
     HANDLE iocp_file_handle;
 
-    SRWLOCK lock;              // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.
+    SRWLOCK lock;                       // Spinlock/Mutex to protect access to this FileStream structure in multithreaded environments.
 
 }ServerFileStream;
 
@@ -202,37 +194,28 @@ typedef struct {
     uint64_t start_timestamp;
     BOOL start_recorded;
     SRWLOCK lock;
-}ClientSAckContext;
+}ClientSAckBuffer;
 
 typedef struct {
-
     struct sockaddr_in client_addr;            // Client's address
     char ip[INET_ADDRSTRLEN];
     uint16_t port;
-    
+
     uint32_t cid;                 // Unique ID received from the client
+    uint32_t sid;                // Unique ID assigned by the server for this clients's session
     char name[MAX_NAME_SIZE];               // Optional: human-readable identifier received from the client
     uint8_t flags;                       // Flags received from the client (e.g., protocol version, capabilities)
     uint8_t connection_status;
- 
-    uint32_t sid;                // Unique ID assigned by the server for this clients's session
+
     volatile time_t last_activity_time; // Last time the client sent a frame (for timeout checks)             
 
-    uint32_t slot;                  // Index of the slot the client is connected to [0..MAX_CLIENTS-1]
-    uint8_t slot_status;                // 0->FREE; 1->BUSY
-   
     QueueSeq queue_ack_seq;
-    ClientSAckContext sack_ctx; // SACK context for this client
- 
+    ClientSAckBuffer sack_buff; // SACK context for this client
+
     SRWLOCK lock;
-} Client;
+}Client;
 
 typedef struct {
-    Client client[MAX_CLIENTS];     // Array of connected clients
-    CRITICAL_SECTION lock;          // For thread-safe access to connected_clients
-}ClientListData;
-
-__declspec(align(64)) typedef struct {
     ServerFileStream *fstream;               // Raw memory buffer
     uint64_t free_head;         // Index of the first free block
     uint64_t *next;             // Next free block indices
@@ -250,7 +233,7 @@ typedef struct {
     uint64_t block_count;       // Total number of blocks in the pool
     uint64_t free_blocks;
     SRWLOCK lock;               // Mutex for thread safety
-} ServerMstreamPool;
+}ServerMstreamPool;
 
 typedef struct {
     Client *client;               // Raw memory buffer
@@ -260,7 +243,7 @@ typedef struct {
     uint64_t block_count;       // Total number of blocks in the pool
     uint64_t free_blocks;
     SRWLOCK lock;               // Mutex for thread safety
-} ServerClientPool;
+}ServerClientPool;
 
 typedef struct {
     SOCKET socket;
@@ -277,7 +260,6 @@ typedef struct {
     ServerFstreamPool pool_fstreams;
     ServerMstreamPool pool_mstreams;
     ServerClientPool pool_clients;
-
 }ServerData;
 
 typedef struct {
@@ -294,19 +276,15 @@ typedef struct {
     QueuePtr queue_send_prio_udp_frame;     // For ACK frames
     QueuePtr queue_send_ctrl_udp_frame;     // For Request/Keep alive frames
 
-    QueuePtr queue_process_fstream;
-
-    QueueClientSlot queue_client_slot;
+    QueuePtr queue_client_ptr;
 
     TableIDs table_file_id;
     TableIDs table_message_id;
 
     TableFileBlock table_file_block;
-
 }ServerBuffers;
 
 typedef struct {
-
     HANDLE recv_send_frame[SERVER_MAX_THREADS_RECV_SEND_FRAME];
     HANDLE file_block_written[SERVER_MAX_THREADS_WRITE_FILE_BLOCK];
     HANDLE process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
@@ -327,7 +305,7 @@ typedef struct {
 
 extern ServerData Server;
 extern ServerBuffers Buffers;
-extern ClientListData ClientList;
+//extern ClientListData ClientList;
 extern ServerThreads Threads;
 
 // Thread functions
@@ -338,8 +316,6 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam);
 static DWORD WINAPI fthread_send_sack_frame(LPVOID lpParam);
 static DWORD WINAPI fthread_scan_for_trailing_sack(LPVOID lpParam);
 
-// static DWORD WINAPI fthread_send_ack_frame(LPVOID lpParam);
-
 static DWORD WINAPI fthread_send_frame(LPVOID lpParam);
 static DWORD WINAPI fthread_send_prio_frame(LPVOID lpParam);
 static DWORD WINAPI fthread_send_ctrl_frame(LPVOID lpParam);
@@ -348,17 +324,15 @@ static DWORD WINAPI fthread_client_timeout(LPVOID lpParam);
 static DWORD WINAPI fthread_server_command(LPVOID lpParam);
 
 // Client management functions
-void init_client_pool(ServerClientPool* pool, const uint64_t block_count);
-static Client* find_client(const uint32_t session_id);
-static Client* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
-static int remove_client(const uint32_t slot);
 
-static void cleanup_client(Client *client);
 static BOOL validate_file_hash(ServerFileStream *fstream);
 static void check_open_file_stream();
 
- 
-
-
+void init_client_pool(ServerClientPool* pool, const uint64_t block_count);
+Client* alloc_client(ServerClientPool* pool);
+Client* find_client(ServerClientPool* pool, const uint32_t sid);
+int init_client(Client *client, const uint32_t sid, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
+void free_client(ServerClientPool* pool, Client* client);
+static void close_client(Client *client);
 
 #endif

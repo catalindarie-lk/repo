@@ -61,7 +61,7 @@ __declspec(align(64))typedef struct{
     size_t size;                            // size of the hash table base array. each index in array is a pointer to a linked list 
                                             // of nodes which have overlapping hash for the sequence number
     TableNodeSendFrame **node;              // array of pointers to TableNodeSendFrame
-    SRWLOCK mutex;                 // mutex for shared data access
+    SRWLOCK mutex;                          // mutex for shared data access
     size_t count;                           // nr of inserted frmes in the table
     MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated
                                             // from this pre-allocated mem pool;
@@ -72,6 +72,7 @@ uint64_t get_hash_table_send_frame(const uint64_t seq_num, const size_t size);
 int insert_table_send_frame(TableSendFrame *table, const uintptr_t entry);
 uintptr_t remove_table_send_frame(TableSendFrame *table, const uint64_t seq_num);
 uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num);
+void clean_table_send_frame(TableSendFrame *table);
 
 //--------------------------------------------------------------------------------------------------------------------------
 typedef struct NodeTableFileBlock{

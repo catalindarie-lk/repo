@@ -118,7 +118,7 @@ ServerFileStream* alloc_fstream(ServerFstreamPool* pool) {
 }
 static uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct sockaddr_in *client_addr) {
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     uint8_t err_code = STS_STREAM_UNDEFINED;
 
@@ -376,7 +376,7 @@ void free_fstream(ServerFstreamPool* pool, ServerFileStream* fstream) {
 }
 void close_fstream(ServerFileStream *fstream) {
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
     
     if(!fstream){
         fprintf(stderr, "ERROR: Trying to clean a NULL pointer file stream\n");
@@ -451,7 +451,7 @@ void close_fstream(ServerFileStream *fstream) {
 }
 void check_file_completition(ServerFileStream *fstream) {
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     if(!fstream){
         fprintf(stderr, "ERROR: Trying to end a NULL pointer file stream\n");
@@ -497,20 +497,16 @@ void destroy_fstream_pool(ServerFstreamPool* pool) {
 // Process received file metadata frame
 int handle_file_metadata(Client *client, UdpFrame *frame) {
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
-    if(client == NULL){
-        fprintf(stdout, "ERROR: Received frame for non existing client context!\n");
+    if(!client){
+        fprintf(stdout, "Received invalid client pointer handle_file_metadata()\n");
         return RET_VAL_ERROR;
     }
-
-    AcquireSRWLockShared(&client->lock);
-    if(client->slot_status == SLOT_FREE){
-        ReleaseSRWLockShared(&client->lock);
-        fprintf(stderr, "ERROR: Received file metadata frame for client with slot status SLOT_FREE!\n");
+    if(!frame){
+        fprintf(stdout, "Received invalid frame pointer handle_file_metadata()\n");
         return RET_VAL_ERROR;
     }
-    ReleaseSRWLockShared(&client->lock);
 
     uint64_t recv_seq_num = _ntohll(frame->header.seq_num);
     uint32_t recv_session_id = _ntohl(frame->header.session_id);
@@ -537,15 +533,6 @@ int handle_file_metadata(Client *client, UdpFrame *frame) {
         op_code = ERR_EXISTING_FILE;
         goto exit_err;
     }
-
-    // AcquireSRWLockShared(&pool_fstreams->lock);
-    // if(pool_fstreams->free_blocks == 0){
-    //     ReleaseSRWLockShared(&pool_fstreams->lock);
-    //     // fprintf(stderr, "All fstreams are busy\n");
-    //     op_code = ERR_RESOURCE_LIMIT;
-    //     goto exit_err; 
-    // }
-    // ReleaseSRWLockShared(&pool_fstreams->lock);
 
     ServerFileStream *fstream = alloc_fstream(pool_fstreams);
     if(!fstream){
@@ -604,17 +591,17 @@ exit_err:
 // Process received file fragment frame
 int handle_file_fragment(Client *client, UdpFrame *frame){
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     char buffer[FILE_FRAGMENT_SIZE];
+    FILETIME ft;
 
-    if(client == NULL){
-        fprintf(stdout, "Received frame for non existing client context!\n");
+    if(!client){
+        fprintf(stdout, "Received invalid client pointer handle_file_fragment()\n");
         return RET_VAL_ERROR;
     }
-
-    if(client->slot_status == SLOT_FREE){
-        fprintf(stderr, "ERROR: Received file metadata frame for client with slot status SLOT_FREE!\n");
+    if(!frame){
+        fprintf(stdout, "Received invalid frame pointer handle_file_fragment()\n");
         return RET_VAL_ERROR;
     }
 
@@ -626,12 +613,6 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
 
     uint8_t op_code = 0;
 
-    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
-        fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_EXISTING_FILE;
-        goto exit_err;
-    }
-
     if(recv_fragment_size == 0 || recv_fragment_size > FILE_FRAGMENT_SIZE){
         fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid fragment size: %u\n", recv_seq_num, recv_file_id, recv_session_id, recv_fragment_size);
         op_code = ERR_MALFORMED_FRAME;
@@ -641,6 +622,12 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
     if(recv_session_id == 0 || recv_file_id == 0){
         fprintf(stderr, "Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid session or file ID\n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_MALFORMED_FRAME;
+        goto exit_err;
+    }
+
+    if(ht_search_id(table_file_id, recv_session_id, recv_file_id, ID_RECV_COMPLETE) == TRUE){
+        fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = ERR_EXISTING_FILE;
         goto exit_err;
     }
 
@@ -769,8 +756,8 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
         fprintf(stderr, "ERROR: Failed to push file fragment ack seq to queue\n");
         return RET_VAL_ERROR;
     }
-    if(push_slot(queue_client_slot, client->slot) == RET_VAL_ERROR){
-        fprintf(stderr, "ERROR: Failed to push client slot to to slot queue\n");
+    if(push_ptr(queue_client_ptr, (uintptr_t)client) == RET_VAL_ERROR){
+        fprintf(stderr, "ERROR: Failed to push client to to client queue\n");
         return RET_VAL_ERROR;
     };
 
@@ -793,20 +780,16 @@ exit_err:
 // Process received file end frame
 int handle_file_end(Client *client, UdpFrame *frame){
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
-    if(client == NULL){
-        fprintf(stdout, "Received frame for non existing client context!\n");
+    if(!client){
+        fprintf(stdout, "Received invalid client pointer handle_file_end()\n");
         return RET_VAL_ERROR;
     }
-
-    AcquireSRWLockShared(&client->lock);
-    if(client->slot_status == SLOT_FREE){
-        ReleaseSRWLockShared(&client->lock);
-        fprintf(stderr, "ERROR: Received file metadata frame for client with slot status SLOT_FREE!\n");
+    if(!frame){
+        fprintf(stdout, "Received invalid frame pointer handle_file_end()\n");
         return RET_VAL_ERROR;
     }
-    ReleaseSRWLockShared(&client->lock);
 
     uint64_t recv_seq_num = _ntohll(frame->header.seq_num);
     uint32_t recv_session_id = _ntohl(frame->header.session_id);

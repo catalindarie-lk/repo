@@ -1,5 +1,5 @@
-#ifndef CHECKSUM_H
-#define CHECKSUM_H
+#ifndef CRC32_H
+#define CRC32_H
 
 #include <stdio.h>              // For size_t type
 #include <stdint.h>             // For uint32_t type
@@ -25,4 +25,4 @@ uint32_t calculate_crc32(const void* data, size_t len);
 BOOL is_checksum_valid(const UdpFrame* frame, int bytes_received);
 
 
-#endif // CHECKSUM_H
+#endif // CRC32_H

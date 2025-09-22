@@ -201,7 +201,7 @@ void free_mstream(ServerMstreamPool* pool, ServerMessageStream* mstream) {
 }
 void close_mstream(ServerMessageStream *mstream) {
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     if(mstream == NULL){
         fprintf(stderr, "ERROR: Trying to clean a NULL pointer message stream\n");
@@ -298,7 +298,7 @@ static void attach_fragment(ServerMessageStream *mstream, char *fragment_buffer,
 }
 static uint8_t check_completion_and_record(ServerMessageStream *mstream) {
     // Check if the message is fully received by verifying total bytes and the fragment bitmap.
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     AcquireSRWLockExclusive(&mstream->lock);
 
@@ -335,7 +335,7 @@ static uint8_t check_completion_and_record(ServerMessageStream *mstream) {
 // HANDLE received message fragment frame
 int handle_message_fragment(Client *client, UdpFrame *frame){
 
-    PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 
     // int slot;
     if(client == NULL){
@@ -396,7 +396,7 @@ int handle_message_fragment(Client *client, UdpFrame *frame){
             fprintf(stderr, "ERROR: Failed to push message fragment ack seq to queue\n");
             return RET_VAL_ERROR;
         }
-        if(push_slot(queue_client_slot, client->slot) == RET_VAL_ERROR){
+        if(push_ptr(queue_client_ptr, (uintptr_t)client) == RET_VAL_ERROR){
             ReleaseSRWLockExclusive(&client->lock);
             fprintf(stderr, "ERROR: Failed to push client slot to to slot queue\n");
             return RET_VAL_ERROR;
@@ -460,7 +460,7 @@ int handle_message_fragment(Client *client, UdpFrame *frame){
             fprintf(stderr, "ERROR: Failed to push message fragment ack seq to queue\n");
             return RET_VAL_ERROR;
         }
-        if(push_slot(queue_client_slot, client->slot) == RET_VAL_ERROR){
+        if(push_ptr(queue_client_ptr, (uintptr_t)client) == RET_VAL_ERROR){
             ReleaseSRWLockExclusive(&client->lock);
             fprintf(stderr, "ERROR: Failed to push client slot to to slot queue\n");
             return RET_VAL_ERROR;

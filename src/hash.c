@@ -157,6 +157,38 @@ uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num)
     return 0;
  
 }
+void clean_table_send_frame(TableSendFrame *table) {
+    
+    if(!table->node){
+        fprintf(stderr, "ERROR: Invalid node array pointer for hash table - search_tx_frame()\n");
+        return;
+    }
+    if(table->size <= 0){
+        fprintf(stderr, "ERROR: Invalid size for hash table search_tx_frame()\n");
+        return;
+    }
+        
+    TableNodeSendFrame *head = NULL;
+    AcquireSRWLockExclusive(&table->mutex);  
+    for (int index = 0; index < HASH_SIZE_ID; index++) {
+        if(table->node[index]){       
+            TableNodeSendFrame *curr = table->node[index];
+            while (curr) {
+                head = curr;                
+                curr = curr->next;
+                pool_free(&table->pool_nodes, (void*)head);
+                table->count--;
+            }
+            pool_free(&table->pool_nodes, (void*)curr);
+            table->count--;
+            table->node[index] = NULL;
+        }     
+    }
+    ReleaseSRWLockExclusive(&table->mutex);
+    return;
+
+
+}
 
 //--------------------------------------------------------------------------------------------------------------------------
 void init_table_id(TableIDs *table, size_t size, const size_t max_nodes){
@@ -311,9 +343,10 @@ void ht_clean_id(TableIDs *table) {
         if(table->entry[index]){       
             NodeTableIDs *node = table->entry[index];
             while (node) {
-                    head = node;                
-                    node = node->next;
-                    pool_free(&table->pool_nodes, (void*)head);
+                head = node;                
+                node = node->next;
+                pool_free(&table->pool_nodes, (void*)head);
+                table->count--;
             }
             pool_free(&table->pool_nodes, (void*)node);
             table->count--;
