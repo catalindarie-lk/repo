@@ -67,9 +67,7 @@
 #define SERVER_POOL_SIZE_RECV                       (SERVER_QUEUE_SIZE_RECV_FRAME + \
                                                     SERVER_QUEUE_SIZE_RECV_PRIO_FRAME)
 #define SERVER_POOL_SIZE_IOCP_RECV                  (SERVER_POOL_SIZE_RECV * 2)
-#define SERVER_POOL_SIZE_FILE_BLOCK                 (256) // Number of file blocks in the pool
-
-#define FILETIME_TO_UINT64(ft)                      ((((uint64_t)(ft).dwHighDateTime) << 32) | ((uint64_t)(ft).dwLowDateTime))
+#define SERVER_POOL_SIZE_FILE_BLOCK                 (512) // Number of file blocks in the pool
 
 // --- Macro to Parse Global Data to Threads ---
 // This macro simplifies passing pointers to global client data structures into thread functions.

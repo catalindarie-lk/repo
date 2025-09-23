@@ -16,7 +16,7 @@
 #include "include/protocol_frames.h"    // For protocol frame definitions
 #include "include/resources.h"
 #include "include/netendians.h"         // For network byte order conversions
-#include "include/crc32.h"           // For checksum validation
+#include "include/crc32.h"              // For checksum validation
 #include "include/sha256.h"
 #include "include/mem_pool.h"           // For memory pool management
 #include "include/fileio.h"             // For file transfer functions
@@ -803,36 +803,7 @@ static DWORD WINAPI fthread_resend_frame(LPVOID lpParam){
     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
 
     while(client->client_status == STATUS_READY){ 
-        // if(client.session_status == CONNECTION_CLOSED){
-        //     ht_clean(&buffers.ht_frame);
-        //     Sleep(250);
-        //     continue;
-        // }
-        time_t current_time = time(NULL);
-        if(table_send_udp_frame->count == 0){
-            Sleep(100);
-            continue;
-        }
-        for(int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++){
-            AcquireSRWLockExclusive(&table_send_udp_frame->mutex);
-            for (int i = 0; i < table_send_udp_frame->size; i++) {
-                TableNodeSendFrame *table_node = table_send_udp_frame->node[i];
-                while (table_node) {
-                    PoolEntrySendFrame *entry_send = (PoolEntrySendFrame*)table_node->entry;
-                    if(entry_send->frame.header.frame_type == FRAME_TYPE_FILE_METADATA && current_time - table_node->sent_time > (time_t)RESEND_FILE_METADATA_TIMEOUT_SEC){
-                        send_pool_frame(entry_send, pool_send_iocp_context);
-                        table_node->sent_time = current_time;
-                    }
-                    if(current_time - table_node->sent_time > (time_t)RESEND_TIMEOUT_SEC){
-                        send_pool_frame(entry_send, pool_send_iocp_context);
-                        table_node->sent_time = current_time;
-                    }
-                    table_node = table_node->next;
-                }
-                
-            }
-            ReleaseSRWLockExclusive(&table_send_udp_frame->mutex);
-        }
+        check_timeout_table_send_frame(table_send_udp_frame, pool_send_iocp_context);
         Sleep(100);
     }
     fprintf(stdout,"resend frame thread exiting...\n");
@@ -1123,18 +1094,20 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                 goto clean;
             }           
 
-            sha256_update(&sha256_ctx, (const uint8_t *)fstream->chunk_buffer, chunk_bytes_to_send);
+            sha256_update(&sha256_ctx, (uint8_t *)fstream->chunk_buffer, chunk_bytes_to_send);
  
             chunk_fragment_offset = 0;
             
             while (chunk_bytes_to_send > 0){
 
-                if(chunk_bytes_to_send > FILE_FRAGMENT_SIZE){
-                    frame_fragment_size = FILE_FRAGMENT_SIZE;
-                } else {
-                    frame_fragment_size = chunk_bytes_to_send;
-                }
+                // if(chunk_bytes_to_send > FILE_FRAGMENT_SIZE){
+                //     frame_fragment_size = FILE_FRAGMENT_SIZE;
+                // } else {
+                //     frame_fragment_size = chunk_bytes_to_send;
+                // }
                 
+                frame_fragment_size = (chunk_bytes_to_send > FILE_FRAGMENT_SIZE) ? FILE_FRAGMENT_SIZE : chunk_bytes_to_send;
+
                 // char buffer[FILE_FRAGMENT_SIZE];
 
                 // const char *offset = fstream->chunk_buffer + chunk_fragment_offset;
@@ -1170,11 +1143,11 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                 fstream->pending_bytes -= frame_fragment_size;
 
                 if(client->session_status == CONNECTION_CLOSED){
-                    fprintf(stderr, "Disconnected from server...\n");
+                    fprintf(stderr, "Disconnected from server!!!\n");
                     goto clean;
                 }
 
-            }     
+            }
         }                  
 
         sha256_final(&sha256_ctx, (uint8_t *)&fstream->calculated_sha256);

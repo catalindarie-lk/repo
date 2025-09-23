@@ -15,7 +15,6 @@
 #endif
 
 //--------------------------------------------------------------------------------------------------------------------------
-#define HASH_SIZE_ID                  (1024)
 
 typedef uint8_t TableStatus;
 enum TableStatus{
@@ -24,25 +23,25 @@ enum TableStatus{
     ID_RECV_COMPLETE= 2
 };
 
-typedef struct NodeTableIDs{
+__declspec(align(64))typedef struct NodeTableIDs{
     uint32_t id;
     uint32_t sid;
-    uint8_t status;                         //1 - Pending; 2 - Finished
+    uint8_t status;
     struct NodeTableIDs *next;
 }NodeTableIDs;
 
-typedef struct{
-    NodeTableIDs **entry;
-    SRWLOCK mutex;
+__declspec(align(64)) typedef struct{
+    NodeTableIDs **bucket;
     size_t size;
     size_t count;
-    MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated from this pre-allocated mem pool;
+    MemPool pool;
+    SRWLOCK mutex;
 }TableIDs;
 
 void init_table_id(TableIDs *table, size_t size, const size_t max_nodes);
-uint64_t ht_get_hash_id(uint32_t id, const size_t size);
+size_t ht_get_hash_id(uint32_t id, const size_t size);
 int ht_insert_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
-void ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id);
+int ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id);
 void ht_remove_all_sid(TableIDs *table, const uint32_t sid);
 BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
 int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
@@ -51,8 +50,8 @@ void ht_clean_id(TableIDs *table);
 //--------------------------------------------------------------------------------------------------------------------------
 
 __declspec(align(64))typedef struct TableNodeSendFrame{
-    uintptr_t entry;                        // pointer to mem pool with entry (frame + extras)
-    time_t sent_time;                       // timestamp of the last time when frame was sent
+    uintptr_t frame;                        // pointer to mem pool with entry (frame + extras)
+    uint64_t timestamp;                     // timestamp of the last time when frame was sent
     uint16_t sent_count;                    // nr of times the frame was sent
     struct TableNodeSendFrame *next;        // next node in linked list
 }TableNodeSendFrame;
@@ -60,22 +59,23 @@ __declspec(align(64))typedef struct TableNodeSendFrame{
 __declspec(align(64))typedef struct{
     size_t size;                            // size of the hash table base array. each index in array is a pointer to a linked list 
                                             // of nodes which have overlapping hash for the sequence number
-    TableNodeSendFrame **node;              // array of pointers to TableNodeSendFrame
-    SRWLOCK mutex;                          // mutex for shared data access
+    TableNodeSendFrame **bucket;            // array of pointers to TableNodeSendFrame
     size_t count;                           // nr of inserted frmes in the table
-    MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated
+    MemPool pool;                           // memory pool of nodes; when new node is inserted into table, memory is allocated
                                             // from this pre-allocated mem pool;
+    SRWLOCK mutex;                          // mutex for shared data access
 }TableSendFrame;
 
 void init_table_send_frame(TableSendFrame *table, const size_t size, const size_t max_nodes);
-uint64_t get_hash_table_send_frame(const uint64_t seq_num, const size_t size);
-int insert_table_send_frame(TableSendFrame *table, const uintptr_t entry);
+size_t get_hash_table_send_frame(const uint64_t seq_num, const size_t size);
+int insert_table_send_frame(TableSendFrame *table, const uintptr_t frame);
 uintptr_t remove_table_send_frame(TableSendFrame *table, const uint64_t seq_num);
 uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num);
+void check_timeout_table_send_frame(TableSendFrame *table, MemPool *pool);
 void clean_table_send_frame(TableSendFrame *table);
 
 //--------------------------------------------------------------------------------------------------------------------------
-typedef struct NodeTableFileBlock{
+__declspec(align(64))typedef struct NodeTableFileBlock{
     OVERLAPPED overlapped;
     uint64_t key;
     uint32_t fid;
@@ -85,18 +85,19 @@ typedef struct NodeTableFileBlock{
     struct NodeTableFileBlock *next;
 }NodeTableFileBlock;
 
-typedef struct{
-    NodeTableFileBlock **entry;
+__declspec(align(64))typedef struct{
+    NodeTableFileBlock **bucket;
     SRWLOCK mutex;
     size_t size;
     size_t count;
-    MemPool pool_nodes;                     // memory pool of nodes; when new node is inserted into table, memory is allocated from this pre-allocated mem pool;
+    MemPool pool;                     // memory pool of nodes; when new node is inserted into table, memory is allocated from this pre-allocated mem pool;
 }TableFileBlock;
 
 void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_nodes);
-uint64_t ht_get_hash_fblock(const uint64_t key, const size_t size);
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* pool_node, size_t node_size);
-void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool);
+size_t ht_get_hash_fblock(const uint64_t key, const size_t size);
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* block_data, size_t block_size);
+int ht_remove_fblock(TableFileBlock *table, const uint64_t key);
 BOOL ht_search_fblock(TableFileBlock *table, const uint64_t key);
+void ht_clean_fblock(TableFileBlock *table);
 
 #endif // FRAMES_HASH_H

@@ -131,7 +131,7 @@ static int init_server_buffers(){
     init_pool(pool_recv_udp_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
     init_pool(pool_iocp_recv_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_RECV);
     init_pool(pool_file_block, SERVER_FILE_BLOCK_SIZE, SERVER_POOL_SIZE_FILE_BLOCK);
-        
+
     init_queue_ptr(queue_recv_udp_frame, SERVER_QUEUE_SIZE_RECV_FRAME);
     init_queue_ptr(queue_recv_prio_udp_frame, SERVER_QUEUE_SIZE_RECV_PRIO_FRAME);
 
@@ -139,7 +139,7 @@ static int init_server_buffers(){
     init_table_id(table_message_id, 1024, 32768);
 
     init_table_fblock(table_file_block, SERVER_POOL_SIZE_FILE_BLOCK, SERVER_POOL_SIZE_FILE_BLOCK);
-    
+
     init_queue_ptr(queue_client_ptr, SERVER_QUEUE_SIZE_CLIENT_PTR);
 
     init_pool(pool_send_udp_frame, sizeof(PoolEntrySendFrame), SERVER_POOL_SIZE_SEND);
@@ -728,7 +728,7 @@ static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam) {
             // }
             uint64_t block_offset = ((uint64_t)node->overlapped.Offset) | (((uint64_t)node->overlapped.OffsetHigh) << 32);
             uint64_t block_nr = block_offset / SERVER_FILE_BLOCK_SIZE;
-            ht_remove_fblock(table_file_block, node->key, pool_file_block);
+            ht_remove_fblock(table_file_block, node->key);
             pool_free(pool_file_block, fstream->file_block[block_nr]);
 
             fstream->file_block[block_nr] = NULL;
@@ -1021,8 +1021,6 @@ static DWORD WINAPI fthread_server_command(LPVOID lpParam){
     return 0;
 }
 
-
-
 void init_client_pool(ServerClientPool* pool, const uint64_t block_count) {
 
     pool->block_count = block_count;
@@ -1237,8 +1235,6 @@ static void close_client(Client *client){
     return;
 }
 
-
-
 int main() {
     // get_network_config();
     init_server_session();
@@ -1258,7 +1254,7 @@ int main() {
                             Server.pool_clients.client[0].queue_ack_seq.pending,
                             Buffers.pool_file_block.free_blocks,
                             Buffers.table_file_block.count,
-                            Buffers.table_file_block.pool_nodes.free_blocks
+                            Buffers.table_file_block.pool.free_blocks
                             );
 
     }
@@ -1266,95 +1262,4 @@ int main() {
     shutdown_server();
     return 0;
 }
-
-
-
-// Find client by session ID
-// static Client* find_client(const uint32_t session_id) {
-    
-//     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-//     // Search for a client within the provided ClientList that matches the given session ID.
-//     for (int slot = 0; slot < MAX_CLIENTS; slot++) {
-//         Client *client = &client_list->client[slot];
-//         AcquireSRWLockShared(&client->lock);
-//         if(client->slot_status == SLOT_FREE){
-//             ReleaseSRWLockShared(&client->lock);
-//             continue; // Move to the next slot in the loop.
-//         }
-//         if(client->sid == session_id){
-//             ReleaseSRWLockShared(&client->lock);
-//             return client;
-//         }
-//         ReleaseSRWLockShared(&client->lock);
-//     }
-//     return NULL;
-// }
-// // Add a new client
-// static Client* add_client(const UdpFrame *recv_frame, const struct sockaddr_in *client_addr) {
-       
-//     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-//     uint32_t free_slot = 0;
-
-//     EnterCriticalSection(&client_list->lock);
-//     while(free_slot < MAX_CLIENTS){
-//         if(client_list->client[free_slot].slot_status == SLOT_FREE) {
-//             break;
-//         }
-//         free_slot++;
-//     }
-
-//     if(free_slot >= MAX_CLIENTS){
-//         fprintf(stderr, "\nMax clients reached. Cannot add new client.\n");
-//         LeaveCriticalSection(&client_list->lock);
-//         return NULL;
-//     }
-   
-//     Client *new_client = &client_list->client[free_slot]; 
-    
-//     AcquireSRWLockExclusive(&new_client->lock);
-
-//     new_client->slot = free_slot;
-//     new_client->slot_status = SLOT_BUSY;
-//     memcpy(&new_client->client_addr, client_addr, sizeof(struct sockaddr_in));
-//     new_client->connection_status = CLIENT_CONNECTED;
-//     new_client->last_activity_time = time(NULL);
-
-//     new_client->cid = _ntohl(recv_frame->payload.connection_request.client_id); 
-//     new_client->sid = InterlockedIncrement(&server->session_id_counter);
-//     new_client->flags = recv_frame->payload.connection_request.flags;
-
-//     snprintf(new_client->name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, recv_frame->payload.connection_request.client_name);
-
-//     inet_ntop(AF_INET, &client_addr->sin_addr, new_client->ip, INET_ADDRSTRLEN);
-//     new_client->port = _ntohs(client_addr->sin_port);
-
-//     fprintf(stdout, "\n[ADDING NEW CLIENT] %s:%d Session ID:%d\n", new_client->ip, new_client->port, new_client->sid);
-
-//     ReleaseSRWLockExclusive(&new_client->lock);
-//     LeaveCriticalSection(&client_list->lock);
-//     return new_client;
-// }
-// // Remove a client
-// static int remove_client(const uint32_t slot) {
-    
-//     PARSE_SERVER_GLOBAL_DATA(Server, ClientList, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-//     if(client_list == NULL){
-//         fprintf(stderr, "\nInvalid client pointer!\n");
-//         return RET_VAL_ERROR;
-//     }
-//     if (slot < 0 || slot >= MAX_CLIENTS) {
-//         fprintf(stderr, "\nInvalid client slot nr:  %d", slot); 
-//         return RET_VAL_ERROR;
-//     }
-//     fprintf(stdout, "\nRemoving client with session ID: %d from slot %d\n", client_list->client[slot].sid, client_list->client[slot].slot);   
-    
-//     EnterCriticalSection(&client_list->lock);    
-//     cleanup_client(&client_list->client[slot]);
-//     LeaveCriticalSection(&client_list->lock);
-
-//     return RET_VAL_SUCCESS;
-// }
 

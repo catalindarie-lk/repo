@@ -47,8 +47,13 @@
 #define SERVER_FILE_BLOCK_SIZE              (FILE_FRAGMENT_SIZE * 64ULL * 4ULL)
 #define CLIENT_FILE_BLOCK_SIZE              (FILE_FRAGMENT_SIZE * 64ULL * 4ULL)
 
+#define RESEND_FILE_FRAGMENT_TIMEOUT        ((uint64_t)(80000000)) // one second has 10 mil * 100ns
+#define RESEND_FILE_METADATA_TIMEOUT        ((uint64_t)(10000000)) // one second has 10 mil * 100ns
+
 #define OP_RECV ((uint8_t)(1))
 #define OP_SEND ((uint8_t)(2))
+
+#define FILETIME_TO_UINT64(ft)              ((((uint64_t)(ft).dwHighDateTime) << 32) | ((uint64_t)(ft).dwLowDateTime))
 
 // --- Frame Types ---
 typedef uint8_t FrameType;

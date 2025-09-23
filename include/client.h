@@ -44,8 +44,6 @@
 #define TEXT_CHUNK_SIZE                             (TEXT_FRAGMENT_SIZE * 64) // Size of a text data chunk (derived from protocol_frames.h)
 // #define FILE_CHUNK_SIZE                             (FILE_FRAGMENT_SIZE * 512) // Size of a file data chunk (derived from protocol_frames.h)
 
-#define RESEND_TIMEOUT_SEC                          5                     // Seconds before a pending frame is considered for retransmission
-#define RESEND_FILE_METADATA_TIMEOUT_SEC            1
 #define MAX_MESSAGE_SIZE_BYTES                      (4 * 1024 * 1024)     // Maximum size for a single large text message (4 MB)
 
 //---------------------------------------------------------------------------------------------------------
@@ -69,14 +67,14 @@
 
 // --- Client RECV Buffer Sizes ---
 #define CLIENT_QUEUE_SIZE_RECV_FRAME                (2048 + 128 * CLIENT_MAX_ACTIVE_FSTREAMS) // Size of the queue for received frames
-#define CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME           16
+#define CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME           64
 // --- Client RECV Memory Pool Sizes ---
 #define CLIENT_POOL_SIZE_RECV                       (CLIENT_QUEUE_SIZE_RECV_FRAME + \
                                                     CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME)
 #define CLIENT_POOL_SIZE_IOCP_RECV                  (CLIENT_POOL_SIZE_RECV * 2)
 //---------------------------------------------------------------------------------------------------------
-#define CLIENT_QUEUE_SIZE_SEND_FILE                 4096                  // Size of the queue for file stream commands
-#define CLIENT_QUEUE_SIZE_SEND_MESSAGE              4096                  // Size of the queue for message stream commands
+#define CLIENT_QUEUE_SIZE_SEND_FILE                 16384                  // Size of the queue for file stream commands
+#define CLIENT_QUEUE_SIZE_SEND_MESSAGE              128                    // Size of the queue for message stream commands
 #define CLIENT_POOL_SIZE_SEND_COMMAND               (CLIENT_QUEUE_SIZE_SEND_FILE + \
                                                     CLIENT_QUEUE_SIZE_SEND_MESSAGE + 16)
 #define CLIENT_QUEUE_SIZE_LOG                       65536

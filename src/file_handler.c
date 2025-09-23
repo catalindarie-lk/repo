@@ -647,7 +647,7 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
     uint64_t block_nr = recv_fragment_offset / SERVER_FILE_BLOCK_SIZE;
     uint64_t block_offset = block_nr * SERVER_FILE_BLOCK_SIZE;
     uint64_t block_fragment_offset = recv_fragment_offset - block_offset;
-    
+
     uint64_t block_size;
     if(block_nr < fstream->block_count - 1){
         block_size = SERVER_FILE_BLOCK_SIZE;
@@ -663,16 +663,16 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
 
     if(check_fragment_received(fstream->received_file_bitmap, recv_fragment_offset, FILE_FRAGMENT_SIZE)){
         ReleaseSRWLockExclusive(&fstream->lock);
-        fprintf(stderr, "Received duplicate file fragment Seq: %llu; fID: %u; sID: %u; \n", recv_seq_num, recv_file_id, recv_session_id);
+        fprintf(stderr, "DEBUG: file_handler() - Received duplicate file fragment Seq: %llu; fID: %u; sID: %u; \n", recv_seq_num, recv_file_id, recv_session_id);
         op_code = ERR_DUPLICATE_FRAME;
         goto exit_err;
     }
-    
+
     if(fstream->recv_block_status[block_nr] == BLOCK_STATUS_NONE && fstream->recv_block_bytes[block_nr] == 0){
         fstream->file_block[block_nr] = pool_alloc(pool_file_block);
         if(!fstream->file_block[block_nr]){
             ReleaseSRWLockExclusive(&fstream->lock);
-            fprintf(stderr, "Failed to allocate memory for file block from pool\n");
+            fprintf(stderr, "DEBUG: file_handler() - Failed to allocate memory for file block from pool\n");
             op_code = ERR_RESOURCE_LIMIT;
             goto exit_err;    
         }
@@ -739,11 +739,11 @@ int handle_file_fragment(Client *client, UdpFrame *frame){
 
         if (retry_async_write(fstream->iocp_file_handle, node->block_data, node->block_size, &node->overlapped) == RET_VAL_ERROR) {
             fprintf(stderr, "CRITICAL ERROR: Terminate file stream (TODO)!\n");
-            ht_remove_fblock(table_file_block, server->file_block_count, pool_file_block);
+            // TODO: need a strategy to safely terminate the stream (since multiple threads are accessing it)
+            ht_remove_fblock(table_file_block, server->file_block_count);
             op_code = ERR_SERVER_TERMINATED_STREAM;
             goto exit_err;
         }
-
     } else {
         ReleaseSRWLockExclusive(&fstream->lock);
         fprintf(stderr, "CRITICAL ERROR: Received fragment frame Seq: %llu; for fID: %u; sID %u with invalid block received bytes: %llu; Terminate file stream (TODO)!\n", recv_seq_num, recv_file_id, recv_session_id, fstream->recv_block_bytes[block_nr]);

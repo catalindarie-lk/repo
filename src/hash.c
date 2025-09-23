@@ -11,246 +11,64 @@
 #include "include/hash.h"
 
 //--------------------------------------------------------------------------------------------------------------------------
-void init_table_send_frame(TableSendFrame *table, const size_t size, const size_t max_nodes){
-    if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for tx_frame hash table init\n");
-        return;
-    }
-    if(max_nodes < size){
-        fprintf(stderr, "ERROR: Invalid max_nodes for tx_frame hash table init\n");
-        return;
-    }
-    table->size = size;
-    table->node = (TableNodeSendFrame **)_aligned_malloc(sizeof(TableNodeSendFrame) * size, 64);
-    if(!table->node){
-        fprintf(stderr, "ERROR: Unable to allocate memory for tx_frame hash table\n");
-        return;
-    }
-    init_pool(&table->pool_nodes, sizeof(TableNodeSendFrame), max_nodes);
-    // memset(table->node, 0, sizeof(uintptr_t) * size);
-    for(int i = 0; i < size; i++){
-        table->node[i] = NULL;
-    }
-
-    InitializeSRWLock(&table->mutex);
-    table->count = 0;
-    return;
-}
-uint64_t get_hash_table_send_frame(const uint64_t seq_num, const size_t size){
-    if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for tx_frame hash table get_seq_num()\n");
-        return RET_VAL_ERROR;
-    }
-    return (seq_num % size);
-}
-int insert_table_send_frame(TableSendFrame *table, const uintptr_t entry){
-    if(!table->node){
-        fprintf(stderr, "ERROR: Invalid node array pointer for hash table - insert_tx_frame()\n");
-        return RET_VAL_ERROR;
-    }
-    if(!entry){
-        fprintf(stderr, "ERROR: Invalid pool_frame pointer for insert_tx_frame() into hash table\n");
-        return RET_VAL_ERROR;
-    }
-    if(table->size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table insert_tx_frame()\n");
-        return RET_VAL_ERROR;
-    }
-    
-    PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)entry;
-    uint64_t seq_num = _ntohll(pool_entry->frame.header.seq_num);
-    
-    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-    
-    TableNodeSendFrame *node = (TableNodeSendFrame*)pool_alloc(&table->pool_nodes);
-    if(node == NULL){
-        ReleaseSRWLockExclusive(&table->mutex);
-        fprintf(stderr, "ERROR: Failed to allocate memeory for tx_frame hash table node\n");
-        return RET_VAL_ERROR;
-    }
-    // fprintf(stdout, "DEBUG: Inserting seq num: %llu at index: %llu\n", seq_num, index);
-    node->entry = entry;
-    node->sent_time = time(NULL);
-    node->sent_count = 1;
-
-    node->next = (TableNodeSendFrame*)table->node[index];  // Insert at the head (linked list)
-    table->node[index] = node;
-    table->count++;
-    ReleaseSRWLockExclusive(&table->mutex);
-    return RET_VAL_SUCCESS;
-}
-uintptr_t remove_table_send_frame(TableSendFrame *table, const uint64_t seq_num){
-    if(!table->node){
-        fprintf(stderr, "ERROR: Invalid node array pointer for hash table - htbl_remove_txframe()\n");
-        return 0;
-    }
-    if(table->size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table htbl_remove_txframe()\n");
-        return 0;
-    }
-    
-    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-
-    TableNodeSendFrame *curr = table->node[index];
-    TableNodeSendFrame *prev = NULL;
-    while (curr) {
-        
-        PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)curr->entry;
-        uint64_t frame_seq_num = _ntohll(pool_entry->frame.header.seq_num);
-
-        if (frame_seq_num == seq_num) {
-            // fprintf(stdout, "DEBUG: Removing frame with seq num: %llu from index: %llu\n", seq_num, index);
-            // Found it
-            if (prev) {
-                prev->next = curr->next;
-            } else {
-                table->node[index] = curr->next;
-            }
-            pool_free(&table->pool_nodes, (void*)curr);
-            table->count--;
-            //fprintf(stdout, "Hash count: %d\n", *count);
-            ReleaseSRWLockExclusive(&table->mutex);
-            return (uintptr_t)pool_entry;
-        }
-        prev = curr;
-        curr = curr->next;
-    }
-    ReleaseSRWLockExclusive(&table->mutex);
-    return 0;
- 
-}
-uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num){
-    if(!table->node){
-        fprintf(stderr, "ERROR: Invalid node array pointer for hash table - search_tx_frame()\n");
-        return 0;
-    }
-    if(table->size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table search_tx_frame()\n");
-        return 0;
-    }
-    
-    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-
-    TableNodeSendFrame *curr = table->node[index];
-    TableNodeSendFrame *prev = NULL;
-    while (curr) {
-        
-        PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)curr->entry;
-        uint64_t frame_seq_num = _ntohll(pool_entry->frame.header.seq_num);
-
-        if (frame_seq_num == seq_num) {
-            ReleaseSRWLockExclusive(&table->mutex);
-            fprintf(stdout, "DEBUG: Found frame node in hash table with seq_num: %llu at index: %llu\n", seq_num, index);
-            return (uintptr_t)pool_entry;
-        }
-        prev = curr;
-        curr = curr->next;
-    }
-    ReleaseSRWLockExclusive(&table->mutex);
-    fprintf(stdout, "DEBUG: Node frame not found in hash table with seq_num: %llu\n", seq_num);
-    return 0;
- 
-}
-void clean_table_send_frame(TableSendFrame *table) {
-    
-    if(!table->node){
-        fprintf(stderr, "ERROR: Invalid node array pointer for hash table - search_tx_frame()\n");
-        return;
-    }
-    if(table->size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table search_tx_frame()\n");
-        return;
-    }
-        
-    TableNodeSendFrame *head = NULL;
-    AcquireSRWLockExclusive(&table->mutex);  
-    for (int index = 0; index < HASH_SIZE_ID; index++) {
-        if(table->node[index]){       
-            TableNodeSendFrame *curr = table->node[index];
-            while (curr) {
-                head = curr;                
-                curr = curr->next;
-                pool_free(&table->pool_nodes, (void*)head);
-                table->count--;
-            }
-            pool_free(&table->pool_nodes, (void*)curr);
-            table->count--;
-            table->node[index] = NULL;
-        }     
-    }
-    ReleaseSRWLockExclusive(&table->mutex);
-    return;
-
-
-}
-
-//--------------------------------------------------------------------------------------------------------------------------
 void init_table_id(TableIDs *table, size_t size, const size_t max_nodes){
-    
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for init_table_id()\n");
+        return;
+    }
     if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table ID's init\n");
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'size' for init_table_id()\n");
         return;
     }
     if(max_nodes < size){
-        fprintf(stderr, "ERROR: Invalid max_nodes for hash table ID's init\n");
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'max_nodes' for init_table_id()\n");
         return;
     }
     table->size = size;
-    table->entry = (NodeTableIDs **)_aligned_malloc(sizeof(NodeTableIDs) * size, 64);
-    if(!table->entry){
-        fprintf(stderr, "ERROR: Unable to allocate memory for hash table ID's init\n");
+    table->bucket = (NodeTableIDs **)_aligned_malloc(sizeof(NodeTableIDs*) * size, 64);
+    if(!table->bucket){
+        fprintf(stderr, "CRITICAL ERROR: Unable to allocate memory for buckets init_table_id()\n");
         return;
     }   
-    
-    init_pool(&table->pool_nodes, sizeof(NodeTableIDs), max_nodes);
-    // memset(ht->entry, 0, sizeof(uintptr_t) * size);
-    for(int i = 0; i < size; i++){
-        table->entry[i] = NULL;
-    }
+    memset(table->bucket, 0, sizeof(NodeTableIDs*) * size);
+
+    init_pool(&table->pool, sizeof(NodeTableIDs), max_nodes);
     InitializeSRWLock(&table->mutex); 
     table->count = 0;
 }
-uint64_t ht_get_hash_id(uint32_t id, const size_t size) {
-    if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table ID's\n");
-        return RET_VAL_ERROR;
-    }
-    return (id % (uint32_t)size);
+size_t ht_get_hash_id(uint32_t id, const size_t size) {
+    return ((size_t)id % size);
 }
 int ht_insert_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status) {
-
-    uint64_t index = ht_get_hash_id(id, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-    NodeTableIDs *node = (NodeTableIDs*)pool_alloc(&table->pool_nodes);
-    if(!node){
-        ReleaseSRWLockExclusive(&table->mutex);
-        fprintf(stderr, "ERROR: fail to allocate memory for hash table ID's node\n");
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_insert_id()\n");
         return RET_VAL_ERROR;
     }
-
+    size_t index = ht_get_hash_id(id, table->size);
+    AcquireSRWLockExclusive(&table->mutex);
+    NodeTableIDs *node = (NodeTableIDs*)pool_alloc(&table->pool);
+    if(!node){
+        ReleaseSRWLockExclusive(&table->mutex);
+        fprintf(stderr, "CRITICAL ERROR: fail to allocate memory for ht_insert_id()\n");
+        return RET_VAL_ERROR;
+    }
     node->sid = sid;
     node->id = id;    
     node->status = status;
-    node->next = (NodeTableIDs *)table->entry[index];  // Insert at the head (linked list)
-    table->entry[index] = node;
+    node->next = (NodeTableIDs *)table->bucket[index];  // Insert at the head (linked list)
+    table->bucket[index] = node;
     table->count++;
     ReleaseSRWLockExclusive(&table->mutex);
     return RET_VAL_SUCCESS;
 }
-void ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id) {
-    
-    uint64_t index = ht_get_hash_id(id, table->size);
-    
-    AcquireSRWLockExclusive(&table->mutex);
-    
-    NodeTableIDs *curr = table->entry[index];
+int ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id) {
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_remove_id()\n");
+        return RET_VAL_ERROR;
+    }   
+    size_t index = ht_get_hash_id(id, table->size);
+    AcquireSRWLockExclusive(&table->mutex);   
+    NodeTableIDs *curr = table->bucket[index];
     NodeTableIDs *prev = NULL;
     while (curr) {     
         if (curr->id == id && curr->sid == sid) {
@@ -258,37 +76,39 @@ void ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id) {
             if (prev) {
                 prev->next = curr->next;
             } else {
-                table->entry[index] = curr->next;
+                table->bucket[index] = curr->next;
             }
             table->count--;
-            pool_free(&table->pool_nodes, (void*)curr);
+            pool_free(&table->pool, (void*)curr);
             ReleaseSRWLockExclusive(&table->mutex);
-            return;
+            return RET_VAL_SUCCESS;
         }
         prev = curr;
         curr = curr->next;
     }
     ReleaseSRWLockExclusive(&table->mutex);
-    return;
+    fprintf(stderr, "DEBUG: Node not found in table sid: %u, fid: %u\n", sid, id);
+    return RET_VAL_ERROR;
 }
 void ht_remove_all_sid(TableIDs *table, const uint32_t sid) {
-    
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_remove_all_sid()\n");
+        return;
+    }
     AcquireSRWLockExclusive(&table->mutex);
     for (size_t i = 0; i < table->size; ++i) {
-        NodeTableIDs *curr = table->entry[i];
+        NodeTableIDs *curr = table->bucket[i];
         NodeTableIDs *prev = NULL;
-
         while (curr) {
             if (curr->sid == sid) {
                 NodeTableIDs *to_remove = curr;
-
                 if (prev) {
                     prev->next = curr->next;
                 } else {
-                    table->entry[i] = curr->next;
+                    table->bucket[i] = curr->next;
                 }
                 curr = curr->next;
-                pool_free(&table->pool_nodes, (void*)to_remove);
+                pool_free(&table->pool, (void*)to_remove);
                 table->count--;
             } else {
                 prev = curr;
@@ -300,196 +120,377 @@ void ht_remove_all_sid(TableIDs *table, const uint32_t sid) {
 }
 BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status) {
     
-    uint64_t index = ht_get_hash_id(id, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-    
-    NodeTableIDs *node = table->entry[index];
-    while (node) {
-        if (node->sid == sid && node->id == id && node->status == status){
-            ReleaseSRWLockExclusive(&table->mutex);
-            return TRUE;
-        }           
-        node = node->next;
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_search_id()\n");
+        return FALSE;
     }
-    ReleaseSRWLockExclusive(&table->mutex);
+    size_t index = ht_get_hash_id(id, table->size);
+    AcquireSRWLockShared(&table->mutex);
+    NodeTableIDs *curr = table->bucket[index];
+    while (curr) {
+        if (curr->sid == sid && curr->id == id && curr->status == status){
+            ReleaseSRWLockShared(&table->mutex);
+            return TRUE;
+        }
+        curr = curr->next;
+    }
+    ReleaseSRWLockShared(&table->mutex);
     return FALSE;
 }
 int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status) {
-    
-    uint64_t index = ht_get_hash_id(id, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-    
-    NodeTableIDs *node = table->entry[index];
-    while (node) {
-        if (node->id == id && node->sid == sid){
-            node->status = status;
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_update_id_status()\n");
+        return RET_VAL_ERROR;
+    } 
+    size_t index = ht_get_hash_id(id, table->size);
+    AcquireSRWLockExclusive(&table->mutex); 
+    NodeTableIDs *curr = table->bucket[index];
+    while (curr) {
+        if (curr->id == id && curr->sid == sid){
+            curr->status = status;
             ReleaseSRWLockExclusive(&table->mutex);
             return RET_VAL_SUCCESS;
         }           
-        node = node->next;
+        curr = curr->next;
     }
     ReleaseSRWLockExclusive(&table->mutex);
     return RET_VAL_ERROR;
 }
 void ht_clean_id(TableIDs *table) {
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_clean_id()\n");
+        return;
+    }
+    AcquireSRWLockExclusive(&table->mutex);
+    for (size_t index = 0; index < table->size; index++) {
+        NodeTableIDs *curr = table->bucket[index];
+        while (curr) {
+            NodeTableIDs *next = curr->next;
+            pool_free(&table->pool, (void*)curr);
+            table->count--;
+            curr = next;
+        }
+        table->bucket[index] = NULL;
+    }
+    ReleaseSRWLockExclusive(&table->mutex);
+}
+
+//--------------------------------------------------------------------------------------------------------------------------
+void init_table_send_frame(TableSendFrame *table, const size_t size, const size_t max_nodes){
     
-    NodeTableIDs *head = NULL;
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for init_table_send_frame()\n");
+        return;
+    }
+    if(size <= 0){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'size' for init_table_send_frame()\n");
+        return;
+    }
+    if(max_nodes < size){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'max_nodes' for init_table_send_frame()\n");
+        return;
+    }
+    table->size = size;
+    table->bucket = (TableNodeSendFrame **)_aligned_malloc(sizeof(TableNodeSendFrame*) * size, 64);
+    if(!table->bucket){
+        fprintf(stderr, "CRITICAL ERROR: Unable to allocate memory for table buckets\n");
+        return;
+    }
+    memset(table->bucket, 0, sizeof(TableNodeSendFrame*) * size);
+
+    init_pool(&table->pool, sizeof(TableNodeSendFrame), max_nodes);
+    InitializeSRWLock(&table->mutex);
+    table->count = 0;
+    return;
+}
+size_t get_hash_table_send_frame(const uint64_t seq_num, const size_t size){
+    return ((size_t)seq_num % size);
+}
+int insert_table_send_frame(TableSendFrame *table, const uintptr_t frame){
+
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for insert_table_send_frame()\n");
+        return RET_VAL_ERROR;
+    }
+    if(!frame){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'frame' pointer for insert_table_send_frame()\n");
+        return RET_VAL_ERROR;
+    }
+    
+    PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)frame;
+    uint64_t seq_num = _ntohll(pool_entry->frame.header.seq_num);
+    
+    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
+    AcquireSRWLockExclusive(&table->mutex);   
+    TableNodeSendFrame *node = (TableNodeSendFrame*)pool_alloc(&table->pool);
+    if(node == NULL){
+        ReleaseSRWLockExclusive(&table->mutex);
+        fprintf(stderr, "CRITICAL ERROR: Failed to allocate memory for insert_table_send_frame()\n");
+        return RET_VAL_ERROR;
+    }
+    node->frame = frame;
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    node->timestamp = FILETIME_TO_UINT64(ft);
+    node->sent_count = 1;
+
+    node->next = (TableNodeSendFrame*)table->bucket[index];  // Insert at the head (linked list)
+    table->bucket[index] = node;
+    table->count++;
+    ReleaseSRWLockExclusive(&table->mutex);
+    return RET_VAL_SUCCESS;
+}
+uintptr_t remove_table_send_frame(TableSendFrame *table, const uint64_t seq_num){
+
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for remove_table_send_frame()\n");
+        return (uintptr_t)0;
+    }
+    
+    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
+    AcquireSRWLockExclusive(&table->mutex);
+    TableNodeSendFrame *curr = table->bucket[index];
+    TableNodeSendFrame *prev = NULL;
+    while (curr) {
+        
+        PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)curr->frame;
+        uint64_t frame_seq_num = _ntohll(pool_entry->frame.header.seq_num);
+
+        if (frame_seq_num == seq_num) {
+            // fprintf(stdout, "DEBUG: Removing frame with seq num: %llu from index: %llu\n", seq_num, index);
+            // Found it
+            if (prev) {
+                prev->next = curr->next;
+            } else {
+                table->bucket[index] = curr->next;
+            }
+            pool_free(&table->pool, (void*)curr);
+            table->count--;
+            //fprintf(stdout, "Hash count: %d\n", *count);
+            ReleaseSRWLockExclusive(&table->mutex);
+            return (uintptr_t)pool_entry;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    ReleaseSRWLockExclusive(&table->mutex);
+    return (uintptr_t)0;
+ 
+}
+uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num){
+
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for search_table_send_frame()\n");
+        return (uintptr_t)0;
+    }
+    
+    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
+    AcquireSRWLockShared(&table->mutex);
+    TableNodeSendFrame *curr = table->bucket[index];
+    TableNodeSendFrame *prev = NULL;
+    while (curr) {
+        PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)curr->frame;
+        uint64_t frame_seq_num = _ntohll(pool_entry->frame.header.seq_num);
+        if (frame_seq_num == seq_num) {
+            ReleaseSRWLockShared(&table->mutex);
+            // fprintf(stdout, "DEBUG: Found frame node in hash table with seq_num: %llu at index: %llu\n", seq_num, index);
+            return (uintptr_t)pool_entry;
+        }
+        prev = curr;
+        curr = curr->next;
+    }
+    ReleaseSRWLockShared(&table->mutex);
+    // fprintf(stdout, "DEBUG: Node frame not found in hash table with seq_num: %llu\n", seq_num);
+    return (uintptr_t)0;
+ 
+}
+void check_timeout_table_send_frame(TableSendFrame *table, MemPool *pool){
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for check_timeout_table_send_frame()\n");
+        return;
+    }
+    if(table->count == 0){
+        return;
+    }
 
     AcquireSRWLockExclusive(&table->mutex);
-    
-    for (int index = 0; index < HASH_SIZE_ID; index++) {
-        if(table->entry[index]){       
-            NodeTableIDs *node = table->entry[index];
-            while (node) {
-                head = node;                
-                node = node->next;
-                pool_free(&table->pool_nodes, (void*)head);
-                table->count--;
+    for (size_t index = 0; index < table->size; index++) {
+        TableNodeSendFrame *table_node = table->bucket[index];
+        while (table_node) {
+            PoolEntrySendFrame *frame = (PoolEntrySendFrame*)table_node->frame;
+            if(!frame){
+                fprintf(stderr, "CRITICAL ERROR: table node with frame pointer NULL!!! - should never happen\n");
+                table_node = table_node->next;
+                continue;
             }
-            pool_free(&table->pool_nodes, (void*)node);
-            table->count--;
-            table->entry[index] = NULL;
-        }     
+
+            FILETIME ft;
+            GetSystemTimePreciseAsFileTime(&ft);
+            uint64_t current_time = FILETIME_TO_UINT64(ft);
+            uint64_t elapsed_time = current_time - table_node->timestamp;
+
+            if(frame->frame.header.frame_type == FRAME_TYPE_FILE_METADATA && elapsed_time > RESEND_FILE_METADATA_TIMEOUT){
+                send_pool_frame(frame, pool);
+                table_node->timestamp = current_time;
+                table_node->sent_count++;
+            } else if (elapsed_time > RESEND_FILE_FRAGMENT_TIMEOUT){
+                send_pool_frame(frame, pool);
+                // fprintf(stdout, "DEBUG: re-sending frame seq: %llu, elapsed_time: %llu\n", _ntohll(frame->frame.header.seq_num), elapsed_time);
+                table_node->timestamp = current_time;
+                table_node->sent_count++;
+            }
+            table_node = table_node->next;
+        }
     }
     ReleaseSRWLockExclusive(&table->mutex);
     return;
 }
+void clean_table_send_frame(TableSendFrame *table) {
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for clean_table_send_frame()\n");
+        return;
+    }
+    AcquireSRWLockExclusive(&table->mutex);
+    for (size_t index = 0; index < table->size; index++) {
+        TableNodeSendFrame *curr = table->bucket[index];
+        while (curr) {
+            TableNodeSendFrame *next = curr->next;
+            pool_free(&table->pool, (void*)curr);
+            table->count--;
+            curr = next;
+        }
+        table->bucket[index] = NULL;
+    }
+    ReleaseSRWLockExclusive(&table->mutex);
+}
 
 //--------------------------------------------------------------------------------------------------------------------------
 void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_nodes) {
-    
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for init_table_fblock()\n");
+        return;
+    }
     if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table file blocks init\n");
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'size' for init_table_fblock()\n");
         return;
     }
     if(max_nodes < size){
-        fprintf(stderr, "ERROR: Invalid max_nodes for hash table file blocks init\n");
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'max_nodes' for init_table_fblock()\n");
         return;
     }
     table->size = size;
-    table->entry = (NodeTableFileBlock **)_aligned_malloc(sizeof(NodeTableFileBlock) * size, 64);
-    if(!table->entry){
-        fprintf(stderr, "ERROR: Unable to allocate memory for hash table file blocks init\n");
+    table->bucket = (NodeTableFileBlock **)_aligned_malloc(sizeof(NodeTableFileBlock*) * size, 64);
+    if(!table->bucket){
+        fprintf(stderr, "CRITICAL ERROR: Unable to allocate memory for buckets init_table_fblock()\n");
         return;
     }   
-    
-    init_pool(&table->pool_nodes, sizeof(NodeTableFileBlock), max_nodes);
-    for(int i = 0; i < size; i++){
-        table->entry[i] = NULL;
-    }
+    memset(table->bucket, 0, sizeof(NodeTableFileBlock*) * size);
+    init_pool(&table->pool, sizeof(NodeTableFileBlock), max_nodes);
     InitializeSRWLock(&table->mutex); 
     table->count = 0;
 }
-uint64_t ht_get_hash_fblock(const uint64_t key, const size_t size) {
-    if(size <= 0){
-        fprintf(stderr, "ERROR: Invalid size for hash table file blocks\n");
-        return RET_VAL_ERROR;
-    }
-    return ((uint64_t)key % (uint64_t)size);
+size_t ht_get_hash_fblock(const uint64_t key, const size_t size) {
+    return ((size_t)key % size);
 }
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* pool_node, size_t block_size) {
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* block_data, size_t block_size) {
 
     if(!table){
-        fprintf(stderr, "ERROR: Invalid pointer(s) passed to insert file block from hash table\n");
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_insert_fblock()\n");
         return NULL;
     }
-    if(!pool_node){
-        fprintf(stderr, "ERROR: Invalid memory block pointer passed to insert file block from hash table\n");
+    if(!block_data){
+        fprintf(stderr, "CRITICAL ERROR: Invalid memory pool block pointer for ht_insert_fblock()\n");
         return NULL;
     }
+
+    size_t index = ht_get_hash_fblock(key, table->size);
 
     AcquireSRWLockExclusive(&table->mutex);
-    uint64_t index = ht_get_hash_fblock(key, table->size);
-
-    NodeTableFileBlock *table_node = (NodeTableFileBlock*)pool_alloc(&table->pool_nodes);
+    NodeTableFileBlock *table_node = (NodeTableFileBlock*)pool_alloc(&table->pool);
 
     if(!table_node){
         ReleaseSRWLockExclusive(&table->mutex);
-        fprintf(stderr, "ERROR: failed to allocate memory for file table node\n");
-        return NULL;
-    }
-
-    if(!pool_node){
-        ReleaseSRWLockExclusive(&table->mutex);
-        fprintf(stderr, "ERROR: invalid node pointer\n");
+        fprintf(stderr, "CRITICAL ERROR: failed to allocate memory for file table node\n");
         return NULL;
     }
 
     table_node->key = key;
     table_node->sid = sid;
     table_node->fid = fid;
-    table_node->block_data = pool_node;
+    table_node->block_data = block_data;
     table_node->block_size = block_size;
-    // memcpy(node->buffer, buffer, buffer_size);
-    table_node->next = (NodeTableFileBlock *)table->entry[index];  // Insert at the head (linked list)
-    table->entry[index] = table_node;
+    table_node->next = (NodeTableFileBlock *)table->bucket[index];  // Insert at the head (linked list)
+    table->bucket[index] = table_node;
     table->count++;
     ReleaseSRWLockExclusive(&table->mutex);
     return table_node;
 }
-void ht_remove_fblock(TableFileBlock *table, const uint64_t key, MemPool *pool) {
+int ht_remove_fblock(TableFileBlock *table, const uint64_t key) {
     
-    if(!table || !pool){
-        fprintf(stderr, "ERROR: Invalid pointer(s) passed to remove file block from hash table\n");
-        return;
+    if(!table){
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_remove_fblock()\n");
+        return RET_VAL_ERROR;
     }
     
-    uint64_t index = ht_get_hash_fblock(key, table->size);
-    
+    size_t index = ht_get_hash_fblock(key, table->size);
     AcquireSRWLockExclusive(&table->mutex);
-
-    NodeTableFileBlock *curr = table->entry[index];
+    NodeTableFileBlock *curr = table->bucket[index];
     NodeTableFileBlock *prev = NULL;
     while (curr) {     
         if (curr->key == key) {
-            // Found it
             if (prev) {
                 prev->next = curr->next;
             } else {
-                table->entry[index] = curr->next;
+                table->bucket[index] = curr->next;
             }
-            curr->key = 0;
-            curr->sid = 0;
-            curr->fid = 0;
-            curr->block_size = 0;
-            // pool_free(pool, (void*)curr->block_data);
-            // curr->block_data = NULL;
-            pool_free(&table->pool_nodes, (void*)curr);
+            pool_free(&table->pool, (void*)curr);
             curr = NULL;
             table->count--;
             ReleaseSRWLockExclusive(&table->mutex);
-            // fprintf(stdout, "Removed from pool key: %llu\n", key);
-            return;
+            return RET_VAL_SUCCESS;
         }
         prev = curr;
         curr = curr->next;
     }
     ReleaseSRWLockExclusive(&table->mutex);
-    return;
+    fprintf(stderr, "WARNING: Node to remove not found for ht_remove_fblock()\n");
+    return RET_VAL_ERROR;
 }
 BOOL ht_search_fblock(TableFileBlock *table, const uint64_t key) {
     
     if(!table){
-        fprintf(stderr, "ERROR: Invalid pointer passed to search file block in hash table\n");
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_search_fblock()\n");
         return FALSE;
     }
-
-    uint64_t index = ht_get_hash_fblock(key, table->size);
-
-    AcquireSRWLockExclusive(&table->mutex);
-
-    NodeTableFileBlock *node = table->entry[index];
-    while (node) {
-        if (node->key == key){
-            ReleaseSRWLockExclusive(&table->mutex);
+    size_t index = ht_get_hash_fblock(key, table->size);
+    AcquireSRWLockShared(&table->mutex);
+    NodeTableFileBlock *curr = table->bucket[index];
+    while (curr) {
+        if (curr->key == key){
+            ReleaseSRWLockShared(&table->mutex);
             return TRUE;
         }           
-        node = node->next;
+        curr = curr->next;
     }
-    ReleaseSRWLockExclusive(&table->mutex);
+    ReleaseSRWLockShared(&table->mutex);
     return FALSE;
 }
-
+void ht_clean_fblock(TableFileBlock *table) {
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_clean_fblock()\n");
+        return;
+    }
+    AcquireSRWLockExclusive(&table->mutex);
+    for (size_t index = 0; index < table->size; index++) {
+        NodeTableFileBlock *curr = table->bucket[index];
+        while (curr) {
+            NodeTableFileBlock *next = curr->next;
+            pool_free(&table->pool, (void*)curr);
+            table->count--;
+            curr = next;
+        }
+        table->bucket[index] = NULL;
+    }
+    ReleaseSRWLockExclusive(&table->mutex);
+}
 
