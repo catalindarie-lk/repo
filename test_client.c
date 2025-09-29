@@ -16,7 +16,7 @@
 #include "include/protocol_frames.h"    // For protocol frame definitions
 #include "include/resources.h"
 #include "include/netendians.h"         // For network byte order conversions
-#include "include/crc32.h"              // For checksum validation
+#include "include/crc32.h"           // For checksum validation
 #include "include/sha256.h"
 #include "include/mem_pool.h"           // For memory pool management
 #include "include/fileio.h"             // For file transfer functions
@@ -152,6 +152,20 @@ static int init_client_buffers(){
             fprintf(stderr, "CRITICAL ERROR: Failed to pre-allocate memory for fstream (chunk_buffer).\n");
             return RET_VAL_ERROR;
         }
+        client->fstream[i].hevent_metadata_response_ok = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_metadata_response_nok = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_file_end_response_ok = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_file_end_response_nok = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_file_end_transfer_err = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (client->fstream[i].hevent_metadata_response_ok == NULL || 
+            client->fstream[i].hevent_metadata_response_nok == NULL ||
+            client->fstream[i].hevent_file_end_response_ok == NULL || 
+            client->fstream[i].hevent_file_end_response_nok == NULL ||
+            client->fstream[i].hevent_file_end_transfer_err == NULL) {
+            fprintf(stderr, "CRITICAL ERROR: Failed to create fstream events. Error: %d\n", GetLastError());
+            return RET_VAL_ERROR;
+        }
+        InitializeSRWLock(&client->fstream[i].lock);
     }
     for(int i = 0; i < CLIENT_MAX_ACTIVE_MSTREAMS; i++){
         memset(&client->mstream[i], 0, sizeof(ClientMessageStream));
@@ -196,14 +210,7 @@ static int init_client_buffers(){
 
     // Initialize fstreams
     for(int index = 0; index < CLIENT_MAX_ACTIVE_FSTREAMS; index++){
-        client->fstream[index].hevent_metadata_response_ok = CreateEvent(NULL, FALSE, FALSE, NULL);
-        client->fstream[index].hevent_metadata_response_nok = CreateEvent(NULL, FALSE, FALSE, NULL);
-        if (client->fstream[index].hevent_metadata_response_ok == NULL || 
-            client->fstream[index].hevent_metadata_response_nok == NULL) {
-            fprintf(stderr, "CRITICAL ERROR: Failed to create fstream metadata events. Error: %d\n", GetLastError());
-            return RET_VAL_ERROR;
-        }
-        InitializeSRWLock(&client->fstream[index].lock);
+
     }
     InitializeSRWLock(&client->fstreams_lock);
     // Initialize mstreams
@@ -353,7 +360,9 @@ int log_to_file(const char* log_message) {
 }
 // --- Cleanup functions for streams ---
 void close_file_stream(ClientFileStream *fstream){
-    // EnterCriticalSection(&fstream->lock);
+
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
     memset(&fstream->calculated_sha256, 0, 32);
     if(fstream->fp){
         fclose(fstream->fp);
@@ -368,10 +377,9 @@ void close_file_stream(ClientFileStream *fstream){
     fstream->fname_len = 0;
     memset(&fstream->fname, 0, MAX_PATH);
     fstream->pending_bytes = 0;
-    fstream->pending_metadata_seq_num = 0;
     memset(fstream->chunk_buffer, 0, CLIENT_FILE_BLOCK_SIZE);
     fstream->fstream_busy = FALSE;
-    // LeaveCriticalSection(&fstream->lock);
+    fstream->pending_bytes = 0;
     return;
 }
 void close_message_stream(ClientMessageStream *mstream){
@@ -556,16 +564,24 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
     uint8_t  recv_frame_type = 0;
     uint64_t recv_seq_num = 0;
     uint32_t recv_session_id = 0;
+    uint32_t recv_file_id = 0;
+
+    uint8_t recv_op_code = 0;
 
     uint32_t recv_session_timeout;
     uint8_t recv_server_status;
 
+    uintptr_t entry = 0;
+
     char log_message[CLIENT_LOG_MESSAGE_LEN];
-
-    HANDLE events[2] = {queue_recv_prio_udp_frame->push_semaphore, queue_recv_udp_frame->push_semaphore};
-
+    
     PoolEntryRecvFrame recv_frame_entry;
     PoolEntryRecvFrame *entry_recv_frame = NULL;
+
+    ClientFileStream *fstream = NULL;
+    bool remove_frame = false;
+
+    HANDLE events[2] = {queue_recv_prio_udp_frame->push_semaphore, queue_recv_udp_frame->push_semaphore};
 
     while(client->client_status == STATUS_READY){
 
@@ -619,6 +635,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
             // For individual datagrams, retransmission is often handled by higher layers or ignored.
             continue;
         }
+
         switch (recv_frame_type) {
             case FRAME_TYPE_CONNECT_RESPONSE:
                 if(recv_seq_num != DEFAULT_CONNECT_REQUEST_SEQ){
@@ -654,6 +671,127 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                 SetEvent(client->hevent_connection_established);
                 break;
 
+            case FRAME_TYPE_FILE_METADATA_RESPONSE:
+                if(recv_session_id != client->sid){
+                    //fprintf(stderr, "Received FILE_METADATA_RESPONSE frame with invalid session ID: %d\n", recv_session_id);
+                    break;
+                }
+                client->last_active_time = time(NULL);
+                recv_op_code = frame->payload.file_metadata_response.op_code;
+                recv_file_id = _ntohl(frame->payload.file_metadata_response.file_id);
+                
+                fstream = NULL;
+                for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+                    AcquireSRWLockExclusive(&client->fstream[i].lock);
+                    if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
+                        fstream = &client->fstream[i];
+                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                        break;
+                    } else {
+                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                        continue;
+                    }                    
+                }
+
+                if(!fstream){
+                    snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_METADATA_RESPONSE for unknown client fstream CODE: %u", recv_op_code);
+                    log_to_file(log_message);
+                    
+                    entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+                    if(!entry){
+                        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                        log_to_file(log_message);
+                        break;
+                    } else {
+                        s_pool_free(pool_send_udp_frame, (void*)entry);
+                    }
+
+                    break;
+                }
+
+                remove_frame = false;
+                switch (recv_op_code) {
+                    case STS_CONFIRM_FILE_METADATA:
+                        // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_METADATA for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        // log_to_file(log_message);
+                        SetEvent(fstream->hevent_metadata_response_ok);
+                        remove_frame = true;
+                        break;
+                    case ERR_CONFIRM_DUPLICATE_FILE_METADATA:
+                        // snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_CONFIRM_DUPLICATE_FILE_METADATA for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        // log_to_file(log_message);
+                        // SetEvent(fstream->hevent_metadata_response_ok);
+                        remove_frame = true;
+                        break;
+
+                    case ERR_EXISTING_FILE:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        SetEvent(fstream->hevent_metadata_response_nok);
+                        remove_frame = true;
+                        break;
+
+                    case ERR_SERVER_TERMINATED_STREAM:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        remove_frame = true;
+                        break;
+
+                    case ERR_STREAM_INIT:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_STREAM_INIT for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        remove_frame = false;
+                        break;
+                    
+                    case ERR_ALL_STREAMS_BUSY:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_ALL_STREAMS_BUSY for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+
+                    case ERR_RESOURCE_LIMIT:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_RESOURCE_LIMIT for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+                        
+                    case ERR_INTERNAL_ERROR:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_INTERNAL_ERROR for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+
+                    case ERR_MALFORMED_FRAME:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_MALFORMED_FRAME for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+
+                    case ERR_UNKNOWN_ERROR:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_ERROR for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+                    
+                    default:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_METADATA_RESPONSE frame CODE: %u", recv_op_code);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+                }
+                
+                if(!remove_frame){
+                    break;
+                }
+
+                entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+                if(!entry){
+                    snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                    log_to_file(log_message);
+                } else {
+                    s_pool_free(pool_send_udp_frame, (void*)entry);
+                }
+                break;
+
             case FRAME_TYPE_ACK:
                 if(recv_session_id != client->sid){
                     //fprintf(stderr, "Received ACK frame with invalid session ID: %d\n", recv_session_id);
@@ -661,90 +799,200 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                     break;
                 }
                 client->last_active_time = time(NULL);
-                uint8_t recv_op_code = frame->payload.ack.op_code;
+                recv_op_code = frame->payload.ack.op_code;
+                recv_file_id = _ntohl(frame->payload.ack.file_id);
+
+                fstream = NULL;
+                for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+                    AcquireSRWLockExclusive(&client->fstream[i].lock);
+                    if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
+                        fstream = &client->fstream[i];
+                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                        break;
+                    } else {
+                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                        continue;
+                    }                    
+                }
+
+                if(!fstream){
+                    // snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_ACK for unknown client fstream CODE: %u", recv_op_code);
+                    // log_to_file(log_message);
+                    
+                    entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+                    if(!entry){
+                        // snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                        // log_to_file(log_message);
+                        break;
+                    } else {
+                        s_pool_free(pool_send_udp_frame, (void*)entry);
+                    }
+
+                    break;
+                }
+
+                remove_frame = false;
+                switch (recv_op_code) {
+                    case ERR_DUPLICATE_FRAME:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_DUPLICATE_FRAME - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        remove_frame = true;
+                        break;
+
+                    case ERR_EXISTING_FILE:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        remove_frame = true;
+                        break;
+
+                    case ERR_UNKNOWN_FILE_ID:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_FILE_ID - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        remove_frame = true;
+                        break;
+                    
+                    case ERR_MALFORMED_FRAME:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_MALFORMED_FRAME - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        remove_frame = true;
+                        break;
+
+                    case ERR_SERVER_TERMINATED_STREAM:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        remove_frame = true;
+                        break;
+
+                    case STS_KEEP_ALIVE:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received STS_KEEP_ALIVE - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        remove_frame = false;
+                        break;
+
+                    default:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_ACK frame CODE: %u", recv_op_code);
+                        log_to_file(log_message);
+                        remove_frame = false;
+                        break;
+                }
+
+                if(!remove_frame){
+                    break;
+                }
+                    
+                entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+                if(!entry){
+                    snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                    log_to_file(log_message);
+                    break;
+                }
+                s_pool_free(pool_send_udp_frame, (void*)entry);
+
 
                 if(recv_seq_num == DEFAULT_DISCONNECT_REQUEST_SEQ && recv_op_code == STS_CONFIRM_DISCONNECT){
                     SetEvent(client->hevent_connection_closed);
                     client->session_status = CONNECTION_CLOSED;
-                    ///////////////////////////////////////////////
-                    // clean_table_send_frame(table_send_udp_frame);
-                    ///////////////////////////////////////////////
                     snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_DISCONNECT - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
                     log_to_file(log_message);
-                    fprintf(stderr, "%s\n", log_message);
                     break;
                 }
 
-                for(int i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++){
-                    ClientFileStream *fstream = &client->fstream[i];
-                    if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == STS_CONFIRM_FILE_METADATA) { 
-                        fstream->pending_metadata_seq_num = 0; 
-                        SetEvent(fstream->hevent_metadata_response_ok);
-                    } else if (recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_CONFIRM_DUPLICATE_FILE_METADATA) {
-                        fstream->pending_metadata_seq_num = 0;
-                        SetEvent(fstream->hevent_metadata_response_ok);
-                        snprintf(log_message, sizeof(log_message), "WARNING: Received ERR_CONFIRM_DUPLICATE_FILE_METADATA for file '%s%s'. Duplicate metadata frame.", fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_EXISTING_FILE ) {
-                        fstream->pending_metadata_seq_num = 0;
-                        SetEvent(fstream->hevent_metadata_response_nok);
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file '%s%s'. Droping metadata frame.", fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                    } else if(recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_STREAM_INIT) {
-                        fstream->pending_metadata_seq_num = 0;
-                        SetEvent(fstream->hevent_metadata_response_nok);
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_STREAM_INIT for file '%s%s'. Droping metadata frame.", fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                    } else if (recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_INTERNAL_ERROR){
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_INTERNAL_ERROR for file '%s%s'.", fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                    } else if (recv_seq_num == fstream->pending_metadata_seq_num && recv_op_code == ERR_UNKNOWN_ERROR){
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_ERROR for file '%s%s'.", fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
+                break;
+
+            case FRAME_TYPE_FILE_END_RESPONSE:
+                if(recv_session_id != client->sid){
+                    break;                    
+                }
+
+                client->last_active_time = time(NULL);
+                recv_op_code = frame->payload.file_end_response.op_code;
+                recv_file_id = _ntohl(frame->payload.file_end_response.file_id);
+
+                fstream = NULL;
+                for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+                    AcquireSRWLockExclusive(&client->fstream[i].lock);
+                    if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
+                        fstream = &client->fstream[i];
+                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                        break;
+                    } else {
+                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                        continue;
                     }
                 }
 
-                if(recv_seq_num == DEFAULT_FILE_END_SEQ && recv_op_code == STS_CONFIRM_FILE_END){
-                    // snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_FILE_END - session ID: %lu", recv_session_id);
-                    // log_to_file(log_message);
-                } else if (recv_seq_num == DEFAULT_FILE_END_SEQ && recv_op_code == ERR_EXISTING_FILE){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file end frame - - session ID: %lu", recv_session_id);
+                if(!fstream){
+                    snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_END_RESPONSE for unknown client fstream CODE: %u", recv_op_code);
                     log_to_file(log_message);
-                } else if (recv_seq_num == DEFAULT_FILE_END_SEQ && recv_op_code == ERR_UNKNOWN_FILE_ID){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_FILE_ID for file end frame - - session ID: %lu", recv_session_id);
-                    log_to_file(log_message);
-                }
-
-                if(recv_op_code == ERR_SERVER_TERMINATED_STREAM){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM for seq num: %llu", recv_seq_num);
-                    log_to_file(log_message);
-                }
-
-                if(recv_op_code == STS_CONFIRM_MESSAGE_FRAGMENT ||
-                        recv_op_code == STS_CONFIRM_FILE_METADATA ||
-                        recv_op_code == ERR_CONFIRM_DUPLICATE_FILE_METADATA ||
-                        recv_op_code == STS_CONFIRM_FILE_END ||
-                        recv_op_code == ERR_DUPLICATE_FRAME || 
-                        recv_op_code == ERR_EXISTING_FILE ||
-                        recv_op_code == ERR_EXISTING_MESSAGE ||
-                        recv_op_code == ERR_UNKNOWN_FILE_ID
-                    ){
                     
-                    uintptr_t entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+                    entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
                     if(!entry){
                         snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
                         log_to_file(log_message);
                         break;
+                    } else {
+                        s_pool_free(pool_send_udp_frame, (void*)entry);
                     }
-                    s_pool_free(pool_send_udp_frame, (void*)entry);
-                }
-
-                if(recv_seq_num == DEFAULT_KEEP_ALIVE_SEQ && recv_op_code == STS_KEEP_ALIVE){
-                    // snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_KEEP_ALIVE - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
-                    // log_to_file(log_message);
                     break;
                 }
+
+                remove_frame = false;
+
+                switch (recv_op_code) {
+                    case STS_CONFIRM_FILE_END:
+                        // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_END for file end seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+                        // log_to_file(log_message);
+                        SetEvent(fstream->hevent_file_end_response_ok);
+                        remove_frame = TRUE;
+                        break;
+                    
+                    case ERR_EXISTING_FILE:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        SetEvent(fstream->hevent_file_end_response_nok);
+                        remove_frame = TRUE;
+                        break;
+                    
+                    case ERR_SERVER_TERMINATED_STREAM:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        SetEvent(fstream->hevent_file_end_transfer_err);
+                        remove_frame = TRUE;
+                        break;
+
+                    case ERR_UNKNOWN_FILE_ID:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_FILE_ID for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        SetEvent(fstream->hevent_file_end_transfer_err);
+                        remove_frame = TRUE;
+                        break;
+
+                    case ERR_RESOURCE_LIMIT:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_RESOURCE_LIMIT for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
+                        log_to_file(log_message);
+                        remove_frame = FALSE;
+                        break;
+
+                    default:
+                        snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_END_RESPONSE frame CODE: %u", recv_op_code);
+                        log_to_file(log_message);
+                        remove_frame = FALSE;
+                        break;               
+                }
+                
+                if(!remove_frame){
+                    break;
+                }
+
+                entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+                if(!entry){
+                    snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                    log_to_file(log_message);
+                    break;
+                } else {
+                    s_pool_free(pool_send_udp_frame, (void*)entry);
+                }
                 break;
+
 
             case FRAME_TYPE_DISCONNECT:
                 if(recv_session_id != client->sid){
@@ -768,13 +1016,13 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                     break;
                 }
                 // Process SACK frame logic here
-                // snprintf(log_message, sizeof(log_message), "DEBUG: Received SACK frame from %s:%d with seq num: %llu, ack count: %u", src_ip, src_port, recv_seq_num, frame->payload.sack.ack_count);
+                // snprintf(log_message, sizeof(log_message), "DEBUG: Received SACK frame from %s:%d with seq num: %llu, ack count: %u, sid: %lu", src_ip, src_port, recv_seq_num, frame->payload.sack.ack_count, recv_session_id);
                 // log_to_file(log_message);
                 int ack_count = frame->payload.sack.ack_count;
                 if(ack_count > 0){
                     for(int i = 0; i < ack_count; i++){
                         uint64_t ack_seq_num = _ntohll(frame->payload.sack.seq_num[i]);
-                        uintptr_t entry = remove_table_send_frame(table_send_udp_frame, ack_seq_num);
+                        entry = remove_table_send_frame(table_send_udp_frame, ack_seq_num);
                         if(!entry){
                             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
                             log_to_file(log_message);
@@ -797,6 +1045,7 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
     _endthreadex(0);    
     return 0;
 }
+
 // --- Re-Send frames not acknowledges within set time ---
 static DWORD WINAPI fthread_resend_frame(LPVOID lpParam){
    
@@ -804,7 +1053,7 @@ static DWORD WINAPI fthread_resend_frame(LPVOID lpParam){
 
     while(client->client_status == STATUS_READY){ 
         check_timeout_table_send_frame(table_send_udp_frame, pool_send_iocp_context);
-        Sleep(100);
+        Sleep(500);
     }
     fprintf(stdout,"resend frame thread exiting...\n");
     _endthreadex(0);
@@ -959,83 +1208,85 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
         }
          
         ClientFileStream *fstream = NULL;
-        AcquireSRWLockExclusive(&client->fstreams_lock);
-        for(int index = 0; index < CLIENT_MAX_ACTIVE_FSTREAMS; index++){
-            fstream = &client->fstream[index];
-            if(!fstream->fstream_busy){
-                fstream->fstream_busy = TRUE;
-                break;
+        for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+            AcquireSRWLockExclusive(&client->fstream[i].lock);
+            
+            if(!client->fstream[i].fstream_busy){
+                fstream = &client->fstream[i];
+                                // Safely copy paths using the lengths from the queue entry
+                                // fpath
+                                int result = snprintf(fstream->dirpath, MAX_PATH, "%.*s",
+                                                        (int)entry->command.send_file.dirpath_len,
+                                                        entry->command.send_file.dirpath);
+                                if (result < 0 || (size_t)result != entry->command.send_file.dirpath_len) {
+                                    snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - Failed to copy dirpath '%.*s' (truncation or error). Result: %d, Expected: %u.",
+                                                                            (int)entry->command.send_file.dirpath_len, entry->command.send_file.dirpath, result, entry->command.send_file.dirpath_len);
+                                    log_to_file(log_message);
+                                    goto clean; // Essential to clean up if path copy fails
+                                }
+                                fstream->fpath_len = entry->command.send_file.dirpath_len;
+                                // rpath
+                                result = snprintf(fstream->rpath, MAX_PATH, "%.*s",
+                                                        (int)entry->command.send_file.rpath_len,
+                                                        entry->command.send_file.rpath);
+                                if (result < 0 || (size_t)result != entry->command.send_file.rpath_len) {
+                                    snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - Failed to copy rpath '%.*s' (truncation or error). Result: %d, Expected: %u.",
+                                                                            (int)entry->command.send_file.rpath_len, entry->command.send_file.rpath, result, entry->command.send_file.rpath_len);
+                                    log_to_file(log_message);
+                                    goto clean; // Essential to clean up if path copy fails
+                                }
+                                fstream->rpath_len = entry->command.send_file.rpath_len;
+
+                                // fname
+                                result = snprintf(fstream->fname, MAX_PATH, "%.*s",
+                                                        (int)entry->command.send_file.fname_len,
+                                                        entry->command.send_file.fname);
+                                if (result < 0 || (size_t)result != entry->command.send_file.fname_len) {
+                                    snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - Failed to copy fname '%.*s' (truncation or error). Result: %d, Expected: %u.",
+                                                                            (int)entry->command.send_file.fname_len, entry->command.send_file.fname, result, entry->command.send_file.fname_len);
+                                    log_to_file(log_message);
+                                    goto clean; // Essential to clean up if path copy fails
+                                }
+                                fstream->fname_len = entry->command.send_file.fname_len;
+
+                                sha256_init(&sha256_ctx);       
+                                fstream->fp = NULL;
+                                
+                                char full_path[MAX_PATH] = {0};
+                                snprintf(full_path, MAX_PATH, "%s%s", fstream->dirpath, fstream->fname);
+
+                                fstream->fsize = get_file_size(full_path, &fstream->fp);
+                                if(fstream->fsize == RET_VAL_ERROR){
+                                    goto clean;
+                                }
+                                fstream->pending_bytes = fstream->fsize;
+
+                                if(!fstream->fp){
+                                    snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - failed to open file %s", full_path);
+                                    log_to_file(log_message);
+                                    fprintf(stderr, "%s\n", log_message);
+                                    goto clean;
+                                }
+
+                                fstream->fid = InterlockedIncrement(&client->fid_count);
+
+                                fstream->fstream_busy = TRUE;
+                                ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                                break;
+
+            } else {
+                ReleaseSRWLockExclusive(&client->fstream[i].lock);
+                continue;
+                
             }
         }
-        ReleaseSRWLockExclusive(&client->fstreams_lock);
+        
 
         if(!fstream){
             snprintf(log_message, sizeof(log_message), "WARNING: All fstreams are busy.");
             log_to_file(log_message);
             continue;
         }
-        
-        AcquireSRWLockExclusive(&fstream->lock);
-       
-        // Safely copy paths using the lengths from the queue entry
-        // fpath
-        int result = snprintf(fstream->dirpath, MAX_PATH, "%.*s",
-                                   (int)entry->command.send_file.dirpath_len,
-                                   entry->command.send_file.dirpath);
-        if (result < 0 || (size_t)result != entry->command.send_file.dirpath_len) {
-            snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - Failed to copy dirpath '%.*s' (truncation or error). Result: %d, Expected: %u.",
-                                                    (int)entry->command.send_file.dirpath_len, entry->command.send_file.dirpath, result, entry->command.send_file.dirpath_len);
-            log_to_file(log_message);
-            goto clean; // Essential to clean up if path copy fails
-        }
-        fstream->fpath_len = entry->command.send_file.dirpath_len;
-        // rpath
-        result = snprintf(fstream->rpath, MAX_PATH, "%.*s",
-                                   (int)entry->command.send_file.rpath_len,
-                                   entry->command.send_file.rpath);
-        if (result < 0 || (size_t)result != entry->command.send_file.rpath_len) {
-            snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - Failed to copy rpath '%.*s' (truncation or error). Result: %d, Expected: %u.",
-                                                    (int)entry->command.send_file.rpath_len, entry->command.send_file.rpath, result, entry->command.send_file.rpath_len);
-            log_to_file(log_message);
-            goto clean; // Essential to clean up if path copy fails
-        }
-        fstream->rpath_len = entry->command.send_file.rpath_len;
-
-        // fname
-        result = snprintf(fstream->fname, MAX_PATH, "%.*s",
-                                   (int)entry->command.send_file.fname_len,
-                                   entry->command.send_file.fname);
-        if (result < 0 || (size_t)result != entry->command.send_file.fname_len) {
-            snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - Failed to copy fname '%.*s' (truncation or error). Result: %d, Expected: %u.",
-                                                    (int)entry->command.send_file.fname_len, entry->command.send_file.fname, result, entry->command.send_file.fname_len);
-            log_to_file(log_message);
-            goto clean; // Essential to clean up if path copy fails
-        }
-        fstream->fname_len = entry->command.send_file.fname_len;
-
-        sha256_init(&sha256_ctx);       
-        fstream->fp = NULL;
-        
-        char full_path[MAX_PATH] = {0};
-        snprintf(full_path, MAX_PATH, "%s%s", fstream->dirpath, fstream->fname);
-
-        fstream->fsize = get_file_size(full_path, &fstream->fp);
-        if(fstream->fsize == RET_VAL_ERROR){
-            goto clean;
-        }
-        fstream->pending_bytes = fstream->fsize;
-
-        // fstream->fp = fopen(full_path, "rb");
-        if(!fstream->fp){
-            snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - failed to open file %s", full_path);
-            log_to_file(log_message);
-            fprintf(stderr, "%s\n", log_message);
-            goto clean;
-        }
-
-        fstream->fid = InterlockedIncrement(&client->fid_count);
-
-        fstream->pending_metadata_seq_num = InterlockedIncrement64(&client->frame_count);
         
         entry_send = (PoolEntrySendFrame*)s_pool_alloc(pool_send_udp_frame);
         if(!entry_send){
@@ -1044,7 +1295,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             goto clean;
         }
         res = construct_file_metadata(entry_send,
-                                        fstream->pending_metadata_seq_num, 
+                                        InterlockedIncrement64(&client->frame_count), 
                                         client->sid, 
                                         fstream->fid, 
                                         fstream->fsize,
@@ -1052,14 +1303,13 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                                         fstream->rpath_len, 
                                         fstream->fname, 
                                         fstream->fname_len,
-                                        // FILE_FRAGMENT_SIZE,
                                         client->socket, &client->server_addr);
         if(res == RET_VAL_ERROR){
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: construct_file_metadata() returned RET_VAL_ERROR. Should not happen since inputs are validated before calling.");
             log_to_file(log_message);
             goto clean;
         }
-        if(s_push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
+        if(s_push_ptr(queue_send_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file metadata frame to 'queue_send_prio_udp_frame'. Should never happen since queue is blocking on push/pop semaphores\n");
             log_to_file(log_message);
             s_pool_free(pool_send_udp_frame, (void*)entry_send);
@@ -1074,8 +1324,8 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             // metadata response ok event
         } else if (wait_result == WAIT_OBJECT_0 + 1){
             // metadata response nok event 
-            // snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - response nok from server.");
-            // log_to_file(log_message);
+            snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - response nok from server.");
+            log_to_file(log_message);
             goto clean;
         } else {
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Unexpected result for wait metadata frame event: %lu.", GetLastError());
@@ -1089,7 +1339,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
 
             chunk_bytes_to_send = fread(fstream->chunk_buffer, 1, CLIENT_FILE_BLOCK_SIZE, fstream->fp);
             if (chunk_bytes_to_send == 0 && ferror(fstream->fp)) {
-                snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - error reading from file %s.", full_path);
+                snprintf(log_message, sizeof(log_message), "ERROR: fthread_process_fstream - error reading from file %s%s", fstream->dirpath, fstream->fname);
                 log_to_file(log_message);
                 goto clean;
             }           
@@ -1141,12 +1391,6 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                 frame_fragment_offset += frame_fragment_size;                       
                 chunk_bytes_to_send -= frame_fragment_size;
                 fstream->pending_bytes -= frame_fragment_size;
-
-                if(client->session_status == CONNECTION_CLOSED){
-                    fprintf(stderr, "Disconnected from server!!!\n");
-                    goto clean;
-                }
-
             }
         }                  
 
@@ -1159,24 +1403,61 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             goto clean;
         }
         construct_file_end(entry_send,
-                            DEFAULT_FILE_END_SEQ, 
+                            InterlockedIncrement64(&client->frame_count), 
                             client->sid, 
                             fstream->fid, 
                             fstream->fsize, 
                             (uint8_t *)&fstream->calculated_sha256,
                             client->socket, &client->server_addr);
-        if(s_push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
-            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file end frame to 'queue_send_prio_udp_frame'. Should never happen since queue is blocking on push/pop semaphores.");
+        if(s_push_ptr(queue_send_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
+            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push file end frame to 'queue_send_udp_frame'. Should never happen since queue is blocking on push/pop semaphores.");
             log_to_file(log_message);
             s_pool_free(pool_send_udp_frame, (void*)entry_send);
             goto clean;
         }
 
+        HANDLE file_end_events[3] = {fstream->hevent_file_end_response_ok, 
+                                fstream->hevent_file_end_response_nok,
+                                fstream->hevent_file_end_transfer_err
+                            };
+
+        DWORD wait_file_end = WaitForMultipleObjects(3, file_end_events, FALSE, INFINITE);
+        
+        if(wait_file_end == WAIT_OBJECT_0){
+            // file end response ok event
+            goto clean;
+        } else if (wait_file_end == WAIT_OBJECT_0 + 1){
+            // metadata response nok event 
+            snprintf(log_message, sizeof(log_message), "ERROR EVENT FILE END: Received event response NOK for file_id: %lu", fstream->fid);
+            log_to_file(log_message);
+            goto clean;
+        } else if (wait_file_end == WAIT_OBJECT_0 + 2){
+            // metadata response nok event 
+            snprintf(log_message, sizeof(log_message), "ERROR EVENT FILE END: Received event TRANSFER ERR for file_id: %lu", fstream->fid);
+            log_to_file(log_message);
+            goto requeue;
+        } else {
+            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Unexpected result for wait file end frame event: %lu.", GetLastError());
+            log_to_file(log_message);
+            goto clean;
+        }
+
     clean:
+        AcquireSRWLockExclusive(&fstream->lock);
         s_pool_free(pool_send_command, (void*)entry);
         close_file_stream(fstream);
         ReleaseSRWLockExclusive(&fstream->lock);
         ReleaseSemaphore(client->fstreams_semaphore, 1, NULL);
+        continue;
+    requeue:
+        // s_pool_free(pool_send_command, (void*)entry);
+        AcquireSRWLockExclusive(&fstream->lock);
+        s_push_ptr(queue_send_file_command, (uintptr_t)entry);
+        close_file_stream(fstream);
+        ReleaseSRWLockExclusive(&fstream->lock);
+        ReleaseSemaphore(client->fstreams_semaphore, 1, NULL);
+        continue;
+
     }
     _endthreadex(0);
     return 0;               

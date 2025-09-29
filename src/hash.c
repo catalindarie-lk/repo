@@ -220,7 +220,7 @@ int insert_table_send_frame(TableSendFrame *table, const uintptr_t frame){
     PoolEntrySendFrame *pool_entry = (PoolEntrySendFrame*)frame;
     uint64_t seq_num = _ntohll(pool_entry->frame.header.seq_num);
     
-    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
+    size_t index = get_hash_table_send_frame(seq_num, table->size);
     AcquireSRWLockExclusive(&table->mutex);   
     TableNodeSendFrame *node = (TableNodeSendFrame*)pool_alloc(&table->pool);
     if(node == NULL){
@@ -247,7 +247,7 @@ uintptr_t remove_table_send_frame(TableSendFrame *table, const uint64_t seq_num)
         return (uintptr_t)0;
     }
     
-    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
+    size_t index = get_hash_table_send_frame(seq_num, table->size);
     AcquireSRWLockExclusive(&table->mutex);
     TableNodeSendFrame *curr = table->bucket[index];
     TableNodeSendFrame *prev = NULL;
@@ -284,7 +284,7 @@ uintptr_t search_table_send_frame(TableSendFrame *table, const uint64_t seq_num)
         return (uintptr_t)0;
     }
     
-    uint64_t index = get_hash_table_send_frame(seq_num, table->size);
+    size_t index = get_hash_table_send_frame(seq_num, table->size);
     AcquireSRWLockShared(&table->mutex);
     TableNodeSendFrame *curr = table->bucket[index];
     TableNodeSendFrame *prev = NULL;
@@ -392,16 +392,16 @@ void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_node
 size_t ht_get_hash_fblock(const uint64_t key, const size_t size) {
     return ((size_t)key % size);
 }
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* block_data, size_t block_size) {
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint8_t op_type ,const uint32_t sid, const uint32_t fid, char* block_data, size_t block_size) {
 
     if(!table){
         fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_insert_fblock()\n");
         return NULL;
     }
-    if(!block_data){
-        fprintf(stderr, "CRITICAL ERROR: Invalid memory pool block pointer for ht_insert_fblock()\n");
-        return NULL;
-    }
+    // if(!block_data){
+    //     fprintf(stderr, "CRITICAL ERROR: Invalid memory pool block pointer for ht_insert_fblock()\n");
+    //     return NULL;
+    // }
 
     size_t index = ht_get_hash_fblock(key, table->size);
 
@@ -419,6 +419,7 @@ NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, 
     table_node->fid = fid;
     table_node->block_data = block_data;
     table_node->block_size = block_size;
+    table_node->op_type = op_type;
     table_node->next = (NodeTableFileBlock *)table->bucket[index];  // Insert at the head (linked list)
     table->bucket[index] = table_node;
     table->count++;
@@ -494,3 +495,22 @@ void ht_clean_fblock(TableFileBlock *table) {
     ReleaseSRWLockExclusive(&table->mutex);
 }
 
+
+//--------------------------------------------------------------------------------------------------------------------------
+size_t hash_stream(const uint32_t session_id, const uint32_t file_id, const uint64_t num_threads) {
+    // Combine the two 32-bit IDs into one 64-bit key
+    if(session_id == 0 || file_id == 0) {
+        return (size_t)num_threads;
+    }
+    uint64_t key = ((uint64_t)session_id << 32) | file_id;
+
+    // Apply a strong 64-bit hash (MurmurHash3 finalizer style)
+    key ^= key >> 33;
+    key *= 0xff51afd7ed558ccdULL;
+    key ^= key >> 33;
+    key *= 0xc4ceb9fe1a85ec53ULL;
+    key ^= key >> 33;
+
+    return (size_t)(key % num_threads);
+
+}

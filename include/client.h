@@ -49,6 +49,7 @@
 //---------------------------------------------------------------------------------------------------------
 // --- Client Stream Configuration ---
 #define CLIENT_MAX_ACTIVE_MSTREAMS                  1                     // Maximum number of concurrent message streams (e.g., long text messages)
+#define CLIENT_MAX_ACTIVE_FSTREAMS                  5
 
 // --- Client Worker Thread Configuration ---
 #define CLIENT_MAX_THREADS_RECV_SEND_FRAME          1                     // Number of threads dedicated to receiving and sending frames
@@ -56,9 +57,9 @@
 #define CLIENT_MAX_THREADS_SEND_FRAME               1                     // Number of threads for popping normal send frames from queue
 //---------------------------------------------------------------------------------------------------------
 // --- Client SEND Buffer Sizes ---
-#define CLIENT_QUEUE_SIZE_SEND_FRAME                1024
-#define CLIENT_QUEUE_SIZE_SEND_PRIO_FRAME           64
-#define CLIENT_QUEUE_SIZE_SEND_CTRL_FRAME           16
+#define CLIENT_QUEUE_SIZE_SEND_FRAME                256
+#define CLIENT_QUEUE_SIZE_SEND_PRIO_FRAME           32
+#define CLIENT_QUEUE_SIZE_SEND_CTRL_FRAME           4
 // --- Client SEND Memory Pool Sizes ---
 #define CLIENT_POOL_SIZE_SEND                       (CLIENT_QUEUE_SIZE_SEND_FRAME + \
                                                     CLIENT_QUEUE_SIZE_SEND_PRIO_FRAME + \
@@ -66,15 +67,15 @@
 #define CLIENT_POOL_SIZE_IOCP_SEND                  CLIENT_POOL_SIZE_SEND * 2
 
 // --- Client RECV Buffer Sizes ---
-#define CLIENT_QUEUE_SIZE_RECV_FRAME                (2048 + 128 * CLIENT_MAX_ACTIVE_FSTREAMS) // Size of the queue for received frames
-#define CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME           64
+#define CLIENT_QUEUE_SIZE_RECV_FRAME                (1024 + 128 * CLIENT_MAX_ACTIVE_FSTREAMS) // Size of the queue for received frames
+#define CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME           32
 // --- Client RECV Memory Pool Sizes ---
 #define CLIENT_POOL_SIZE_RECV                       (CLIENT_QUEUE_SIZE_RECV_FRAME + \
                                                     CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME)
 #define CLIENT_POOL_SIZE_IOCP_RECV                  (CLIENT_POOL_SIZE_RECV * 2)
 //---------------------------------------------------------------------------------------------------------
-#define CLIENT_QUEUE_SIZE_SEND_FILE                 16384                  // Size of the queue for file stream commands
-#define CLIENT_QUEUE_SIZE_SEND_MESSAGE              128                    // Size of the queue for message stream commands
+#define CLIENT_QUEUE_SIZE_SEND_FILE                 65536                  // Size of the queue for file stream commands
+#define CLIENT_QUEUE_SIZE_SEND_MESSAGE              65536                  // Size of the queue for message stream commands
 #define CLIENT_POOL_SIZE_SEND_COMMAND               (CLIENT_QUEUE_SIZE_SEND_FILE + \
                                                     CLIENT_QUEUE_SIZE_SEND_MESSAGE + 16)
 #define CLIENT_QUEUE_SIZE_LOG                       65536
@@ -170,11 +171,16 @@ typedef struct{
     uint8_t calculated_sha256[32];      // Buffer for sha256 calculated by the server
 
     uint64_t pending_bytes;                     // Remaining bytes of the file data to be sent/received
-    uint64_t pending_metadata_seq_num;          // Sequence number for pending metadata frames
+    // uint64_t pending_metadata_seq_num;          // Sequence number for pending metadata frames
     uint8_t *chunk_buffer;                      // Buffer to hold chunks of file data for reading/writing
 
     HANDLE hevent_metadata_response_ok;         // Event handle for successful metadata response
     HANDLE hevent_metadata_response_nok;        // Event handle for unsuccessful metadata response
+
+    HANDLE hevent_file_end_response_ok;         // Event handle for successful metadata response
+    HANDLE hevent_file_end_response_nok;        // Event handle for unsuccessful metadata response
+    HANDLE hevent_file_end_transfer_err;
+
     SRWLOCK lock;                      // Critical section for protecting access to this stream's data
 }ClientFileStream;
 

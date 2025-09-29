@@ -479,7 +479,7 @@ exit_err:
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for message fragment error ack frame\n");
         return RET_VAL_ERROR;
     }
-    construct_ack_frame(entry_send_frame, recv_seq_num, recv_session_id, op_code, server->socket, &client->client_addr);
+    construct_ack_frame(entry_send_frame, recv_seq_num, recv_session_id, recv_message_id, op_code, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
         pool_free(pool_send_udp_frame, entry_send_frame);
         fprintf(stderr, "ERROR: Failed to push message ack error to queue priority.\n");

@@ -36,7 +36,7 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server Stream Configuration ---
-#define MAX_SERVER_ACTIVE_FSTREAMS                  ((MAX_CLIENTS + 1) * CLIENT_MAX_ACTIVE_FSTREAMS) // 5 file streams per client + 5 extra for safety
+#define MAX_SERVER_ACTIVE_FSTREAMS                  (11) // 5 file streams per client + 5 extra for safety
 #define MAX_SERVER_ACTIVE_MSTREAMS                  10
 
 // --- Server Worker Thread Configuration ---
@@ -79,9 +79,6 @@
     MemPool *pool_file_block = &((buffers_obj).pool_file_block); \
     MemPool *pool_iocp_send_context = &((buffers_obj).pool_iocp_send_context); \
     MemPool *pool_iocp_recv_context = &((buffers_obj).pool_iocp_recv_context); \
-    MemPool *pool_recv_udp_frame = &((buffers_obj).pool_recv_udp_frame); \
-    QueuePtr *queue_recv_udp_frame = &((buffers_obj).queue_recv_udp_frame); \
-    QueuePtr *queue_recv_prio_udp_frame = &((buffers_obj).queue_recv_prio_udp_frame); \
     TableIDs *table_file_id = &((buffers_obj).table_file_id); \
     TableIDs *table_message_id = &((buffers_obj).table_message_id); \
     TableFileBlock *table_file_block = &((buffers_obj).table_file_block); \
@@ -93,6 +90,7 @@
     ServerFstreamPool *pool_fstreams = &((server_obj).pool_fstreams); \
     ServerMstreamPool *pool_mstreams = &((server_obj).pool_mstreams); \
     ServerClientPool *pool_clients = &((server_obj).pool_clients); \
+    ServerStreamProcessingUnit *sspu = &((server_obj).sspu); \
 // end of #define PARSE_GLOBAL_DATA // End marker for the macro definition
 
 enum Status{
@@ -244,6 +242,20 @@ typedef struct {
 }ServerClientPool;
 
 typedef struct {
+    HANDLE thread_process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
+    HANDLE thread_process_ctrl_frame;
+    MemPool pool_ctrl_frame;
+    QueuePtr queue_ctrl_frame;
+    MemPool pool_data_frame;
+    QueuePtr queue_data_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
+    QueuePtr queue_prio_data_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
+    QueuePtr queue_stream_completition[SERVER_MAX_THREADS_PROCESS_FRAME];
+    
+    size_t id[SERVER_MAX_THREADS_PROCESS_FRAME];
+} ServerStreamProcessingUnit;
+
+
+typedef struct {
     SOCKET socket;
     struct sockaddr_in server_addr;            // Server address structure
     uint8_t server_status;                // Status of the server (e.g., busy, ready, error)
@@ -258,6 +270,13 @@ typedef struct {
     ServerFstreamPool pool_fstreams;
     ServerMstreamPool pool_mstreams;
     ServerClientPool pool_clients;
+
+    ServerStreamProcessingUnit sspu;
+
+    MemPool iocp_pool;
+    HANDLE iocp_ctrl_frame;
+    HANDLE iocp_data_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
+
 }ServerData;
 
 typedef struct {
@@ -265,9 +284,9 @@ typedef struct {
     MemPool pool_iocp_send_context;
     MemPool pool_iocp_recv_context;
 
-    MemPool pool_recv_udp_frame;
-    QueuePtr queue_recv_udp_frame;
-    QueuePtr queue_recv_prio_udp_frame;
+    // MemPool pool_recv_udp_frame;
+    // QueuePtr queue_recv_udp_frame;
+    // QueuePtr queue_recv_prio_udp_frame;
 
     MemPool pool_send_udp_frame;
     QueuePtr queue_send_udp_frame;          // For SACK frames
@@ -285,7 +304,7 @@ typedef struct {
 typedef struct {
     HANDLE recv_send_frame[SERVER_MAX_THREADS_RECV_SEND_FRAME];
     HANDLE file_block_written[SERVER_MAX_THREADS_WRITE_FILE_BLOCK];
-    HANDLE process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
+    // HANDLE process_frame[SERVER_MAX_THREADS_PROCESS_FRAME];
 
     HANDLE send_sack_frame[SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES];
     HANDLE scan_for_trailing_sack;
@@ -309,6 +328,7 @@ extern ServerThreads Threads;
 // Thread functions
 static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam);
 static DWORD WINAPI func_thread_process_frame(LPVOID lpParam);
+static DWORD WINAPI func_thread_process_ctrl_frame(LPVOID lpParam);
 static DWORD WINAPI func_thread_file_block_written(LPVOID lpParam);
 
 static DWORD WINAPI fthread_send_sack_frame(LPVOID lpParam);

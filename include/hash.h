@@ -20,7 +20,9 @@ typedef uint8_t TableStatus;
 enum TableStatus{
     ID_STATUS_NONE = 0,
     ID_WAITING_FRAGMENTS = 1,
-    ID_RECV_COMPLETE= 2
+    ID_RECV_COMPLETE = 2,
+    ID_TRANSFER_ERROR = 3,
+    ID_TRANSFER_SUCCESS = 4
 };
 
 __declspec(align(64))typedef struct NodeTableIDs{
@@ -82,6 +84,7 @@ __declspec(align(64))typedef struct NodeTableFileBlock{
     uint32_t sid;
     size_t block_size;
     char* block_data;
+    uint8_t op_type;
     struct NodeTableFileBlock *next;
 }NodeTableFileBlock;
 
@@ -95,9 +98,15 @@ __declspec(align(64))typedef struct{
 
 void init_table_fblock(TableFileBlock *table, size_t size, const size_t max_nodes);
 size_t ht_get_hash_fblock(const uint64_t key, const size_t size);
-NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint32_t sid, const uint32_t fid, char* block_data, size_t block_size);
+NodeTableFileBlock *ht_insert_fblock(TableFileBlock *table, const uint64_t key, const uint8_t op_type ,const uint32_t sid, const uint32_t fid, char* block_data, size_t block_size);
 int ht_remove_fblock(TableFileBlock *table, const uint64_t key);
 BOOL ht_search_fblock(TableFileBlock *table, const uint64_t key);
 void ht_clean_fblock(TableFileBlock *table);
+
+
+size_t hash_stream(const uint32_t session_id, const uint32_t file_id, const uint64_t num_threads);
+
+
+
 
 #endif // FRAMES_HASH_H

@@ -144,8 +144,11 @@ int send_pool_frame(PoolEntrySendFrame *pool_entry, MemPool *mem_pool){
         case FRAME_TYPE_FILE_END:
             frame_size = sizeof(FrameHeader) + sizeof(FileEndPayload); // Or header + payload_len + related metadata
             break;
-        case FRAME_TYPE_FILE_COMPLETE:
-            frame_size = sizeof(FrameHeader) + sizeof(FileCompletePayload); // Or header + payload_len + related metadata
+        case FRAME_TYPE_FILE_END_RESPONSE:
+            frame_size = sizeof(FrameHeader) + sizeof(FileEndResponsePayload); // Or header + payload_len + related metadata
+            break;
+        case FRAME_TYPE_TRANSFER_ERROR:
+            frame_size = sizeof(FrameHeader) + sizeof(TransferErrorPayload); // Or header + payload_len + related metadata
             break;
         case FRAME_TYPE_TEXT_MESSAGE:
             frame_size = sizeof(FrameHeader) + sizeof(TextPayload); // Or header + payload_len + related metadata

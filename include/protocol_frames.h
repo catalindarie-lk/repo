@@ -22,8 +22,6 @@
 #define MAX_FRAME_SIZE                      1400
 #define FRAME_DELIMITER                     0xAABB             // A magic number to identify valid frames
 
-#define CLIENT_MAX_ACTIVE_FSTREAMS          4                     // Maximum number of concurrent file streams (transfers) per client
-
 #define MAX_PAYLOAD_SIZE                    (MAX_FRAME_SIZE - sizeof(FrameHeader))
 #define TEXT_FRAGMENT_SIZE                  (MAX_PAYLOAD_SIZE - sizeof(uint32_t) * 4)
 #define FILE_FRAGMENT_SIZE                  (MAX_PAYLOAD_SIZE - (sizeof(uint32_t) * 2) - sizeof(uint64_t))
@@ -47,7 +45,7 @@
 #define SERVER_FILE_BLOCK_SIZE              (FILE_FRAGMENT_SIZE * 64ULL * 4ULL)
 #define CLIENT_FILE_BLOCK_SIZE              (FILE_FRAGMENT_SIZE * 64ULL * 4ULL)
 
-#define RESEND_FILE_FRAGMENT_TIMEOUT        ((uint64_t)(80000000)) // one second has 10 mil * 100ns
+#define RESEND_FILE_FRAGMENT_TIMEOUT        ((uint64_t)(50000000)) // one second has 10 mil * 100ns
 #define RESEND_FILE_METADATA_TIMEOUT        ((uint64_t)(10000000)) // one second has 10 mil * 100ns
 
 #define OP_RECV ((uint8_t)(1))
@@ -71,8 +69,11 @@ enum FrameType{
     FRAME_TYPE_FILE_METADATA_RESPONSE = 21,
     FRAME_TYPE_FILE_FRAGMENT = 22,                   // File data fragment
     FRAME_TYPE_FILE_END = 23,
-    FRAME_TYPE_FILE_COMPLETE = 24,
-    FRAME_TYPE_TEXT_MESSAGE = 30      // Fragment of a long text message
+    FRAME_TYPE_FILE_END_RESPONSE = 24,
+
+    FRAME_TYPE_TRANSFER_ERROR = 51,
+    // FRAME_TYPE_FILE_COMPLETE = 27,
+    FRAME_TYPE_TEXT_MESSAGE = 100      // Fragment of a long text message
 };
 
 typedef uint8_t AckErrorCode;
@@ -96,6 +97,7 @@ enum AckErrorCode {
     ERR_MALFORMED_FRAME = 107,     // Frame structure or size invalid
     ERR_RESOURCE_LIMIT = 108,      // Server ran out of memory or slots
     ERR_CONFIRM_DUPLICATE_FILE_METADATA = 109, // Client sent duplicate metadata
+    ERR_ALL_STREAMS_BUSY = 110,
 
     ERR_INVALID_SESSION = 120,     // Session ID not recognized
     ERR_TIMEOUT = 121,             // Session timed out due to inactivity
@@ -149,6 +151,7 @@ typedef struct {
 } ConnectResponsePayload;
 
 typedef struct {
+    uint32_t file_id;                                       // Unique identifier for the file transfer session
     uint8_t op_code;
 } AckPayload;
 
@@ -188,10 +191,20 @@ typedef struct{
     uint8_t file_hash[32];                                  // For SHA256 hash
 }FileEndPayload;
 
+typedef struct {
+    uint32_t file_id;                                       // Unique identifier for the file transfer session
+    uint8_t  op_code;                                       //
+}FileEndResponsePayload;
+
 typedef struct{
     uint32_t file_id;                                       // Unique identifier for the file transfer session
     uint8_t op_code;
 }FileCompletePayload;
+
+typedef struct{
+    uint32_t file_id;
+    uint8_t op_code;
+}TransferErrorPayload;
 
 typedef struct {
     uint32_t message_id;                                    // Unique ID for this specific long message
@@ -214,7 +227,9 @@ typedef struct {
         FileMetadataResponsePayload file_metadata_response;                  // File metadata request/response
         FileFragmentPayload file_fragment;                  // File data fragment
         FileEndPayload file_end;
+        FileEndResponsePayload file_end_response;
         FileCompletePayload file_complete;
+        TransferErrorPayload transfer_error;
         TextPayload text_fragment;                      // Fragment of a long text message
         uint8_t raw_payload[MAX_PAYLOAD_SIZE];              // For generic access or padding
     } payload;
