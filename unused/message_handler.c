@@ -333,7 +333,7 @@ static uint8_t check_completion_and_record(ServerMessageStream *mstream) {
 }
 
 // HANDLE received message fragment frame
-int handle_message_fragment(Client *client, UdpFrame *frame){
+int handle_message_fragment(ServerClient *client, UdpFrame *frame){
 
     PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
 

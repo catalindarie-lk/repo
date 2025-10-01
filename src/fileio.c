@@ -133,7 +133,6 @@ BOOL RenameFileByHandle(HANDLE hFile, const wchar_t* newPath) {
     if(!result){
         fwprintf(stderr, L"CRITICAL ERROR: failed to rename temp file to: %ls\n", newPath);
     }
-
     return result;
 }
 
@@ -150,7 +149,7 @@ BOOL DeleteFileByHandle(HANDLE hFile) {
     if(!result){
         fprintf(stderr, "Failed to delete file!\n");
     }
-
+    FlushFileBuffers(hFile);
     return result;
 }
 

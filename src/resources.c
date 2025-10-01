@@ -150,9 +150,6 @@ int send_pool_frame(PoolEntrySendFrame *pool_entry, MemPool *mem_pool){
         case FRAME_TYPE_TRANSFER_ERROR:
             frame_size = sizeof(FrameHeader) + sizeof(TransferErrorPayload); // Or header + payload_len + related metadata
             break;
-        case FRAME_TYPE_TEXT_MESSAGE:
-            frame_size = sizeof(FrameHeader) + sizeof(TextPayload); // Or header + payload_len + related metadata
-            break;
         case FRAME_TYPE_ACK:
             frame_size = sizeof(FrameHeader) + sizeof(AckPayload); // Acknowledgment frame
             break;

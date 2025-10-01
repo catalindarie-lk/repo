@@ -137,6 +137,25 @@ BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const 
     ReleaseSRWLockShared(&table->mutex);
     return FALSE;
 }
+uint8_t ht_status_id(TableIDs *table, const uint32_t sid, const uint32_t id) {
+    
+    if (!table) {
+        fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_status_id()\n");
+        return ID_UNKNOWN;
+    }
+    size_t index = ht_get_hash_id(id, table->size);
+    AcquireSRWLockShared(&table->mutex);
+    NodeTableIDs *curr = table->bucket[index];
+    while (curr) {
+        if (curr->sid == sid && curr->id == id){
+            ReleaseSRWLockShared(&table->mutex);
+            return curr->status;
+        }
+        curr = curr->next;
+    }
+    ReleaseSRWLockShared(&table->mutex);
+    return ID_UNKNOWN;
+}
 int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status) {
     if (!table) {
         fprintf(stderr, "CRITICAL ERROR: Invalid 'table' pointer for ht_update_id_status()\n");

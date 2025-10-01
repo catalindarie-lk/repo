@@ -20,9 +20,11 @@ typedef uint8_t TableStatus;
 enum TableStatus{
     ID_STATUS_NONE = 0,
     ID_WAITING_FRAGMENTS = 1,
-    ID_RECV_COMPLETE = 2,
-    ID_TRANSFER_ERROR = 3,
-    ID_TRANSFER_SUCCESS = 4
+    ID_RECV_COMPLETE = 2,    
+    ID_WRITE_COMPLETE = 3,
+    ID_TRANSFER_ERROR = 99,
+
+    ID_UNKNOWN = 255
 };
 
 __declspec(align(64))typedef struct NodeTableIDs{
@@ -46,6 +48,7 @@ int ht_insert_id(TableIDs *table, const uint32_t sid, const uint32_t id, const u
 int ht_remove_id(TableIDs *table, const uint32_t sid, const uint32_t id);
 void ht_remove_all_sid(TableIDs *table, const uint32_t sid);
 BOOL ht_search_id(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
+uint8_t ht_status_id(TableIDs *table, const uint32_t sid, const uint32_t id);
 int ht_update_id_status(TableIDs *table, const uint32_t sid, const uint32_t id, const uint8_t status);
 void ht_clean_id(TableIDs *table);
 

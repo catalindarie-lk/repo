@@ -16,7 +16,7 @@
 #include "include/protocol_frames.h"    // For protocol frame definitions
 #include "include/resources.h"
 #include "include/netendians.h"         // For network byte order conversions
-#include "include/crc32.h"           // For checksum validation
+#include "include/crc32.h"              // For checksum validation
 #include "include/sha256.h"
 #include "include/mem_pool.h"           // For memory pool management
 #include "include/fileio.h"             // For file transfer functions
@@ -153,15 +153,19 @@ static int init_client_buffers(){
             return RET_VAL_ERROR;
         }
         client->fstream[i].hevent_metadata_response_ok = CreateEvent(NULL, FALSE, FALSE, NULL);
-        client->fstream[i].hevent_metadata_response_nok = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_metadata_err_retry_transfer = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_metadata_err_abort_transfer = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_fragment_err_retry_transfer = CreateEvent(NULL, FALSE, FALSE, NULL);
         client->fstream[i].hevent_file_end_response_ok = CreateEvent(NULL, FALSE, FALSE, NULL);
         client->fstream[i].hevent_file_end_response_nok = CreateEvent(NULL, FALSE, FALSE, NULL);
-        client->fstream[i].hevent_file_end_transfer_err = CreateEvent(NULL, FALSE, FALSE, NULL);
+        client->fstream[i].hevent_file_end_err_retry_transfer = CreateEvent(NULL, FALSE, FALSE, NULL);
         if (client->fstream[i].hevent_metadata_response_ok == NULL || 
-            client->fstream[i].hevent_metadata_response_nok == NULL ||
+            client->fstream[i].hevent_metadata_err_abort_transfer == NULL ||
+            client->fstream[i].hevent_metadata_err_retry_transfer == NULL ||
+            client->fstream[i].hevent_fragment_err_retry_transfer == NULL ||
             client->fstream[i].hevent_file_end_response_ok == NULL || 
             client->fstream[i].hevent_file_end_response_nok == NULL ||
-            client->fstream[i].hevent_file_end_transfer_err == NULL) {
+            client->fstream[i].hevent_file_end_err_retry_transfer == NULL) {
             fprintf(stderr, "CRITICAL ERROR: Failed to create fstream events. Error: %d\n", GetLastError());
             return RET_VAL_ERROR;
         }
@@ -322,6 +326,484 @@ static void client_shutdown(){
     return;
 }
 
+// --- Cleanup functions for streams ---
+static inline void close_fstream(ClientFileStream *fstream){
+
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    memset(&fstream->calculated_sha256, 0, 32);
+    if(fstream->fp){
+        fclose(fstream->fp);
+        fstream->fp = NULL;
+    }
+    fstream->fid = 0;
+    fstream->fsize = 0;
+    fstream->fpath_len = 0;
+    memset(&fstream->dirpath, 0, MAX_PATH);
+    fstream->rpath_len = 0;
+    memset(&fstream->rpath, 0, MAX_PATH);
+    fstream->fname_len = 0;
+    memset(&fstream->fname, 0, MAX_PATH);
+    fstream->pending_bytes = 0;
+    memset(fstream->chunk_buffer, 0, CLIENT_FILE_BLOCK_SIZE);
+    fstream->fstream_busy = FALSE;
+    fstream->pending_bytes = 0;
+    return;
+}
+static inline ClientFileStream *get_fstream(ClientData *client, const uint32_t file_id){
+    // ClientFileStream *fstream = NULL;
+    for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+        AcquireSRWLockExclusive(&client->fstream[i].lock);
+        if(client->fstream[i].fstream_busy && client->fstream[i].fid == file_id){
+            // fstream = &client->fstream[i];
+            ReleaseSRWLockExclusive(&client->fstream[i].lock);
+            return &client->fstream[i];
+        } else {
+            ReleaseSRWLockExclusive(&client->fstream[i].lock);
+            continue;
+        }                    
+    }
+    return NULL;
+}
+static inline bool is_frame_valid(PoolEntryRecvFrame *frame_buff){
+        
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint16_t recv_delimiter = _ntohs(frame->header.start_delimiter);
+    uint32_t frame_size = frame_buff->frame_size;
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port);
+
+    if (recv_delimiter != FRAME_DELIMITER) {
+        LOG_TO_FILE("ERROR: Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.", 
+                    src_ip, src_port, recv_delimiter);
+        return false;
+    }        
+    if (!is_checksum_valid(frame, frame_size)) {
+        LOG_TO_FILE("ERROR: Received frame from %s:%d with checksum mismatch. Discarding.", 
+                    src_ip, src_port);
+        return false;
+    }
+    return true;
+}
+static inline void handle_connect_response(PoolEntryRecvFrame *frame_buff){
+
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+    uint8_t server_status = frame->payload.connection_response.server_status;
+    uint32_t session_timeout = _ntohl(frame->payload.connection_response.session_timeout);
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port);
+
+    if(seq_num != DEFAULT_CONNECT_REQUEST_SEQ){
+        LOG_TO_FILE("ERROR: Connect response seq num invalid. Connection not established...");
+        fprintf(stderr, "%s\n", log_message);
+        return;
+    }
+ 
+    if(session_id == 0 || server_status != STATUS_READY){
+        LOG_TO_FILE("ERROR: Session ID invalid or server not ready. Connection not established...");
+        fprintf(stderr, "%s\n", log_message);
+        return;
+    }
+    if(session_timeout <= MIN_CONNECTION_TIMEOUT_SEC){
+        LOG_TO_FILE("ERROR: Session timeout invalid. Connection not established...");
+        fprintf(stderr, "%s\n", log_message);
+        return;
+    }
+    LOG_TO_FILE("DEBUG: Received connect response from %s:%d with session ID: %d, timeout: %d seconds, server status: %d.",
+                                            src_ip, src_port, session_id, session_timeout, server_status);
+    fprintf(stderr, "%s\n", log_message);
+    client->server_status = server_status;
+    client->session_timeout = session_timeout;
+    client->sid = session_id;
+    snprintf(client->server_name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, frame->payload.connection_response.server_name);
+    client->last_active_time = time(NULL);
+    SetEvent(client->hevent_connection_established);
+    return;
+}
+static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff){
+                
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+
+    uintptr_t entry;
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port);
+
+    if(session_id != client->sid){
+        return;
+    }
+    client->last_active_time = time(NULL);
+    uint8_t op_code = frame->payload.file_metadata_response.op_code;
+    uint32_t file_id = _ntohl(frame->payload.file_metadata_response.file_id);
+    
+    ClientFileStream *fstream = get_fstream(client, file_id);
+ 
+    if(!fstream){
+        LOG_TO_FILE("ERROR: Received FRAME_TYPE_FILE_METADATA_RESPONSE for unknown client fstream CODE: %u", op_code);
+        
+        uintptr_t entry = remove_table_send_frame(table_send_udp_frame, seq_num);
+        if(!entry){
+            LOG_TO_FILE("WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+        } else {
+            s_pool_free(pool_send_udp_frame, (void*)entry);
+        }
+        return;
+    }
+
+    bool remove_frame = false;
+    switch (op_code) {
+        case STS_CONFIRM_FILE_METADATA:
+        case STS_WAITING_FILE_FRAGMENTS:
+            SetEvent(fstream->hevent_metadata_response_ok);
+            remove_frame = true;
+            // LOG_TO_FILE("DEBUG: Received metadata response [STS_CONFIRM_FILE_METADATA] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+//============================================================RETRY FILE TRANSFER==================================================================================================
+        case ERR_INVALID_FRAME_DATA:
+            SetEvent(fstream->hevent_metadata_err_retry_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (retry file transfer): Received metadata response [ERR_INVALID_FRAME_DATA] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+    
+        case ERR_STREAM_MEMORY_ALLOCATION:
+            SetEvent(fstream->hevent_metadata_err_retry_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (retry file transfer): Received metadata response [ERR_INVALID_FRAME_DATA] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+//============================================================ABORT FILE TRANSFER==================================================================================================
+        case ERR_COMPLETED_FILE:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_COMPLETED_FILE sid] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_STREAM_ALREADY_FAILED:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_STREAM_ALREADY_FAILED] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_UNKNOWN_FILE_ID:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_UNKNOWN_FILE_ID] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_EXISTING_DISK_FILE:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_EXISTING_DISK_FILE] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_EXISTING_DISK_TEMP_FILE:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_EXISTING_DISK_TEMP_FILE] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_INVALID_DRIVE_PARTITION:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_INVALID_DRIVE_PARTITION] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_CREATE_FILE_PATH:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_CREATE_FILE_PATH] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+
+        case ERR_CREATE_FILE:
+            SetEvent(fstream->hevent_metadata_err_abort_transfer);
+            remove_frame = true;
+            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_CREATE_FILE] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            break;
+//========================================================================================================================================================================================
+        case ERR_MALFORMED_FRAME:
+        case ERR_STREAM_INIT:
+        case ERR_ALL_STREAMS_BUSY:
+            remove_frame = false;
+            break;
+        
+        default:
+            remove_frame = false;
+            LOG_TO_FILE("-----CRITICAL ERROR-----: Received metadata response with invalid code type: %u", op_code);
+            break;
+    }
+
+    if(!remove_frame){
+        return;
+    }
+
+    entry = remove_table_send_frame(table_send_udp_frame, seq_num);
+    if(!entry){
+        LOG_TO_FILE("WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+    } else {
+        s_pool_free(pool_send_udp_frame, (void*)entry);
+    }
+    return;
+}
+static inline void handle_ack(PoolEntryRecvFrame *frame_buff){
+
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+ 
+    uintptr_t entry;
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port);
+
+    if(session_id != client->sid){
+        return;
+    }
+    client->last_active_time = time(NULL);
+    uint8_t op_code = frame->payload.ack.op_code;
+    uint32_t file_id = _ntohl(frame->payload.ack.file_id);
+
+    ClientFileStream *fstream = get_fstream(client, file_id);
+
+    if(!fstream){                   
+        entry = remove_table_send_frame(table_send_udp_frame, seq_num);
+        if(!entry){
+            // snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+            // log_to_file(log_message);
+        } else {
+            s_pool_free(pool_send_udp_frame, (void*)entry);
+        }
+        return;
+    }
+
+    bool remove_frame = false;
+    switch (op_code) {
+
+        case ERR_UNKNOWN_FILE_ID:
+        case ERR_INVALID_FILE_STATUS:
+        case ERR_STREAM_ALREADY_FAILED:
+        case ERR_COMPLETED_FILE:
+        case ERR_DUPLICATE_FRAME:
+        case ERR_ABSOLETE_STREAM:
+            remove_frame = true;
+            break;
+
+        case ERR_MALFORMED_FRAME:
+        case ERR_RESOURCE_LIMIT:
+            remove_frame = false;
+            break;
+
+        case ERR_FILE_TRANSFER:
+            // snprintf(log_message, sizeof(log_message), "ERROR: RETRY FILE TRANSFER (FRAGMENT EVENT): %s%s", fstream->dirpath, fstream->fname);
+            // log_to_file(log_message);
+            // SetEvent(fstream->hevent_fragment_err_retry_transfer);
+            remove_frame = true;
+            break;
+
+        case STS_KEEP_ALIVE:
+            remove_frame = false;
+            break;
+
+        default:
+            snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_ACK frame CODE: %u", op_code);
+            log_to_file(log_message);
+            remove_frame = false;
+            break;
+    }
+
+    if(!remove_frame){
+        return;
+    }
+        
+    entry = remove_table_send_frame(table_send_udp_frame, seq_num);
+    if(!entry){
+        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+        log_to_file(log_message);
+        return;
+    }
+    s_pool_free(pool_send_udp_frame, (void*)entry);
+
+    if(seq_num == DEFAULT_DISCONNECT_REQUEST_SEQ && op_code == STS_CONFIRM_DISCONNECT){
+        SetEvent(client->hevent_connection_closed);
+        client->session_status = CONNECTION_CLOSED;
+        snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_DISCONNECT - code: %lu; seq num: %llx.", op_code, seq_num);
+        log_to_file(log_message);
+        return;
+    }
+
+    return;
+}
+static inline void handle_file_end_response(PoolEntryRecvFrame *frame_buff){
+                
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+ 
+    uintptr_t entry;
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port); 
+    
+    if(session_id != client->sid){
+        return;              
+    }
+
+    client->last_active_time = time(NULL);
+    uint8_t op_code = frame->payload.file_end_response.op_code;
+    uint32_t file_id = _ntohl(frame->payload.file_end_response.file_id);
+
+    ClientFileStream *fstream = get_fstream(client, file_id);
+
+    if(!fstream){
+        snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_END_RESPONSE for unknown client fstream CODE: %u", op_code);
+        log_to_file(log_message);
+        
+        entry = remove_table_send_frame(table_send_udp_frame, seq_num);
+        if(!entry){
+            snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+            log_to_file(log_message);
+        } else {
+            s_pool_free(pool_send_udp_frame, (void*)entry);
+        }
+        return;
+    }
+
+    bool remove_frame = false;
+
+    switch (op_code) {
+        case STS_CONFIRM_FILE_END:
+            // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_END for file end seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+            // log_to_file(log_message);
+            SetEvent(fstream->hevent_file_end_response_ok);
+            remove_frame = true;
+            break;
+
+        case ERR_STREAM_ALREADY_FAILED:
+            SetEvent(fstream->hevent_file_end_err_retry_transfer);
+            remove_frame = true;
+            break;
+        
+        case ERR_UNKNOWN_FILE_ID:
+        case ERR_COMPLETED_FILE:
+        case ERR_ABSOLETE_STREAM:
+            SetEvent(fstream->hevent_file_end_response_nok);
+            remove_frame = true;
+            break;
+
+        default:
+            snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_END_RESPONSE frame CODE: %u", op_code);
+            log_to_file(log_message);
+            remove_frame = FALSE;
+            break;               
+    }
+    
+    if(!remove_frame){
+        return;
+    }
+
+    entry = remove_table_send_frame(table_send_udp_frame, seq_num);
+    if(!entry){
+        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+        log_to_file(log_message);
+    } else {
+        s_pool_free(pool_send_udp_frame, (void*)entry);
+    }
+    return;
+}
+static inline void handle_sack(PoolEntryRecvFrame *frame_buff){
+
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    // uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+ 
+    uintptr_t entry;
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port); 
+    
+    if(session_id != client->sid){
+        snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with invalid session ID: %d. Discarding.", session_id);
+        log_to_file(log_message);
+        return;
+    }
+    // Process SACK frame logic here
+    // snprintf(log_message, sizeof(log_message), "DEBUG: Received SACK frame from %s:%d with seq num: %llu, ack count: %u, sid: %lu", src_ip, src_port, recv_seq_num, frame->payload.sack.ack_count, recv_session_id);
+    // log_to_file(log_message);
+    int ack_count = frame->payload.sack.ack_count;
+    if(ack_count > 0){
+        for(int i = 0; i < ack_count; i++){
+            uint64_t ack_seq_num = _ntohll(frame->payload.sack.seq_num[i]);
+            entry = remove_table_send_frame(table_send_udp_frame, ack_seq_num);
+            if(!entry){
+                snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+                log_to_file(log_message);
+                continue;
+            }
+            s_pool_free(pool_send_udp_frame, (void*)entry);
+        }
+    } else {
+        snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with zero ACK count. Discarding.");
+        log_to_file(log_message);
+    }
+    return;
+}
+
 // --- log function ---
 int log_to_file(const char* log_message) {
     // Get the precise system time
@@ -357,41 +839,6 @@ int log_to_file(const char* log_message) {
         return RET_VAL_ERROR;
     }
     return RET_VAL_SUCCESS;
-}
-// --- Cleanup functions for streams ---
-void close_file_stream(ClientFileStream *fstream){
-
-    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
-
-    memset(&fstream->calculated_sha256, 0, 32);
-    if(fstream->fp){
-        fclose(fstream->fp);
-        fstream->fp = NULL;
-    }
-    fstream->fid = 0;
-    fstream->fsize = 0;
-    fstream->fpath_len = 0;
-    memset(&fstream->dirpath, 0, MAX_PATH);
-    fstream->rpath_len = 0;
-    memset(&fstream->rpath, 0, MAX_PATH);
-    fstream->fname_len = 0;
-    memset(&fstream->fname, 0, MAX_PATH);
-    fstream->pending_bytes = 0;
-    memset(fstream->chunk_buffer, 0, CLIENT_FILE_BLOCK_SIZE);
-    fstream->fstream_busy = FALSE;
-    fstream->pending_bytes = 0;
-    return;
-}
-void close_message_stream(ClientMessageStream *mstream){
-    EnterCriticalSection(&mstream->lock);
-    memset(mstream->message_buffer, 0, MAX_MESSAGE_SIZE_BYTES);
-    mstream->message_id = 0;
-    mstream->message_len = 0;
-    mstream->remaining_bytes_to_send = 0;
-    mstream->throttle = FALSE;
-    mstream->mstream_busy = FALSE;
-    LeaveCriticalSection(&mstream->lock);
-    return;
 }
 
 // --- Receive frame thread function ---
@@ -549,458 +996,65 @@ static DWORD WINAPI fthread_recv_send_frame(LPVOID lpParam) {
     return 0;
 }
 // --- Processes a received frame ---
+
 static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
 
     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
 
-    UdpFrame *frame;
-    struct sockaddr_in *src_addr;
-    char src_ip[INET_ADDRSTRLEN];
-    uint16_t src_port;
-    
-    uint32_t frame_bytes_received = 0;
-
-    uint16_t recv_delimiter = 0;
-    uint8_t  recv_frame_type = 0;
-    uint64_t recv_seq_num = 0;
-    uint32_t recv_session_id = 0;
-    uint32_t recv_file_id = 0;
-
-    uint8_t recv_op_code = 0;
-
-    uint32_t recv_session_timeout;
-    uint8_t recv_server_status;
-
-    uintptr_t entry = 0;
-
     char log_message[CLIENT_LOG_MESSAGE_LEN];
-    
-    PoolEntryRecvFrame recv_frame_entry;
-    PoolEntryRecvFrame *entry_recv_frame = NULL;
 
-    ClientFileStream *fstream = NULL;
-    bool remove_frame = false;
+    PoolEntryRecvFrame *frame_buff = NULL;
 
-    HANDLE events[2] = {queue_recv_prio_udp_frame->push_semaphore, queue_recv_udp_frame->push_semaphore};
+    HANDLE events[2] = {queue_recv_prio_udp_frame->push_semaphore, 
+                            queue_recv_udp_frame->push_semaphore};
 
     while(client->client_status == STATUS_READY){
 
         DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
         if (result == WAIT_OBJECT_0) {
-            entry_recv_frame = (PoolEntryRecvFrame*)pop_ptr(queue_recv_prio_udp_frame);
-            if(!entry_recv_frame){
+            frame_buff = (PoolEntryRecvFrame*)pop_ptr(queue_recv_prio_udp_frame);
+            if(!frame_buff){
                 snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Poped empty pointer from 'queue_recv_prio_udp_frame'.");
                 log_to_file(log_message);
                 continue;
             }
-            memcpy(&recv_frame_entry, entry_recv_frame, sizeof(PoolEntryRecvFrame));
-            pool_free(pool_recv_udp_frame, (void*)entry_recv_frame);
+            // memcpy(&recv_frame_entry, entry_recv_frame, sizeof(PoolEntryRecvFrame));
+            // pool_free(pool_recv_udp_frame, (void*)entry_recv_frame);
         } else if (result == WAIT_OBJECT_0 + 1) {
-            entry_recv_frame = (PoolEntryRecvFrame*)pop_ptr(queue_recv_udp_frame);
-            if(!entry_recv_frame){
+            frame_buff = (PoolEntryRecvFrame*)pop_ptr(queue_recv_udp_frame);
+            if(!frame_buff){
                 snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Poped empty pointer from 'queue_recv_udp_frame'.");
                 log_to_file(log_message);
                 continue;
             }
-            memcpy(&recv_frame_entry, entry_recv_frame, sizeof(PoolEntryRecvFrame));
-            pool_free(pool_recv_udp_frame, (void*)entry_recv_frame);
+            // memcpy(&recv_frame_entry, entry_recv_frame, sizeof(PoolEntryRecvFrame));
+            // pool_free(pool_recv_udp_frame, (void*)entry_recv_frame);
         } else {
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: WaitForMultipleObjects (queue_recv_udp_frame - semaphore) failed with code: %lu.", result);
             log_to_file(log_message);
             continue;
         }
 
-        frame = &recv_frame_entry.frame;
-        src_addr = &recv_frame_entry.src_addr;
-        frame_bytes_received = recv_frame_entry.frame_size;
-
-        // Extract header fields   
-        recv_delimiter = _ntohs(frame->header.start_delimiter);
-        recv_frame_type = frame->header.frame_type;
-        recv_seq_num = _ntohll(frame->header.seq_num);
-        recv_session_id = _ntohl(frame->header.session_id);
- 
-        inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
-        src_port = _ntohs(src_addr->sin_port);
-
-        if (recv_delimiter != FRAME_DELIMITER) {
-            snprintf(log_message, sizeof(log_message), "ERROR: Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.", src_ip, src_port, recv_delimiter);
-            log_to_file(log_message);
-            continue;
-        }        
-        if (!is_checksum_valid(frame, frame_bytes_received)) {
-            snprintf(log_message, sizeof(log_message), "ERROR: Received frame from %s:%d with checksum mismatch. Discarding.", src_ip, src_port);
-            log_to_file(log_message);
-            // Optionally send ACK for checksum mismatch if this is part of a reliable stream
-            // For individual datagrams, retransmission is often handled by higher layers or ignored.
+        if(!is_frame_valid(frame_buff)){
+            pool_free(pool_recv_udp_frame, (void*)frame_buff);
             continue;
         }
 
-        switch (recv_frame_type) {
+        switch (frame_buff->frame.header.frame_type) {
             case FRAME_TYPE_CONNECT_RESPONSE:
-                if(recv_seq_num != DEFAULT_CONNECT_REQUEST_SEQ){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Connect response seq num invalid. Connection not established...");
-                    log_to_file(log_message);
-                    fprintf(stderr, "%s\n", log_message);
-                    break;
-                }
-                recv_server_status = frame->payload.connection_response.server_status;
-                recv_session_timeout = _ntohl(frame->payload.connection_response.session_timeout);               
-                if(recv_session_id == 0 || recv_server_status != STATUS_READY){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Session ID invalid or server not ready. Connection not established...");
-                    log_to_file(log_message);
-                    fprintf(stderr, "%s\n", log_message);
-                    break;
-                }
-                if(recv_session_timeout <= MIN_CONNECTION_TIMEOUT_SEC){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Session timeout invalid. Connection not established...");
-                    log_to_file(log_message);
-                    fprintf(stderr, "%s\n", log_message);
-                    break;
-                }
-                snprintf(log_message, sizeof(log_message), "DEBUG: Received connect response from %s:%d with session ID: %d, timeout: %d seconds, server status: %d.",
-                                                        src_ip, src_port, recv_session_id, recv_session_timeout, recv_server_status);
-                log_to_file(log_message);
-                fprintf(stderr, "%s\n", log_message);
-                client->server_status = recv_server_status;
-                client->session_timeout = recv_session_timeout;
-                client->sid = recv_session_id;
-                snprintf(client->server_name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, frame->payload.connection_response.server_name);
-                client->last_active_time = time(NULL);
-                               
-                SetEvent(client->hevent_connection_established);
+                handle_connect_response(frame_buff);
                 break;
 
             case FRAME_TYPE_FILE_METADATA_RESPONSE:
-                if(recv_session_id != client->sid){
-                    //fprintf(stderr, "Received FILE_METADATA_RESPONSE frame with invalid session ID: %d\n", recv_session_id);
-                    break;
-                }
-                client->last_active_time = time(NULL);
-                recv_op_code = frame->payload.file_metadata_response.op_code;
-                recv_file_id = _ntohl(frame->payload.file_metadata_response.file_id);
-                
-                fstream = NULL;
-                for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
-                    AcquireSRWLockExclusive(&client->fstream[i].lock);
-                    if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
-                        fstream = &client->fstream[i];
-                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
-                        break;
-                    } else {
-                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
-                        continue;
-                    }                    
-                }
-
-                if(!fstream){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_METADATA_RESPONSE for unknown client fstream CODE: %u", recv_op_code);
-                    log_to_file(log_message);
-                    
-                    entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
-                    if(!entry){
-                        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                        log_to_file(log_message);
-                        break;
-                    } else {
-                        s_pool_free(pool_send_udp_frame, (void*)entry);
-                    }
-
-                    break;
-                }
-
-                remove_frame = false;
-                switch (recv_op_code) {
-                    case STS_CONFIRM_FILE_METADATA:
-                        // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_METADATA for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        // log_to_file(log_message);
-                        SetEvent(fstream->hevent_metadata_response_ok);
-                        remove_frame = true;
-                        break;
-                    case ERR_CONFIRM_DUPLICATE_FILE_METADATA:
-                        // snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_CONFIRM_DUPLICATE_FILE_METADATA for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        // log_to_file(log_message);
-                        // SetEvent(fstream->hevent_metadata_response_ok);
-                        remove_frame = true;
-                        break;
-
-                    case ERR_EXISTING_FILE:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        SetEvent(fstream->hevent_metadata_response_nok);
-                        remove_frame = true;
-                        break;
-
-                    case ERR_SERVER_TERMINATED_STREAM:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        remove_frame = true;
-                        break;
-
-                    case ERR_STREAM_INIT:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_STREAM_INIT for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        remove_frame = false;
-                        break;
-                    
-                    case ERR_ALL_STREAMS_BUSY:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_ALL_STREAMS_BUSY for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-
-                    case ERR_RESOURCE_LIMIT:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_RESOURCE_LIMIT for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-                        
-                    case ERR_INTERNAL_ERROR:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_INTERNAL_ERROR for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-
-                    case ERR_MALFORMED_FRAME:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_MALFORMED_FRAME for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-
-                    case ERR_UNKNOWN_ERROR:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_ERROR for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-                    
-                    default:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_METADATA_RESPONSE frame CODE: %u", recv_op_code);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-                }
-                
-                if(!remove_frame){
-                    break;
-                }
-
-                entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
-                if(!entry){
-                    snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                    log_to_file(log_message);
-                } else {
-                    s_pool_free(pool_send_udp_frame, (void*)entry);
-                }
+                handle_metadata_response(frame_buff);
                 break;
 
             case FRAME_TYPE_ACK:
-                if(recv_session_id != client->sid){
-                    //fprintf(stderr, "Received ACK frame with invalid session ID: %d\n", recv_session_id);
-                    //TODO - send ACK frame with error code for invalid session ID
-                    break;
-                }
-                client->last_active_time = time(NULL);
-                recv_op_code = frame->payload.ack.op_code;
-                recv_file_id = _ntohl(frame->payload.ack.file_id);
-
-                fstream = NULL;
-                for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
-                    AcquireSRWLockExclusive(&client->fstream[i].lock);
-                    if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
-                        fstream = &client->fstream[i];
-                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
-                        break;
-                    } else {
-                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
-                        continue;
-                    }                    
-                }
-
-                if(!fstream){
-                    // snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_ACK for unknown client fstream CODE: %u", recv_op_code);
-                    // log_to_file(log_message);
-                    
-                    entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
-                    if(!entry){
-                        // snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                        // log_to_file(log_message);
-                        break;
-                    } else {
-                        s_pool_free(pool_send_udp_frame, (void*)entry);
-                    }
-
-                    break;
-                }
-
-                remove_frame = false;
-                switch (recv_op_code) {
-                    case ERR_DUPLICATE_FRAME:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_DUPLICATE_FRAME - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        remove_frame = true;
-                        break;
-
-                    case ERR_EXISTING_FILE:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        remove_frame = true;
-                        break;
-
-                    case ERR_UNKNOWN_FILE_ID:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_FILE_ID - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        remove_frame = true;
-                        break;
-                    
-                    case ERR_MALFORMED_FRAME:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_MALFORMED_FRAME - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        remove_frame = true;
-                        break;
-
-                    case ERR_SERVER_TERMINATED_STREAM:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        remove_frame = true;
-                        break;
-
-                    case STS_KEEP_ALIVE:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received STS_KEEP_ALIVE - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        remove_frame = false;
-                        break;
-
-                    default:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_ACK frame CODE: %u", recv_op_code);
-                        log_to_file(log_message);
-                        remove_frame = false;
-                        break;
-                }
-
-                if(!remove_frame){
-                    break;
-                }
-                    
-                entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
-                if(!entry){
-                    snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                    log_to_file(log_message);
-                    break;
-                }
-                s_pool_free(pool_send_udp_frame, (void*)entry);
-
-
-                if(recv_seq_num == DEFAULT_DISCONNECT_REQUEST_SEQ && recv_op_code == STS_CONFIRM_DISCONNECT){
-                    SetEvent(client->hevent_connection_closed);
-                    client->session_status = CONNECTION_CLOSED;
-                    snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_DISCONNECT - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
-                    log_to_file(log_message);
-                    break;
-                }
-
+                handle_ack(frame_buff);
                 break;
 
             case FRAME_TYPE_FILE_END_RESPONSE:
-                if(recv_session_id != client->sid){
-                    break;                    
-                }
-
-                client->last_active_time = time(NULL);
-                recv_op_code = frame->payload.file_end_response.op_code;
-                recv_file_id = _ntohl(frame->payload.file_end_response.file_id);
-
-                fstream = NULL;
-                for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
-                    AcquireSRWLockExclusive(&client->fstream[i].lock);
-                    if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
-                        fstream = &client->fstream[i];
-                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
-                        break;
-                    } else {
-                        ReleaseSRWLockExclusive(&client->fstream[i].lock);
-                        continue;
-                    }
-                }
-
-                if(!fstream){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_END_RESPONSE for unknown client fstream CODE: %u", recv_op_code);
-                    log_to_file(log_message);
-                    
-                    entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
-                    if(!entry){
-                        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                        log_to_file(log_message);
-                        break;
-                    } else {
-                        s_pool_free(pool_send_udp_frame, (void*)entry);
-                    }
-                    break;
-                }
-
-                remove_frame = false;
-
-                switch (recv_op_code) {
-                    case STS_CONFIRM_FILE_END:
-                        // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_END for file end seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
-                        // log_to_file(log_message);
-                        SetEvent(fstream->hevent_file_end_response_ok);
-                        remove_frame = TRUE;
-                        break;
-                    
-                    case ERR_EXISTING_FILE:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_EXISTING_FILE for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        SetEvent(fstream->hevent_file_end_response_nok);
-                        remove_frame = TRUE;
-                        break;
-                    
-                    case ERR_SERVER_TERMINATED_STREAM:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_SERVER_TERMINATED_STREAM for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        SetEvent(fstream->hevent_file_end_transfer_err);
-                        remove_frame = TRUE;
-                        break;
-
-                    case ERR_UNKNOWN_FILE_ID:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_UNKNOWN_FILE_ID for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        SetEvent(fstream->hevent_file_end_transfer_err);
-                        remove_frame = TRUE;
-                        break;
-
-                    case ERR_RESOURCE_LIMIT:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received ERR_RESOURCE_LIMIT for file end frame - session ID: %lu, file id: %lu", recv_session_id, recv_file_id);
-                        log_to_file(log_message);
-                        remove_frame = FALSE;
-                        break;
-
-                    default:
-                        snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_END_RESPONSE frame CODE: %u", recv_op_code);
-                        log_to_file(log_message);
-                        remove_frame = FALSE;
-                        break;               
-                }
-                
-                if(!remove_frame){
-                    break;
-                }
-
-                entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
-                if(!entry){
-                    snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                    log_to_file(log_message);
-                    break;
-                } else {
-                    s_pool_free(pool_send_udp_frame, (void*)entry);
-                }
-                break;
-
-
-            case FRAME_TYPE_DISCONNECT:
-                if(recv_session_id != client->sid){
-                    break;                    
-                }                
-                snprintf(log_message, sizeof(log_message), "Received disconnect request frame. Session closed by server...");
-                log_to_file(log_message);
-                fprintf(stderr, "%s\n", log_message);
+                handle_file_end_response(frame_buff);
                 break;
 
             case FRAME_TYPE_CONNECT_REQUEST:
@@ -1010,37 +1064,15 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
                 break;
             
             case FRAME_TYPE_SACK:
-                if(recv_session_id != client->sid){
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with invalid session ID: %d. Discarding.", recv_session_id);
-                    log_to_file(log_message);
-                    break;
-                }
-                // Process SACK frame logic here
-                // snprintf(log_message, sizeof(log_message), "DEBUG: Received SACK frame from %s:%d with seq num: %llu, ack count: %u, sid: %lu", src_ip, src_port, recv_seq_num, frame->payload.sack.ack_count, recv_session_id);
-                // log_to_file(log_message);
-                int ack_count = frame->payload.sack.ack_count;
-                if(ack_count > 0){
-                    for(int i = 0; i < ack_count; i++){
-                        uint64_t ack_seq_num = _ntohll(frame->payload.sack.seq_num[i]);
-                        entry = remove_table_send_frame(table_send_udp_frame, ack_seq_num);
-                        if(!entry){
-                            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                            log_to_file(log_message);
-                            continue;
-                        }
-                        s_pool_free(pool_send_udp_frame, (void*)entry);
-                    }
-                } else {
-                    snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with zero ACK count. Discarding.");
-                    log_to_file(log_message);
-                }
+                handle_sack(frame_buff);
                 break;
 
             default:
-                snprintf(log_message, sizeof(log_message), "ERROR: Received frame with unknown type: %u from %s:%d. Discarding.", recv_frame_type, src_ip, src_port);
+                snprintf(log_message, sizeof(log_message), "ERROR: RECEIVED UNKNOWN TYPE FRAME");
                 log_to_file(log_message);
                 break;
         }
+        pool_free(pool_recv_udp_frame, (void*)frame_buff);
     }
     _endthreadex(0);    
     return 0;
@@ -1316,16 +1348,23 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             goto clean;
         }
 
-        HANDLE events[2] = {fstream->hevent_metadata_response_ok, fstream->hevent_metadata_response_nok};
+        HANDLE events[3] = {fstream->hevent_metadata_response_ok, 
+                                fstream->hevent_metadata_err_retry_transfer,
+                            fstream->hevent_metadata_err_abort_transfer};
 
-        DWORD wait_result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+        DWORD wait_result = WaitForMultipleObjects(3, events, FALSE, INFINITE);
         
         if(wait_result == WAIT_OBJECT_0){
             // metadata response ok event
         } else if (wait_result == WAIT_OBJECT_0 + 1){
             // metadata response nok event 
-            snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - response nok from server.");
+            snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - retry.");
             log_to_file(log_message);
+            goto requeue;
+        } else if (wait_result == WAIT_OBJECT_0 + 2){
+            // metadata response nok event 
+            // snprintf(log_message, sizeof(log_message), "ERROR: Send metadata frame - abort.");
+            // log_to_file(log_message);
             goto clean;
         } else {
             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Unexpected result for wait metadata frame event: %lu.", GetLastError());
@@ -1391,6 +1430,28 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
                 frame_fragment_offset += frame_fragment_size;                       
                 chunk_bytes_to_send -= frame_fragment_size;
                 fstream->pending_bytes -= frame_fragment_size;
+
+                // // 2. Check the event state immediately (non-blocking)
+                // AcquireSRWLockExclusive(&fstream->lock);
+                // DWORD dwWaitResult = WaitForSingleObject(fstream->hevent_fragment_err_retry_transfer, 0); // Timeout is 0
+
+                // // 3. Evaluate the result
+                // if (dwWaitResult == WAIT_OBJECT_0) {
+                //     printf("The event is currently signaled.\n");
+                //     // Handle event logic...
+                //     ReleaseSRWLockExclusive(&fstream->lock);
+                //     goto requeue;
+                // } else if (dwWaitResult == WAIT_TIMEOUT) {
+                //     ReleaseSRWLockExclusive(&fstream->lock);
+                //     // continue
+                // } else if (dwWaitResult == WAIT_ABANDONED) {
+                //     // This generally applies to mutexes, but handling it is good practice.
+                //     printf("The wait was abandoned.\n");
+                // } else {
+                //     // WAIT_FAILED
+                //     printf("WaitForSingleObject failed: %lu\n", GetLastError());
+                // }
+
             }
         }                  
 
@@ -1418,7 +1479,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
 
         HANDLE file_end_events[3] = {fstream->hevent_file_end_response_ok, 
                                 fstream->hevent_file_end_response_nok,
-                                fstream->hevent_file_end_transfer_err
+                                fstream->hevent_file_end_err_retry_transfer
                             };
 
         DWORD wait_file_end = WaitForMultipleObjects(3, file_end_events, FALSE, INFINITE);
@@ -1445,7 +1506,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
     clean:
         AcquireSRWLockExclusive(&fstream->lock);
         s_pool_free(pool_send_command, (void*)entry);
-        close_file_stream(fstream);
+        close_fstream(fstream);
         ReleaseSRWLockExclusive(&fstream->lock);
         ReleaseSemaphore(client->fstreams_semaphore, 1, NULL);
         continue;
@@ -1453,7 +1514,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
         // s_pool_free(pool_send_command, (void*)entry);
         AcquireSRWLockExclusive(&fstream->lock);
         s_push_ptr(queue_send_file_command, (uintptr_t)entry);
-        close_file_stream(fstream);
+        close_fstream(fstream);
         ReleaseSRWLockExclusive(&fstream->lock);
         ReleaseSemaphore(client->fstreams_semaphore, 1, NULL);
         continue;
@@ -1461,131 +1522,6 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
     }
     _endthreadex(0);
     return 0;               
-}
-// --- Send message thread function ---
-static DWORD WINAPI fthread_process_mstream(LPVOID lpParam){
-
-    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
-
-    uint32_t frame_fragment_offset;
-    uint32_t frame_fragment_len;
-
-    PoolEntryCommand *entry = NULL;
-    int res;
-
-    char log_message[CLIENT_LOG_MESSAGE_LEN];
-
-    while(client->client_status == STATUS_READY){
-        // this semaphore is released when a stream finished it's job
-        WaitForSingleObject(client->mstreams_semaphore, INFINITE);
-
-        // s_pop_command(queue_send_message_command, &entry);
-
-        entry = (PoolEntryCommand*)s_pop_ptr(queue_send_message_command);
-        if(!entry){
-            snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: popped invalid pointer from command message queue\n");
-            log_to_file(log_message);
-            continue;
-        }
-
-        if(!entry->command.send_message.message_buffer){
-            snprintf(log_message, sizeof(log_message), "ERROR: Queue message buffer invalid pointer.");
-            log_to_file(log_message);
-            continue;
-        }
-
-        if(entry->command.send_message.message_len >= MAX_MESSAGE_SIZE_BYTES){
-            snprintf(log_message, sizeof(log_message), "CRITTICAL ERROR: Message size is too big. Can't send.");
-            log_to_file(log_message);
-            fprintf(stderr, "%s\n", log_message);
-            continue;
-        }
-        if(entry->command.send_message.message_len <= 0){
-            snprintf(log_message, sizeof(log_message), "CRITTICAL ERROR: Message size not valid (should be greater than zero).");
-            log_to_file(log_message);
-            fprintf(stderr, "%s\n", log_message);
-            continue;
-        }
-        
-        ClientMessageStream *mstream = NULL;
-        for(int index = 0; index < CLIENT_MAX_ACTIVE_MSTREAMS; index++){
-            mstream = &client->mstream[index];
-            if(!mstream->mstream_busy) {
-                EnterCriticalSection(&mstream->lock);
-                mstream->mstream_busy = TRUE;
-                mstream->message_len = entry->command.send_message.message_len;
-                memcpy(mstream->message_buffer, entry->command.send_message.message_buffer, mstream->message_len);
-                mstream->message_buffer[mstream->message_len] = '\0';
-                free(entry->command.send_message.message_buffer);
-                break;
-            }
-        }
-
-        if(!mstream){
-            LeaveCriticalSection(&mstream->lock);
-            snprintf(log_message, sizeof(log_message), "WARNING: All mstreams are busy!");
-            log_to_file(log_message);
-            fprintf(stderr, "%s\n", log_message);
-            continue;
-        }
-
-        mstream->message_id = InterlockedIncrement(&client->mid_count);
-        frame_fragment_offset = 0;
-
-        mstream->remaining_bytes_to_send = mstream->message_len;
-
-        while(mstream->remaining_bytes_to_send > 0){
-
-            if(mstream->remaining_bytes_to_send > TEXT_FRAGMENT_SIZE){
-                frame_fragment_len = TEXT_FRAGMENT_SIZE;
-            } else {
-                frame_fragment_len = mstream->remaining_bytes_to_send;
-            }
-
-            char buffer[TEXT_FRAGMENT_SIZE];
-
-            const char *offset = mstream->message_buffer + frame_fragment_offset;
-            memcpy(buffer, offset, frame_fragment_len);
-            if(frame_fragment_len < TEXT_FRAGMENT_SIZE){
-                buffer[frame_fragment_len] = '\0';
-            }
-
-            PoolEntrySendFrame *entry_send = s_pool_alloc(pool_send_udp_frame);
-            if(!entry_send){
-                snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: s_pool_alloc() returned null pointer when allocating for text fragment. Should not happen since queue is blocking on push/pop semaphores.");
-                log_to_file(log_message);
-                goto clean;
-            }
-
-            res = construct_text_fragment(entry_send,
-                                            InterlockedIncrement64(&client->frame_count), 
-                                            client->sid, 
-                                            mstream->message_id, 
-                                            mstream->message_len, 
-                                            frame_fragment_offset, 
-                                            buffer, 
-                                            frame_fragment_len,
-                                            client->socket, &client->server_addr);
-
-            if(s_push_ptr(queue_send_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
-                snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push message frame to 'queue_send_udp_frame'. Should not happen since queue is blocking on push/pop semaphores.");
-                log_to_file(log_message);
-                goto clean;
-            }
-
-            frame_fragment_offset += frame_fragment_len;                       
-            mstream->remaining_bytes_to_send -= frame_fragment_len;
-        }
-
-    clean:
-        s_pool_free(pool_send_command, (void*)entry);
-        close_message_stream(mstream);
-        ReleaseSemaphore(client->mstreams_semaphore, 1, NULL);
-        LeaveCriticalSection(&mstream->lock);
-
-    }
-    _endthreadex(0);
-    return 0; 
 }
 // --- Process command ---
 static DWORD WINAPI fthread_client_command(LPVOID lpParam) {
@@ -1804,3 +1740,586 @@ int main() {
 
 }
 
+
+
+
+
+
+
+
+// static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
+
+//     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+//     UdpFrame *frame;
+//     struct sockaddr_in *src_addr;
+//     char src_ip[INET_ADDRSTRLEN];
+//     uint16_t src_port;
+    
+//     uint32_t frame_bytes_received = 0;
+
+//     uint16_t recv_delimiter = 0;
+//     uint8_t  recv_frame_type = 0;
+//     uint64_t recv_seq_num = 0;
+//     uint32_t recv_session_id = 0;
+//     uint32_t recv_file_id = 0;
+
+//     uint8_t recv_op_code = 0;
+
+//     uint32_t recv_session_timeout;
+//     uint8_t recv_server_status;
+
+//     uintptr_t entry = 0;
+
+//     char log_message[CLIENT_LOG_MESSAGE_LEN];
+    
+//     PoolEntryRecvFrame recv_frame_entry;
+//     PoolEntryRecvFrame *entry_recv_frame = NULL;
+
+//     ClientFileStream *fstream = NULL;
+//     bool remove_frame = false;
+
+//     HANDLE events[2] = {queue_recv_prio_udp_frame->push_semaphore, queue_recv_udp_frame->push_semaphore};
+
+//     while(client->client_status == STATUS_READY){
+
+//         DWORD result = WaitForMultipleObjects(2, events, FALSE, INFINITE);
+//         if (result == WAIT_OBJECT_0) {
+//             entry_recv_frame = (PoolEntryRecvFrame*)pop_ptr(queue_recv_prio_udp_frame);
+//             if(!entry_recv_frame){
+//                 snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Poped empty pointer from 'queue_recv_prio_udp_frame'.");
+//                 log_to_file(log_message);
+//                 continue;
+//             }
+//             memcpy(&recv_frame_entry, entry_recv_frame, sizeof(PoolEntryRecvFrame));
+//             pool_free(pool_recv_udp_frame, (void*)entry_recv_frame);
+//         } else if (result == WAIT_OBJECT_0 + 1) {
+//             entry_recv_frame = (PoolEntryRecvFrame*)pop_ptr(queue_recv_udp_frame);
+//             if(!entry_recv_frame){
+//                 snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Poped empty pointer from 'queue_recv_udp_frame'.");
+//                 log_to_file(log_message);
+//                 continue;
+//             }
+//             memcpy(&recv_frame_entry, entry_recv_frame, sizeof(PoolEntryRecvFrame));
+//             pool_free(pool_recv_udp_frame, (void*)entry_recv_frame);
+//         } else {
+//             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: WaitForMultipleObjects (queue_recv_udp_frame - semaphore) failed with code: %lu.", result);
+//             log_to_file(log_message);
+//             continue;
+//         }
+
+//         frame = &recv_frame_entry.frame;
+//         src_addr = &recv_frame_entry.src_addr;
+//         frame_bytes_received = recv_frame_entry.frame_size;
+
+//         // Extract header fields   
+//         recv_delimiter = _ntohs(frame->header.start_delimiter);
+//         recv_frame_type = frame->header.frame_type;
+//         recv_seq_num = _ntohll(frame->header.seq_num);
+//         recv_session_id = _ntohl(frame->header.session_id);
+ 
+//         inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+//         src_port = _ntohs(src_addr->sin_port);
+
+//         if (recv_delimiter != FRAME_DELIMITER) {
+//             snprintf(log_message, sizeof(log_message), "ERROR: Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.", src_ip, src_port, recv_delimiter);
+//             log_to_file(log_message);
+//             continue;
+//         }        
+//         if (!is_checksum_valid(frame, frame_bytes_received)) {
+//             snprintf(log_message, sizeof(log_message), "ERROR: Received frame from %s:%d with checksum mismatch. Discarding.", src_ip, src_port);
+//             log_to_file(log_message);
+//             // Optionally send ACK for checksum mismatch if this is part of a reliable stream
+//             // For individual datagrams, retransmission is often handled by higher layers or ignored.
+//             continue;
+//         }
+
+//         switch (recv_frame_type) {
+//             case FRAME_TYPE_CONNECT_RESPONSE:
+//                 if(recv_seq_num != DEFAULT_CONNECT_REQUEST_SEQ){
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Connect response seq num invalid. Connection not established...");
+//                     log_to_file(log_message);
+//                     fprintf(stderr, "%s\n", log_message);
+//                     break;
+//                 }
+//                 recv_server_status = frame->payload.connection_response.server_status;
+//                 recv_session_timeout = _ntohl(frame->payload.connection_response.session_timeout);               
+//                 if(recv_session_id == 0 || recv_server_status != STATUS_READY){
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Session ID invalid or server not ready. Connection not established...");
+//                     log_to_file(log_message);
+//                     fprintf(stderr, "%s\n", log_message);
+//                     break;
+//                 }
+//                 if(recv_session_timeout <= MIN_CONNECTION_TIMEOUT_SEC){
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Session timeout invalid. Connection not established...");
+//                     log_to_file(log_message);
+//                     fprintf(stderr, "%s\n", log_message);
+//                     break;
+//                 }
+//                 snprintf(log_message, sizeof(log_message), "DEBUG: Received connect response from %s:%d with session ID: %d, timeout: %d seconds, server status: %d.",
+//                                                         src_ip, src_port, recv_session_id, recv_session_timeout, recv_server_status);
+//                 log_to_file(log_message);
+//                 fprintf(stderr, "%s\n", log_message);
+//                 client->server_status = recv_server_status;
+//                 client->session_timeout = recv_session_timeout;
+//                 client->sid = recv_session_id;
+//                 snprintf(client->server_name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, frame->payload.connection_response.server_name);
+//                 client->last_active_time = time(NULL);
+                               
+//                 SetEvent(client->hevent_connection_established);
+//                 break;
+
+//             case FRAME_TYPE_FILE_METADATA_RESPONSE:
+//                 if(recv_session_id != client->sid){
+//                     //fprintf(stderr, "Received FILE_METADATA_RESPONSE frame with invalid session ID: %d\n", recv_session_id);
+//                     break;
+//                 }
+//                 client->last_active_time = time(NULL);
+//                 recv_op_code = frame->payload.file_metadata_response.op_code;
+//                 recv_file_id = _ntohl(frame->payload.file_metadata_response.file_id);
+                
+//                 fstream = NULL;
+//                 for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+//                     AcquireSRWLockExclusive(&client->fstream[i].lock);
+//                     if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
+//                         fstream = &client->fstream[i];
+//                         ReleaseSRWLockExclusive(&client->fstream[i].lock);
+//                         break;
+//                     } else {
+//                         ReleaseSRWLockExclusive(&client->fstream[i].lock);
+//                         continue;
+//                     }                    
+//                 }
+
+//                 if(!fstream){
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_METADATA_RESPONSE for unknown client fstream CODE: %u", recv_op_code);
+//                     log_to_file(log_message);
+                    
+//                     entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+//                     if(!entry){
+//                         snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                         log_to_file(log_message);
+//                         break;
+//                     } else {
+//                         s_pool_free(pool_send_udp_frame, (void*)entry);
+//                     }
+
+//                     break;
+//                 }
+
+//                 remove_frame = false;
+//                 switch (recv_op_code) {
+//                     case STS_CONFIRM_FILE_METADATA:
+//                     case STS_WAITING_FILE_FRAGMENTS:
+//                         // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_METADATA for metadata seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+//                         // log_to_file(log_message);
+//                         SetEvent(fstream->hevent_metadata_response_ok);
+//                         remove_frame = true;
+//                         break;
+
+//                     case ERR_INVALID_FRAME_DATA:
+//                     case ERR_STREAM_MEMORY_ALLOCATION:
+//                         snprintf(log_message, sizeof(log_message), "ERROR: RETRY FILE TRANSFER: %s%s", fstream->dirpath, fstream->fname);
+//                         log_to_file(log_message);
+//                         SetEvent(fstream->hevent_metadata_err_retry_transfer);
+//                         remove_frame = true;
+//                         break;
+
+//                     case ERR_COMPLETED_FILE:
+//                     case ERR_STREAM_ALREADY_FAILED:
+//                     case ERR_UNKNOWN_FILE_ID:
+//                     case ERR_EXISTING_DISK_FILE:
+//                     case ERR_EXISTING_DISK_TEMP_FILE:
+//                     case ERR_INVALID_DRIVE_PARTITION:
+//                     case ERR_CREATE_FILE_PATH:
+//                     case ERR_CREATE_FILE:
+//                         snprintf(log_message, sizeof(log_message), "ERROR: ABORT FILE TRANSFER: %s%s", fstream->dirpath, fstream->fname);
+//                         log_to_file(log_message);
+//                         SetEvent(fstream->hevent_metadata_err_abort_transfer);
+//                         remove_frame = true;
+//                         break;
+
+//                     case ERR_MALFORMED_FRAME:
+//                     case ERR_STREAM_INIT:
+//                     case ERR_ALL_STREAMS_BUSY:
+//                         remove_frame = false;
+//                         break;
+                    
+//                     default:
+//                         snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_METADATA_RESPONSE frame CODE: %u", recv_op_code);
+//                         log_to_file(log_message);
+//                         remove_frame = false;
+//                         break;
+//                 }
+                
+//                 if(!remove_frame){
+//                     break;
+//                 }
+
+//                 entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+//                 if(!entry){
+//                     snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                     log_to_file(log_message);
+//                 } else {
+//                     s_pool_free(pool_send_udp_frame, (void*)entry);
+//                 }
+//                 break;
+
+//             case FRAME_TYPE_ACK:
+//                 if(recv_session_id != client->sid){
+//                     //fprintf(stderr, "Received ACK frame with invalid session ID: %d\n", recv_session_id);
+//                     //TODO - send ACK frame with error code for invalid session ID
+//                     break;
+//                 }
+//                 client->last_active_time = time(NULL);
+//                 recv_op_code = frame->payload.ack.op_code;
+//                 recv_file_id = _ntohl(frame->payload.ack.file_id);
+
+//                 fstream = NULL;
+//                 for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+//                     AcquireSRWLockExclusive(&client->fstream[i].lock);
+//                     if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
+//                         fstream = &client->fstream[i];
+//                         ReleaseSRWLockExclusive(&client->fstream[i].lock);
+//                         break;
+//                     } else {
+//                         ReleaseSRWLockExclusive(&client->fstream[i].lock);
+//                         continue;
+//                     }                    
+//                 }
+
+//                 if(!fstream){
+//                     // snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_ACK for unknown client fstream CODE: %u", recv_op_code);
+//                     // log_to_file(log_message);
+                    
+//                     entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+//                     if(!entry){
+//                         // snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                         // log_to_file(log_message);
+//                         break;
+//                     } else {
+//                         s_pool_free(pool_send_udp_frame, (void*)entry);
+//                     }
+
+//                     break;
+//                 }
+
+//                 remove_frame = false;
+//                 switch (recv_op_code) {
+
+//                     case ERR_UNKNOWN_FILE_ID:
+//                     case ERR_INVALID_FILE_STATUS:
+//                     case ERR_STREAM_ALREADY_FAILED:
+//                     case ERR_COMPLETED_FILE:
+//                     case ERR_DUPLICATE_FRAME:
+//                     case ERR_ABSOLETE_STREAM:
+//                         remove_frame = true;
+//                         break;
+
+//                     case ERR_MALFORMED_FRAME:
+//                     case ERR_RESOURCE_LIMIT:
+//                         remove_frame = false;
+//                         break;
+
+//                     case ERR_FILE_TRANSFER:
+//                         // snprintf(log_message, sizeof(log_message), "ERROR: RETRY FILE TRANSFER (FRAGMENT EVENT): %s%s", fstream->dirpath, fstream->fname);
+//                         // log_to_file(log_message);
+//                         // SetEvent(fstream->hevent_fragment_err_retry_transfer);
+//                         remove_frame = true;
+//                         break;
+
+//                     case STS_KEEP_ALIVE:
+//                         remove_frame = false;
+//                         break;
+
+//                     default:
+//                         snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_ACK frame CODE: %u", recv_op_code);
+//                         log_to_file(log_message);
+//                         remove_frame = false;
+//                         break;
+//                 }
+
+//                 if(!remove_frame){
+//                     break;
+//                 }
+                    
+//                 entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+//                 if(!entry){
+//                     snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                     log_to_file(log_message);
+//                     break;
+//                 }
+//                 s_pool_free(pool_send_udp_frame, (void*)entry);
+
+
+//                 if(recv_seq_num == DEFAULT_DISCONNECT_REQUEST_SEQ && recv_op_code == STS_CONFIRM_DISCONNECT){
+//                     SetEvent(client->hevent_connection_closed);
+//                     client->session_status = CONNECTION_CLOSED;
+//                     snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_DISCONNECT - code: %lu; seq num: %llx.", recv_op_code, recv_seq_num);
+//                     log_to_file(log_message);
+//                     break;
+//                 }
+
+//                 break;
+
+//             case FRAME_TYPE_FILE_END_RESPONSE:
+//                 if(recv_session_id != client->sid){
+//                     break;                    
+//                 }
+
+//                 client->last_active_time = time(NULL);
+//                 recv_op_code = frame->payload.file_end_response.op_code;
+//                 recv_file_id = _ntohl(frame->payload.file_end_response.file_id);
+
+//                 fstream = NULL;
+//                 for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
+//                     AcquireSRWLockExclusive(&client->fstream[i].lock);
+//                     if(client->fstream[i].fstream_busy && client->fstream[i].fid == recv_file_id){
+//                         fstream = &client->fstream[i];
+//                         ReleaseSRWLockExclusive(&client->fstream[i].lock);
+//                         break;
+//                     } else {
+//                         ReleaseSRWLockExclusive(&client->fstream[i].lock);
+//                         continue;
+//                     }
+//                 }
+
+//                 if(!fstream){
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_END_RESPONSE for unknown client fstream CODE: %u", recv_op_code);
+//                     log_to_file(log_message);
+                    
+//                     entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+//                     if(!entry){
+//                         snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                         log_to_file(log_message);
+//                         break;
+//                     } else {
+//                         s_pool_free(pool_send_udp_frame, (void*)entry);
+//                     }
+//                     break;
+//                 }
+
+//                 remove_frame = false;
+
+//                 switch (recv_op_code) {
+//                     case STS_CONFIRM_FILE_END:
+//                         // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_END for file end seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
+//                         // log_to_file(log_message);
+//                         SetEvent(fstream->hevent_file_end_response_ok);
+//                         remove_frame = true;
+//                         break;
+
+//                     case ERR_STREAM_ALREADY_FAILED:
+//                         SetEvent(fstream->hevent_file_end_err_retry_transfer);
+//                         remove_frame = true;
+//                         break;
+                    
+//                     case ERR_UNKNOWN_FILE_ID:
+//                     case ERR_COMPLETED_FILE:
+//                     case ERR_ABSOLETE_STREAM:
+//                         SetEvent(fstream->hevent_file_end_response_nok);
+//                         remove_frame = true;
+//                         break;
+
+//                     default:
+//                         snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_END_RESPONSE frame CODE: %u", recv_op_code);
+//                         log_to_file(log_message);
+//                         remove_frame = FALSE;
+//                         break;               
+//                 }
+                
+//                 if(!remove_frame){
+//                     break;
+//                 }
+
+//                 entry = remove_table_send_frame(table_send_udp_frame, recv_seq_num);
+//                 if(!entry){
+//                     snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                     log_to_file(log_message);
+//                     break;
+//                 } else {
+//                     s_pool_free(pool_send_udp_frame, (void*)entry);
+//                 }
+//                 break;
+
+
+//             case FRAME_TYPE_DISCONNECT:
+//                 if(recv_session_id != client->sid){
+//                     break;                    
+//                 }                
+//                 snprintf(log_message, sizeof(log_message), "Received disconnect request frame. Session closed by server...");
+//                 log_to_file(log_message);
+//                 fprintf(stderr, "%s\n", log_message);
+//                 break;
+
+//             case FRAME_TYPE_CONNECT_REQUEST:
+//                 break;
+                
+//             case FRAME_TYPE_KEEP_ALIVE:
+//                 break;
+            
+//             case FRAME_TYPE_SACK:
+//                 if(recv_session_id != client->sid){
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with invalid session ID: %d. Discarding.", recv_session_id);
+//                     log_to_file(log_message);
+//                     break;
+//                 }
+//                 // Process SACK frame logic here
+//                 // snprintf(log_message, sizeof(log_message), "DEBUG: Received SACK frame from %s:%d with seq num: %llu, ack count: %u, sid: %lu", src_ip, src_port, recv_seq_num, frame->payload.sack.ack_count, recv_session_id);
+//                 // log_to_file(log_message);
+//                 int ack_count = frame->payload.sack.ack_count;
+//                 if(ack_count > 0){
+//                     for(int i = 0; i < ack_count; i++){
+//                         uint64_t ack_seq_num = _ntohll(frame->payload.sack.seq_num[i]);
+//                         entry = remove_table_send_frame(table_send_udp_frame, ack_seq_num);
+//                         if(!entry){
+//                             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
+//                             log_to_file(log_message);
+//                             continue;
+//                         }
+//                         s_pool_free(pool_send_udp_frame, (void*)entry);
+//                     }
+//                 } else {
+//                     snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with zero ACK count. Discarding.");
+//                     log_to_file(log_message);
+//                 }
+//                 break;
+
+//             default:
+//                 snprintf(log_message, sizeof(log_message), "ERROR: Received frame with unknown type: %u from %s:%d. Discarding.", recv_frame_type, src_ip, src_port);
+//                 log_to_file(log_message);
+//                 break;
+//         }
+//     }
+//     _endthreadex(0);    
+//     return 0;
+// }
+
+
+
+
+// // --- Send message thread function ---
+// static DWORD WINAPI fthread_process_mstream(LPVOID lpParam){
+
+//     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+//     uint32_t frame_fragment_offset;
+//     uint32_t frame_fragment_len;
+
+//     PoolEntryCommand *entry = NULL;
+//     int res;
+
+//     char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+//     while(client->client_status == STATUS_READY){
+//         // this semaphore is released when a stream finished it's job
+//         WaitForSingleObject(client->mstreams_semaphore, INFINITE);
+
+//         // s_pop_command(queue_send_message_command, &entry);
+
+//         entry = (PoolEntryCommand*)s_pop_ptr(queue_send_message_command);
+//         if(!entry){
+//             snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: popped invalid pointer from command message queue\n");
+//             log_to_file(log_message);
+//             continue;
+//         }
+
+//         if(!entry->command.send_message.message_buffer){
+//             snprintf(log_message, sizeof(log_message), "ERROR: Queue message buffer invalid pointer.");
+//             log_to_file(log_message);
+//             continue;
+//         }
+
+//         if(entry->command.send_message.message_len >= MAX_MESSAGE_SIZE_BYTES){
+//             snprintf(log_message, sizeof(log_message), "CRITTICAL ERROR: Message size is too big. Can't send.");
+//             log_to_file(log_message);
+//             fprintf(stderr, "%s\n", log_message);
+//             continue;
+//         }
+//         if(entry->command.send_message.message_len <= 0){
+//             snprintf(log_message, sizeof(log_message), "CRITTICAL ERROR: Message size not valid (should be greater than zero).");
+//             log_to_file(log_message);
+//             fprintf(stderr, "%s\n", log_message);
+//             continue;
+//         }
+        
+//         ClientMessageStream *mstream = NULL;
+//         for(int index = 0; index < CLIENT_MAX_ACTIVE_MSTREAMS; index++){
+//             mstream = &client->mstream[index];
+//             if(!mstream->mstream_busy) {
+//                 EnterCriticalSection(&mstream->lock);
+//                 mstream->mstream_busy = TRUE;
+//                 mstream->message_len = entry->command.send_message.message_len;
+//                 memcpy(mstream->message_buffer, entry->command.send_message.message_buffer, mstream->message_len);
+//                 mstream->message_buffer[mstream->message_len] = '\0';
+//                 free(entry->command.send_message.message_buffer);
+//                 break;
+//             }
+//         }
+
+//         if(!mstream){
+//             LeaveCriticalSection(&mstream->lock);
+//             snprintf(log_message, sizeof(log_message), "WARNING: All mstreams are busy!");
+//             log_to_file(log_message);
+//             fprintf(stderr, "%s\n", log_message);
+//             continue;
+//         }
+
+//         mstream->message_id = InterlockedIncrement(&client->mid_count);
+//         frame_fragment_offset = 0;
+
+//         mstream->remaining_bytes_to_send = mstream->message_len;
+
+//         while(mstream->remaining_bytes_to_send > 0){
+
+//             if(mstream->remaining_bytes_to_send > TEXT_FRAGMENT_SIZE){
+//                 frame_fragment_len = TEXT_FRAGMENT_SIZE;
+//             } else {
+//                 frame_fragment_len = mstream->remaining_bytes_to_send;
+//             }
+
+//             char buffer[TEXT_FRAGMENT_SIZE];
+
+//             const char *offset = mstream->message_buffer + frame_fragment_offset;
+//             memcpy(buffer, offset, frame_fragment_len);
+//             if(frame_fragment_len < TEXT_FRAGMENT_SIZE){
+//                 buffer[frame_fragment_len] = '\0';
+//             }
+
+//             PoolEntrySendFrame *entry_send = s_pool_alloc(pool_send_udp_frame);
+//             if(!entry_send){
+//                 snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: s_pool_alloc() returned null pointer when allocating for text fragment. Should not happen since queue is blocking on push/pop semaphores.");
+//                 log_to_file(log_message);
+//                 goto clean;
+//             }
+
+//             res = construct_text_fragment(entry_send,
+//                                             InterlockedIncrement64(&client->frame_count), 
+//                                             client->sid, 
+//                                             mstream->message_id, 
+//                                             mstream->message_len, 
+//                                             frame_fragment_offset, 
+//                                             buffer, 
+//                                             frame_fragment_len,
+//                                             client->socket, &client->server_addr);
+
+//             if(s_push_ptr(queue_send_udp_frame, (uintptr_t)entry_send) == RET_VAL_ERROR){
+//                 snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: Failed to push message frame to 'queue_send_udp_frame'. Should not happen since queue is blocking on push/pop semaphores.");
+//                 log_to_file(log_message);
+//                 goto clean;
+//             }
+
+//             frame_fragment_offset += frame_fragment_len;                       
+//             mstream->remaining_bytes_to_send -= frame_fragment_len;
+//         }
+
+//     clean:
+//         s_pool_free(pool_send_command, (void*)entry);
+//         close_message_stream(mstream);
+//         ReleaseSemaphore(client->mstreams_semaphore, 1, NULL);
+//         LeaveCriticalSection(&mstream->lock);
+
+//     }
+//     _endthreadex(0);
+//     return 0; 
+// }

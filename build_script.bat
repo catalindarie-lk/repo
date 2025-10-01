@@ -21,7 +21,6 @@ set common=%workspace%\src\resources.c ^
 REM Conditional dependency only for udp_server
 if "%target%"=="test_server" (
     set private=%workspace%\src\file_handler.c ^
-%workspace%\src\message_handler.c ^
 %workspace%\src\server_frames.c ^
 %workspace%\src\server_statistics.c
 ) else if "%target%"=="test_client" (

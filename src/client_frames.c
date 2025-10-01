@@ -262,35 +262,35 @@ int construct_file_end(PoolEntrySendFrame *entry,
 
 
 
-int construct_text_fragment(PoolEntrySendFrame *entry,
-                            const uint64_t seq_num, 
-                            const uint32_t session_id, 
-                            const uint32_t message_id, 
-                            const uint32_t message_len, 
-                            const uint32_t fragment_offset, 
-                            const char* fragment_buffer, 
-                            const uint32_t fragment_len,
-                            const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+// int construct_text_fragment(PoolEntrySendFrame *entry,
+//                             const uint64_t seq_num, 
+//                             const uint32_t session_id, 
+//                             const uint32_t message_id, 
+//                             const uint32_t message_len, 
+//                             const uint32_t fragment_offset, 
+//                             const char* fragment_buffer, 
+//                             const uint32_t fragment_len,
+//                             const SOCKET src_socket, const struct sockaddr_in *dest_addr){
     
-    UdpFrame *frame = &entry->frame;
+//     UdpFrame *frame = &entry->frame;
     
-    frame->header.start_delimiter = _htons(FRAME_DELIMITER);
-    frame->header.frame_type = FRAME_TYPE_TEXT_MESSAGE;
-    frame->header.seq_num = _htonll(seq_num);
-    frame->header.session_id = _htonl(session_id);
-    // Set the payload fields
-    frame->payload.text_fragment.message_id = _htonl(message_id);
-    frame->payload.text_fragment.message_len = _htonl(message_len);
-    frame->payload.text_fragment.fragment_len = _htonl(fragment_len);
-    frame->payload.text_fragment.fragment_offset = _htonl(fragment_offset);
+//     frame->header.start_delimiter = _htons(FRAME_DELIMITER);
+//     frame->header.frame_type = FRAME_TYPE_TEXT_MESSAGE;
+//     frame->header.seq_num = _htonll(seq_num);
+//     frame->header.session_id = _htonl(session_id);
+//     // Set the payload fields
+//     frame->payload.text_fragment.message_id = _htonl(message_id);
+//     frame->payload.text_fragment.message_len = _htonl(message_len);
+//     frame->payload.text_fragment.fragment_len = _htonl(fragment_len);
+//     frame->payload.text_fragment.fragment_offset = _htonl(fragment_offset);
     
-    memcpy(frame->payload.text_fragment.chars, fragment_buffer, fragment_len);
+//     memcpy(frame->payload.text_fragment.chars, fragment_buffer, fragment_len);
    
-    // Calculate the checksum for the frame
-    frame->header.checksum = _htonl(calculate_crc32(frame, sizeof(FrameHeader) + sizeof(TextPayload)));
+//     // Calculate the checksum for the frame
+//     frame->header.checksum = _htonl(calculate_crc32(frame, sizeof(FrameHeader) + sizeof(TextPayload)));
 
-    entry->src_socket = src_socket;
-    memcpy(&entry->dest_addr, dest_addr, sizeof(struct sockaddr_in));
+//     entry->src_socket = src_socket;
+//     memcpy(&entry->dest_addr, dest_addr, sizeof(struct sockaddr_in));
 
-    return RET_VAL_SUCCESS;
-}
+//     return RET_VAL_SUCCESS;
+// }

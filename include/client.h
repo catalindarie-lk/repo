@@ -58,8 +58,8 @@
 //---------------------------------------------------------------------------------------------------------
 // --- Client SEND Buffer Sizes ---
 #define CLIENT_QUEUE_SIZE_SEND_FRAME                256
-#define CLIENT_QUEUE_SIZE_SEND_PRIO_FRAME           32
-#define CLIENT_QUEUE_SIZE_SEND_CTRL_FRAME           4
+#define CLIENT_QUEUE_SIZE_SEND_PRIO_FRAME           64
+#define CLIENT_QUEUE_SIZE_SEND_CTRL_FRAME           64
 // --- Client SEND Memory Pool Sizes ---
 #define CLIENT_POOL_SIZE_SEND                       (CLIENT_QUEUE_SIZE_SEND_FRAME + \
                                                     CLIENT_QUEUE_SIZE_SEND_PRIO_FRAME + \
@@ -68,7 +68,7 @@
 
 // --- Client RECV Buffer Sizes ---
 #define CLIENT_QUEUE_SIZE_RECV_FRAME                (1024 + 128 * CLIENT_MAX_ACTIVE_FSTREAMS) // Size of the queue for received frames
-#define CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME           32
+#define CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME           64
 // --- Client RECV Memory Pool Sizes ---
 #define CLIENT_POOL_SIZE_RECV                       (CLIENT_QUEUE_SIZE_RECV_FRAME + \
                                                     CLIENT_QUEUE_SIZE_RECV_PRIO_FRAME)
@@ -81,6 +81,21 @@
 #define CLIENT_QUEUE_SIZE_LOG                       65536
 #define CLIENT_POOL_SIZE_LOG                        (CLIENT_QUEUE_SIZE_LOG + 16)
 //---------------------------------------------------------------------------------------------------------
+
+
+// Requires 'char log_message[CLIENT_LOG_MESSAGE_LEN];' to be locally declared 
+// in the calling function.
+
+#define LOG_TO_FILE(fmt, ...) \
+    do { \
+        /* Check: Assumes log_message is locally declared and sized. */ \
+        /* We use the implied 'log_message' variable. */ \
+        snprintf(log_message, sizeof(log_message), fmt, ##__VA_ARGS__); \
+        \
+        /* Write the content of the buffer to the log file */ \
+        log_to_file(log_message); \
+    } while(0)
+
 
 // --- Macro to Parse Global Data to Threads ---
 // This macro simplifies passing pointers to global client data structures into thread functions.
@@ -175,11 +190,14 @@ typedef struct{
     uint8_t *chunk_buffer;                      // Buffer to hold chunks of file data for reading/writing
 
     HANDLE hevent_metadata_response_ok;         // Event handle for successful metadata response
-    HANDLE hevent_metadata_response_nok;        // Event handle for unsuccessful metadata response
+    HANDLE hevent_metadata_err_retry_transfer;
+    HANDLE hevent_metadata_err_abort_transfer;        // Event handle for unsuccessful metadata response
+
+    HANDLE hevent_fragment_err_retry_transfer;
 
     HANDLE hevent_file_end_response_ok;         // Event handle for successful metadata response
     HANDLE hevent_file_end_response_nok;        // Event handle for unsuccessful metadata response
-    HANDLE hevent_file_end_transfer_err;
+    HANDLE hevent_file_end_err_retry_transfer;
 
     SRWLOCK lock;                      // Critical section for protecting access to this stream's data
 }ClientFileStream;
@@ -276,9 +294,7 @@ extern ClientThreads Threads;                   // Global instance of client thr
 int init_client_session();                      // Initializes the client session, sockets, pools, queues, etc.
 int reset_client_session();                     // Resets the client session to a clean state
 
-// Functions for cleaning up stream-specific resources
-void close_file_stream(ClientFileStream *fstream);          // Cleans up resources associated with a file stream
-void close_message_stream(ClientMessageStream *mstream);    // Cleans up resources associated with a message stream
+
 
 int log_to_file(const char* log_message);
 
@@ -291,8 +307,20 @@ static DWORD WINAPI fthread_send_frame(LPVOID lpParam);        // Thread for pop
 static DWORD WINAPI fthread_send_prio_frame(LPVOID lpParam);   // Thread for popping priority frames from send queue
 static DWORD WINAPI fthread_send_ctrl_frame(LPVOID lpParam);   // Thread for popping control frames from send queue
 static DWORD WINAPI fthread_process_fstream(LPVOID lpParam);       // Thread for managing a specific file stream operation
-static DWORD WINAPI fthread_process_mstream(LPVOID lpParam);       // Thread for managing a specific message stream operation
 static DWORD WINAPI fthread_client_command(LPVOID lpParam);        // Thread for processing client commands (e.g., from UI or other modules)
 static DWORD WINAPI fthread_error_log_write(LPVOID lpParam);       // Thread for writing error logs to a file
+
+
+// Functions for cleaning up stream-specific resources
+static inline void close_fstream(ClientFileStream *fstream);       // Cleans up resources associated with a file stream
+static inline ClientFileStream *get_fstream(ClientData *client, const uint32_t file_id);
+static inline bool is_frame_valid(PoolEntryRecvFrame *frame_buff);
+static inline void handle_connect_response(PoolEntryRecvFrame *frame_buff);
+static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff);
+static inline void handle_ack(PoolEntryRecvFrame *frame_buff);
+static inline void handle_file_end_response(PoolEntryRecvFrame *frame_buff);
+static inline void handle_sack(PoolEntryRecvFrame *frame_buff);
+
+
 
 #endif // CLIENT_H // End of header guard

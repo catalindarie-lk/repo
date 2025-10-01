@@ -9,6 +9,11 @@
 //--------------------------------------------------------------------------------------------------------------------------
 void init_pool(MemPool* pool, const uint64_t block_size, const uint64_t block_count) {
 
+    if(!pool){
+        fprintf(stderr, "ERROR: Passed an invalid pool pointer!\n");
+        return;
+    }
+
     pool->block_size = block_size;
     pool->block_count = block_count;
 
@@ -57,6 +62,11 @@ void init_pool(MemPool* pool, const uint64_t block_size, const uint64_t block_co
 }
 void* pool_alloc(MemPool* pool) {
     // Enter critical section to protect shared pool data
+    if(!pool){
+        fprintf(stderr, "ERROR: Passed an invalid pool pointer!\n");
+        return NULL;
+    }
+
     AcquireSRWLockExclusive(&pool->lock);
     // Check if the pool is exhausted
     if (pool->free_head == END_BLOCK) { // Check against POOL_END
@@ -78,8 +88,12 @@ void* pool_alloc(MemPool* pool) {
 }
 void pool_free(MemPool* pool, void* ptr) {
     // Handle NULL pointer case
-    if (ptr == NULL) {
+    if (!ptr) {
         fprintf(stderr, "ERROR: Attempt to free a NULL block in pool!\n");
+        return;
+    }
+    if(!pool){
+        fprintf(stderr, "ERROR: Passed an invalid pool pointer!\n");
         return;
     }
     // Enter critical section

@@ -72,60 +72,42 @@ enum FrameType{
     FRAME_TYPE_FILE_END_RESPONSE = 24,
 
     FRAME_TYPE_TRANSFER_ERROR = 51,
-    // FRAME_TYPE_FILE_COMPLETE = 27,
-    FRAME_TYPE_TEXT_MESSAGE = 100      // Fragment of a long text message
 };
 
 typedef uint8_t AckErrorCode;
 enum AckErrorCode {
-    // STS_FRAME_DATA_ACK = 11,
-    STS_ACK_UNDEFINED = 0,
+    
+    UNDEFINED = 0,
     
     STS_KEEP_ALIVE = 12,  
     STS_CONFIRM_FILE_METADATA = 21,
-    STS_CONFIRM_FILE_END = 22,
-    STS_CONFIRM_DISCONNECT = 23,
-    STS_CONFIRM_MESSAGE_FRAGMENT = 24,
+    STS_WAITING_FILE_FRAGMENTS = 22,    //server->NO && client->drop_stream
 
-    ERR_EXISTING_FILE = 100,       // Server has completed this transfer
-    ERR_DUPLICATE_FRAME = 101,     // Frame was already received
-    ERR_UNKNOWN_FILE_ID = 102,
-    ERR_EXISTING_MESSAGE = 103,
-    ERR_MESSAGE_FINAL_CHECK = 104,
-    ERR_MEMORY_ALLOCATION = 105,
-    ERR_STREAM_INIT = 106,    
-    ERR_MALFORMED_FRAME = 107,     // Frame structure or size invalid
-    ERR_RESOURCE_LIMIT = 108,      // Server ran out of memory or slots
-    ERR_CONFIRM_DUPLICATE_FILE_METADATA = 109, // Client sent duplicate metadata
-    ERR_ALL_STREAMS_BUSY = 110,
+    STS_CONFIRM_FILE_END = 23,
+    STS_CONFIRM_DISCONNECT = 24,
 
-    ERR_INVALID_SESSION = 120,     // Session ID not recognized
-    ERR_TIMEOUT = 121,             // Session timed out due to inactivity
-    ERR_UNSUPPORTED_FRAME = 122,   // Frame type not supported
-    ERR_UNAUTHORIZED = 123,        // Authentication/authorization failed
-    ERR_INTERNAL_ERROR = 124,       // Catch-all for unexpected server fault
-    ERR_UNKNOWN_ERROR = 125,
+    ERR_MALFORMED_FRAME = 25,          //server->NO && client->drop_frame
+    ERR_COMPLETED_FILE = 26,            //server->NO && client->drop_frame
+    ERR_STREAM_INIT = 27,               //server->NO && client->requeue_stream
+    ERR_STREAM_ALREADY_FAILED = 28,    //server->NO && client->drop_frame
+    ERR_UNKNOWN_FILE_ID = 29,          //server->NO && client->drop_frame
+    ERR_INVALID_FILE_STATUS = 30,
+    ERR_ALL_STREAMS_BUSY = 31,         //server->NO && client->NO
+    ERR_ABSOLETE_STREAM = 32,
 
-    ERR_SERVER_TERMINATED_STREAM = 126
+    ERR_EXISTING_DISK_FILE = 33,        //server->close_stream && client->drop_frame
+    ERR_EXISTING_DISK_TEMP_FILE = 34,   //server->close_stream && client->drop_frame
+    ERR_INVALID_FRAME_DATA = 35,       //server->close_stream && client->requeue_stream
+    ERR_STREAM_MEMORY_ALLOCATION = 36, //server->close_stream && client->requeue_stream
+    ERR_INVALID_DRIVE_PARTITION = 37,  //server->close_stream && client->drop_frame
+    ERR_CREATE_FILE_PATH = 38,         //server->close_stream && client->drop_frame
+    ERR_CREATE_FILE = 39,              //server->close_stream && client->requeue_stream
+    ERR_FILE_TRANSFER = 40,            //server->close_stream && client->drop_frame
 
+    ERR_DUPLICATE_FRAME = 41,          //server->NO && client->NO
+    ERR_RESOURCE_LIMIT = 42,           //server->NO && client->NO
 };
 
-typedef uint8_t StreamErrorCode;
-enum StreamErrorCode {
-    STS_STREAM_UNDEFINED = 0,
-    STS_STREAM_SUCCESS = 10,
-
-    ERR_STREAM_MEMORY_ALLOCATION = 100,
-    ERR_STREAM_INVALID_PARAMETERS = 101,
-    ERR_STREAM_INVALID_PAYLOAD_DATA = 102,
-    ERR_STREAM_PATH_CREATE = 103,
-    ERR_STREAM_FILE_EXIST = 104,
-    ERR_STREAM_TEMP_FILE_EXIST = 105,
-    ERR_STREAM_TABLE_INSERT = 106,
-    ERR_STREAM_FILE_HANDLE_INIT = 107,
-    ERR_STREAM_FILE_HANDLE_ASSOCIATE = 108
-
-};
 
 #pragma pack(push, 1) 
 // Common Header for all frames
@@ -234,11 +216,6 @@ typedef struct {
         uint8_t raw_payload[MAX_PAYLOAD_SIZE];              // For generic access or padding
     } payload;
 } UdpFrame;
-
-// typedef struct {
-//     FrameHeader header;
-//     AckPayload payload;
-// } AckUdpFrame;
 
 #pragma pack(pop)
 
