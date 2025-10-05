@@ -314,7 +314,7 @@ static DWORD WINAPI fthread_error_log_write(LPVOID lpParam);       // Thread for
 // Functions for cleaning up stream-specific resources
 static inline void close_fstream(ClientFileStream *fstream);       // Cleans up resources associated with a file stream
 static inline ClientFileStream *get_fstream(ClientData *client, const uint32_t file_id);
-static inline bool is_frame_valid(PoolEntryRecvFrame *frame_buff);
+// inline bool is_frame_valid(PoolEntryRecvFrame *frame_buff);
 static inline void handle_connect_response(PoolEntryRecvFrame *frame_buff);
 static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff);
 static inline void handle_ack(PoolEntryRecvFrame *frame_buff);

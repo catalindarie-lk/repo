@@ -151,15 +151,22 @@ static int init_server_buffers(){
     init_table_id(table_message_id, 1024, 32768);
 
     init_queue_ptr(queue_client_ptr, SERVER_QUEUE_SIZE_CLIENT_PTR);
+    init_pool(pool_iocp_send_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_SEND);
 
     init_pool(pool_send_udp_frame, sizeof(PoolEntrySendFrame), SERVER_POOL_SIZE_SEND);
-    init_pool(pool_iocp_send_context, sizeof(SocketContext), SERVER_POOL_SIZE_IOCP_SEND);
+    init_pool(pool_send_prio_udp_frame, sizeof(PoolEntrySendFrame), 256);
+    init_pool(pool_send_ctrl_udp_frame, sizeof(PoolEntrySendFrame), 16);
+    
     init_queue_ptr(queue_send_udp_frame, SERVER_QUEUE_SIZE_SEND_FRAME);
     init_queue_ptr(queue_send_prio_udp_frame, SERVER_QUEUE_SIZE_SEND_PRIO_FRAME);
     init_queue_ptr(queue_send_ctrl_udp_frame, SERVER_QUEUE_SIZE_SEND_CTRL_FRAME);
 
     init_pool(&sspu->pool_ctrl_frame, sizeof(PoolEntryRecvFrame), 64);
+    init_queue_ptr(&sspu->queue_ctrl_frame, 64);
+
+
     init_pool(&sspu->pool_data_frame, sizeof(PoolEntryRecvFrame), SERVER_POOL_SIZE_RECV);
+    init_queue_ptr(&sspu->queue_data_frame, SERVER_POOL_SIZE_RECV);
 
     for (int i = 0; i < SERVER_POOL_SIZE_IOCP_RECV; ++i) {
         SocketContext* recv_context = (SocketContext*)pool_alloc(pool_iocp_recv_context);
@@ -205,19 +212,28 @@ static int start_threads() {
     // }
     sspu->thread_process_ctrl_frame = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_ctrl_frame, NULL, 0, NULL);
     if (sspu->thread_process_ctrl_frame == NULL) {
-        fprintf(stderr, "Failed to create thread_process_ctrl_frame. Error: %d\n", GetLastError());
+        fprintf(stderr, "Failed to create 'thread_process_ctrl_frame'. Error: %d\n", GetLastError());
         return RET_VAL_ERROR;
     }
-    SetThreadPriority(sspu->thread_process_ctrl_frame, THREAD_PRIORITY_NORMAL);
+    SetThreadPriority(sspu->thread_process_ctrl_frame, THREAD_PRIORITY_ABOVE_NORMAL);
+    
+    for(int i = 0; i < SERVER_MAX_THREADS_PROCESS_FSTREAM; i++){
+        sspu->thread_process_data_frame[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_data_frame, NULL, 0, NULL);
+        if (sspu->thread_process_data_frame[i] == NULL) {
+            fprintf(stderr, "Failed to create 'thread_process_data_frame'. Error: %d\n", GetLastError());
+            return RET_VAL_ERROR;
+        }
+        SetThreadPriority(sspu->thread_process_data_frame[i], THREAD_PRIORITY_ABOVE_NORMAL);
+    }
 
     for(int i = 0; i < SERVER_MAX_THREADS_PROCESS_FSTREAM; i++){
         sspu->process_fstream_uid[i] = i;
-        sspu->process_fstream[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_fstream, (LPVOID)&sspu->process_fstream_uid[i], 0, NULL);
-        if (sspu->process_fstream[i] == NULL) {
+        sspu->thread_process_fstream[i] = (HANDLE)_beginthreadex(NULL, 0, func_thread_process_fstream, (LPVOID)&sspu->process_fstream_uid[i], 0, NULL);
+        if (sspu->thread_process_fstream[i] == NULL) {
             fprintf(stderr, "Failed to create 'process_fstream' thread. Error: %d\n", GetLastError());
             return RET_VAL_ERROR;
         }
-        SetThreadPriority(sspu->process_fstream[i], THREAD_PRIORITY_ABOVE_NORMAL);
+        SetThreadPriority(sspu->thread_process_fstream[i], THREAD_PRIORITY_ABOVE_NORMAL);
     }
 
     for(int i = 0; i < SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES; i++){
@@ -389,6 +405,7 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                         case FRAME_TYPE_CONNECT_REQUEST:
                         case FRAME_TYPE_DISCONNECT:
                         case FRAME_TYPE_KEEP_ALIVE:
+                        case FRAME_TYPE_FILE_METADATA:
                             
                             frame_buff = (PoolEntryRecvFrame*)pool_alloc(&sspu->pool_ctrl_frame);
                             if (!frame_buff) {
@@ -403,57 +420,15 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                             GetSystemTimePreciseAsFileTime(&ft);
                             frame_buff->timestamp = FILETIME_TO_UINT64(ft);
 
-                            PostQueuedCompletionStatus(server->iocp_ctrl_frame_handle, 0, (uintptr_t)frame_buff, NULL);
-
-                            break;
-
-                        case FRAME_TYPE_FILE_METADATA:
-
-                            frame_buff = (PoolEntryRecvFrame*)pool_alloc(&sspu->pool_data_frame);
-                            if (!frame_buff) {
-                                fprintf(stderr, "CRITICAL ERROR: Failed to allocate memory for received frame entry.\n");
-                                break;
+                            if(push_ptr(&sspu->queue_ctrl_frame, (uintptr_t)frame_buff) == RET_VAL_ERROR){
+                                fprintf(stderr, "CRITICAL ERROR: Failed to enqueue control frame.\n");
+                                pool_free(&sspu->pool_ctrl_frame, frame_buff);
                             }
-
-                            memset(frame_buff, 0, sizeof(PoolEntryRecvFrame));
-                            memcpy(&frame_buff->frame, socket_context->buffer, NrOfBytesTransferred);
-                            memcpy(&frame_buff->src_addr, &socket_context->addr, sizeof(struct sockaddr_in));
-                            frame_buff->frame_size = NrOfBytesTransferred;
-                            GetSystemTimePreciseAsFileTime(&ft);
-                            frame_buff->timestamp = FILETIME_TO_UINT64(ft);
-
-                            iocp_op = (IocpOperation*)s_pool_alloc(&sspu->pool_iocp_operation);   
-                            memset(&iocp_op->overlapped, 0, sizeof(OVERLAPPED));
-                            iocp_op->io_type = IO_DATA_FRAME;
-
-                            PostQueuedCompletionStatus(server->iocp_process_fstream_handle, 0, (uintptr_t)frame_buff, &iocp_op->overlapped);
-                            
                             break;
                         
                         case FRAME_TYPE_FILE_FRAGMENT:
-
-                            frame_buff = (PoolEntryRecvFrame*)pool_alloc(&sspu->pool_data_frame);
-                            if (!frame_buff) {
-                                fprintf(stderr, "CRITICAL ERROR: Failed to allocate memory for received frame entry.\n");
-                                break;
-                            }
-
-                            memset(frame_buff, 0, sizeof(PoolEntryRecvFrame));
-                            memcpy(&frame_buff->frame, socket_context->buffer, NrOfBytesTransferred);
-                            memcpy(&frame_buff->src_addr, &socket_context->addr, sizeof(struct sockaddr_in));
-                            frame_buff->frame_size = NrOfBytesTransferred;
-                            GetSystemTimePreciseAsFileTime(&ft);
-                            frame_buff->timestamp = FILETIME_TO_UINT64(ft);
-
-                            iocp_op = (IocpOperation*)s_pool_alloc(&sspu->pool_iocp_operation);   
-                            memset(&iocp_op->overlapped, 0, sizeof(OVERLAPPED));
-                            iocp_op->io_type = IO_DATA_FRAME;
-
-                            PostQueuedCompletionStatus(server->iocp_process_fstream_handle, 0, (uintptr_t)frame_buff, &iocp_op->overlapped);
-                            break;
-
                         case FRAME_TYPE_FILE_END:
-                                                    
+
                             frame_buff = (PoolEntryRecvFrame*)pool_alloc(&sspu->pool_data_frame);
                             if (!frame_buff) {
                                 fprintf(stderr, "CRITICAL ERROR: Failed to allocate memory for received frame entry.\n");
@@ -467,12 +442,42 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
                             GetSystemTimePreciseAsFileTime(&ft);
                             frame_buff->timestamp = FILETIME_TO_UINT64(ft);
 
-                            iocp_op = (IocpOperation*)s_pool_alloc(&sspu->pool_iocp_operation);   
-                            memset(&iocp_op->overlapped, 0, sizeof(OVERLAPPED));
-                            iocp_op->io_type = IO_DATA_FRAME;
+                            // iocp_op = (IocpOperation*)s_pool_alloc(&sspu->pool_iocp_operation);   
+                            // memset(&iocp_op->overlapped, 0, sizeof(OVERLAPPED));
+                            // iocp_op->io_type = IO_DATA_FRAME;
 
-                            PostQueuedCompletionStatus(server->iocp_process_fstream_handle, 0, (uintptr_t)frame_buff, &iocp_op->overlapped);
+                            // PostQueuedCompletionStatus(server->iocp_process_fstream_handle, 0, (uintptr_t)frame_buff, &iocp_op->overlapped);
+                            if(push_ptr(&sspu->queue_data_frame, (uintptr_t)frame_buff) == RET_VAL_ERROR){
+                                fprintf(stderr, "CRITICAL ERROR: Failed to enqueue data frame.\n");
+                                pool_free(&sspu->pool_data_frame, frame_buff);
+                            }
                             break;
+
+                        // case FRAME_TYPE_FILE_END:
+                                                    
+                        //     frame_buff = (PoolEntryRecvFrame*)pool_alloc(&sspu->pool_data_frame);
+                        //     if (!frame_buff) {
+                        //         fprintf(stderr, "CRITICAL ERROR: Failed to allocate memory for received frame entry.\n");
+                        //         break;
+                        //     }
+
+                        //     memset(frame_buff, 0, sizeof(PoolEntryRecvFrame));
+                        //     memcpy(&frame_buff->frame, socket_context->buffer, NrOfBytesTransferred);
+                        //     memcpy(&frame_buff->src_addr, &socket_context->addr, sizeof(struct sockaddr_in));
+                        //     frame_buff->frame_size = NrOfBytesTransferred;
+                        //     GetSystemTimePreciseAsFileTime(&ft);
+                        //     frame_buff->timestamp = FILETIME_TO_UINT64(ft);
+
+                        //     iocp_op = (IocpOperation*)s_pool_alloc(&sspu->pool_iocp_operation);   
+                        //     memset(&iocp_op->overlapped, 0, sizeof(OVERLAPPED));
+                        //     iocp_op->io_type = IO_DATA_FRAME;
+
+                        //     // PostQueuedCompletionStatus(server->iocp_process_fstream_handle, 0, (uintptr_t)frame_buff, &iocp_op->overlapped);
+                        //     if(push_ptr(&sspu->queue_data_frame, (uintptr_t)frame_buff) == RET_VAL_ERROR){
+                        //         fprintf(stderr, "CRITICAL ERROR: Failed to enqueue data frame.\n");
+                        //         pool_free(&sspu->pool_data_frame, frame_buff);
+                        //     }
+                        //     break;
 
                         default:
                             fprintf(stderr, "CRITICAL ERROR: Invalid frame type %u.\n", frame_type);
@@ -518,201 +523,138 @@ static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam) {
     _endthreadex(0);
     return 0;
 }
+
 // --- Process a control frame ---
 static DWORD WINAPI func_thread_process_ctrl_frame(LPVOID lpParam){
 
     PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-    char src_ip[INET_ADDRSTRLEN];   // Buffer to store the human-readable string representation of the source IP address.
-    uint16_t src_port;              // Stores the source port number.
-
-    PoolEntrySendFrame *pool_send_entry = NULL;
-
-    DWORD dummyBytesTransferred;
-    uintptr_t lpCompletionKey;
-    LPOVERLAPPED dummyOverlapped;
-    
+   
     while (server->server_status == STATUS_READY) {
 
-        BOOL getqcompl_result = GetQueuedCompletionStatus(
-            server->iocp_ctrl_frame_handle,
-            &dummyBytesTransferred,
-            &lpCompletionKey,
-            &dummyOverlapped,
-            INFINITE
-        );
+        char src_ip[INET_ADDRSTRLEN];   // Buffer to store the human-readable string representation of the source IP address.
+        uint16_t src_port;              // Stores the source port number.
 
-        if (!getqcompl_result) {
-            DWORD err = GetLastError();
-            fprintf(stderr, "I/O failed with error: %lu\n", err);
+        PoolEntryRecvFrame *frame_buff = NULL;
+
+        DWORD result = WaitForSingleObject(sspu->queue_ctrl_frame.push_semaphore, INFINITE); // Wait for a client slot to be available
+        if(result ==  WAIT_OBJECT_0) {
+            frame_buff = (PoolEntryRecvFrame*)pop_ptr(&sspu->queue_ctrl_frame);
+            if(!frame_buff){
+                fprintf(stdout, "Poped invalid frame from 'sspu->queue_ctrl_frame'\n");
+                continue;
+            }
+        } else {
+            fprintf(stderr, "CRITICAL ERROR: Unexpected result wait semaphore 'sspu->queue_ctrl_frame': %lu\n", result);
             continue;
         }
         
-        if (lpCompletionKey == 0) {
-            fprintf(stderr, "ERROR: NULL lpCompletitionKey from server->iocp_ctrl_frame. Skipping.\n");
-            continue;
-        }
-
-        PoolEntryRecvFrame* recv_ptr = (PoolEntryRecvFrame*)lpCompletionKey;
-        PoolEntryRecvFrame frame_buff = {0};
-        
-        memcpy(&frame_buff, recv_ptr, sizeof(PoolEntryRecvFrame));
-        pool_free(&sspu->pool_ctrl_frame, (void*)recv_ptr);
-
-        UdpFrame *frame = &frame_buff.frame;
-        struct sockaddr_in *src_addr = &frame_buff.src_addr;
-        uint32_t frame_size = frame_buff.frame_size;
-
-        uint16_t start_delimiter = _ntohs(frame->header.start_delimiter);
-        uint8_t frame_type = frame_buff.frame.header.frame_type;
-        uint64_t seq_num = _ntohll(frame->header.seq_num);
-        uint32_t session_id = _ntohl(frame->header.session_id);
-
+        struct sockaddr_in *src_addr = &frame_buff->src_addr;
         inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
         src_port = _ntohs(src_addr->sin_port);
 
-        if (start_delimiter != FRAME_DELIMITER) {
-            fprintf(stderr, "DEBUG: Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.\n", 
-                                            src_ip, src_port, start_delimiter);
-            continue;
-        }
+        UdpFrame *frame = &frame_buff->frame;
+        uint8_t frame_type = frame_buff->frame.header.frame_type;
+        uint32_t session_id = _ntohl(frame_buff->frame.header.session_id);
 
-        if (!is_checksum_valid(frame, frame_size)) {
-            fprintf(stderr, "DEBUG: Received frame from %s:%d with checksum mismatch. Discarding.\n", 
-                                            src_ip, src_port);
+        if(!is_frame_valid(frame_buff)){
             continue;
         }
 
         ServerClient *client = NULL;
 
-        if(frame_type == FRAME_TYPE_CONNECT_REQUEST && 
-                                session_id == DEFAULT_CONNECT_REQUEST_SID &&
-                                seq_num == DEFAULT_CONNECT_REQUEST_SEQ){
-            client = alloc_client(pool_clients);
-            if (!client) {
-                fprintf(stderr, "Failed to alloc_client() from %s:%d. Max clients reached or server error.\n", src_ip, src_port);
-                continue;
-            }
-            init_client(client, InterlockedIncrement(&server->session_id_counter), frame, src_addr);
-            AcquireSRWLockExclusive(&client->lock);
-            client->last_activity_time = time(NULL);
-            ReleaseSRWLockExclusive(&client->lock);
-
-            pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
-            if(!pool_send_entry){
-                fprintf(stderr, "ERROR: Failed to allocate memory in the pool for connect response frame\n");
-                continue;
-            }
-            construct_connect_response_frame(pool_send_entry,
-                                    DEFAULT_CONNECT_REQUEST_SEQ, 
-                                    client->sid, 
-                                    server->session_timeout, 
-                                    server->server_status, 
-                                    server->name, 
-                                    server->socket, &client->client_addr);
-
-            if(push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
-                fprintf(stderr, "ERROR: Failed to push connect response frame to queue.\n");
-                pool_free(pool_send_udp_frame, pool_send_entry);
-            }
-
-            fprintf(stdout, "DEBUG: Client %s:%d Requested connection. Responding to connect request with Session ID: %u\n", 
-                                                    client->ip, client->port, client->sid);
-            continue;
-
-        } else if (frame_type == FRAME_TYPE_CONNECT_REQUEST && 
-                        (session_id != DEFAULT_CONNECT_REQUEST_SID || seq_num != DEFAULT_CONNECT_REQUEST_SEQ)) {
-            // This is a re-connect request from an existing client.
-            fprintf(stdout, "DEBUG: Client %s:%d requested re-connection with Session ID: %u\n", 
-                                                    src_ip, src_port, session_id);
-            client = find_client(pool_clients, session_id);
-            if(client == NULL){
-                fprintf(stderr, "ERROR: Unknown client (invalid DEFAULT_CONNECT_REQUEST_SID)\n");
-                continue;
-            }
-            AcquireSRWLockExclusive(&client->lock);
-            client->last_activity_time = time(NULL);
-            ReleaseSRWLockExclusive(&client->lock);
-
-            pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
-            if(!pool_send_entry){
-                fprintf(stderr, "ERROR: failed to allocate memory for connect response frame\n");
-                continue;
-            }
-            construct_connect_response_frame(pool_send_entry,
-                                    DEFAULT_CONNECT_REQUEST_SEQ, 
-                                    client->sid, 
-                                    server->session_timeout, 
-                                    server->server_status, 
-                                    server->name, 
-                                    server->socket, &client->client_addr);
-
-            if(push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
-                fprintf(stderr, "ERROR: Failed to push connect response frame to queue.\n");
-                pool_free(pool_send_udp_frame, pool_send_entry);
-            }
-
-            fprintf(stdout, "DEBUG: Client %s:%d Requested re-connection. Responding to re-connect request with Session ID: %u\n", 
-                                                    client->ip, client->port, client->sid);
-            continue;
-        } else {
+        if(frame_type != FRAME_TYPE_CONNECT_REQUEST){
             client = find_client(pool_clients, session_id);
             if(!client){
-                // fprintf(stderr, "Received frame from unknown client\n");
+                fprintf(stderr, "ERROR: Received from unknown client %s:%d\n", src_ip, src_port);
                 continue;
             }
+        }
+        switch (frame_type) {
+            case FRAME_TYPE_CONNECT_REQUEST:
+                client = handle_connection_request(frame_buff);
+                break;
+            case FRAME_TYPE_KEEP_ALIVE:                
+                handle_keep_alive(client, frame);
+                break;
+            case FRAME_TYPE_DISCONNECT:
+                handle_disconnect(client, frame);
+                break;
+            case FRAME_TYPE_FILE_METADATA:
+                handle_file_metadata(client, frame);
+                break;
+            default:
+                fprintf(stderr, "ERROR: Received unknown type frame type: %u from %s:%d\n", frame_type ,src_ip, src_port);
+                break;        
+            }    
+        pool_free(&sspu->pool_ctrl_frame, (void*)frame_buff);
+    }
+
+    fprintf(stdout, "recv thread exiting\n");
+    _endthreadex(0);
+    return 0;
+}
+
+// --- Process a control frame ---
+static DWORD WINAPI func_thread_process_data_frame(LPVOID lpParam){
+
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
+   
+    while (server->server_status == STATUS_READY) {
+
+        char src_ip[INET_ADDRSTRLEN];   // Buffer to store the human-readable string representation of the source IP address.
+        uint16_t src_port;              // Stores the source port number.
+
+        PoolEntryRecvFrame *frame_buff = NULL;
+
+        DWORD result = WaitForSingleObject(sspu->queue_data_frame.push_semaphore, INFINITE); // Wait for a client slot to be available
+        if(result ==  WAIT_OBJECT_0) {
+            frame_buff = (PoolEntryRecvFrame*)pop_ptr(&sspu->queue_data_frame);
+            if(!frame_buff){
+                fprintf(stdout, "Poped invalid frame from 'sspu->queue_data_frame'\n");
+                continue;
+            }
+        } else {
+            fprintf(stderr, "CRITICAL ERROR: Unexpected result wait semaphore 'sspu->queue_data_frame': %lu\n", result);
+            continue;
+        }
+        
+        struct sockaddr_in *src_addr = &frame_buff->src_addr;
+        inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
+        src_port = _ntohs(src_addr->sin_port);
+
+        UdpFrame *frame = &frame_buff->frame;
+        uint8_t frame_type = frame_buff->frame.header.frame_type;
+        uint32_t session_id = _ntohl(frame_buff->frame.header.session_id);
+
+        if(!is_frame_valid(frame_buff)){
+            continue;
+        }
+
+        ServerClient *client = find_client(pool_clients, session_id);
+        if(!client){
+            fprintf(stderr, "ERROR: Received from unknown client %s:%d\n", src_ip, src_port);
+            continue;
         }
 
         switch (frame_type) {
-
-        case FRAME_TYPE_KEEP_ALIVE:
-            AcquireSRWLockExclusive(&client->lock);
-            client->last_activity_time = time(NULL);
-            ReleaseSRWLockExclusive(&client->lock);
-
-            pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
-            if(!pool_send_entry){
-                fprintf(stderr, "ERROR: Failed to allocate memory in the pool for keep_alive ack frame\n");
+            case FRAME_TYPE_FILE_FRAGMENT:
+                handle_file_fragment(client, frame);
                 break;
-            }
-
-            uint32_t file_id = _ntohl(frame->payload.ack.file_id);
-
-            construct_ack_frame(pool_send_entry, seq_num, session_id, file_id, STS_KEEP_ALIVE, server->socket, &client->client_addr);
-            if (push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
-                pool_free(pool_send_udp_frame, pool_send_entry);
-                fprintf(stderr, "ERROR: Failed to push to queue priority.\n");
-            }
-            break;
-
-        case FRAME_TYPE_DISCONNECT:
-            fprintf(stdout, "DEBUG: Client %s:%d with session ID: %d requested disconnect...\n", client->ip, client->port, client->sid);
-            pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
-            if(!pool_send_entry){
-                fprintf(stderr, "ERROR: Failed to allocate memory in the pool for disconnect ack frame\n");
+            case FRAME_TYPE_FILE_END:
+                handle_file_end(client, frame);
                 break;
-            }
-            construct_ack_frame(pool_send_entry, seq_num, session_id, 0, STS_CONFIRM_DISCONNECT, server->socket, &client->client_addr);
-            if (push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
-                pool_free(pool_send_udp_frame, pool_send_entry);
-                fprintf(stderr, "ERROR: Failed to push to queue priority.\n");
-            }
-            // TODO: if client is closed immediately then the server can crash since another worker thread will try to access
-            // clear client memory in the pool. it is safe to close the client after no more frames are being send (timeout).
-            // need to think of a strategy to safely close the client with frame request!
-            // One ideea is to send a disconnect response and stop processing frames from this client and 
-            // let the timeout disconnect the client naturally (probably need to introduce separate timeout with lower time value)
-            AcquireSRWLockExclusive(&client->lock);
-            client->connection_status = CLIENT_DISCONNECTED;
-            ReleaseSRWLockExclusive(&client->lock);
-            // close_client(client);
-            break;
+            default:
+                fprintf(stderr, "ERROR: Received unknown type frame type: %u from %s:%d\n", frame_type ,src_ip, src_port);
+                break;
         }
+        pool_free(&sspu->pool_data_frame, (void*)frame_buff);
+
     }
     fprintf(stdout, "recv thread exiting\n");
     _endthreadex(0);
     return 0;
 }
+
 // --- IOCP Write file block ---
 static DWORD WINAPI func_thread_process_fstream(LPVOID lpParam) {
 
@@ -758,54 +700,7 @@ static DWORD WINAPI func_thread_process_fstream(LPVOID lpParam) {
         }
 
         switch(iocp_op->io_type){
-
-            case IO_DATA_FRAME:
-
-                PoolEntryRecvFrame* frame_buff = (PoolEntryRecvFrame*)lpCompletitionKey;
-                     
-                struct sockaddr_in *src_addr = &frame_buff->src_addr;
-                uint32_t frame_size = frame_buff->frame_size;
-                UdpFrame *frame = &frame_buff->frame;
-
-                uint16_t start_delimiter = _ntohs(frame->header.start_delimiter);
-                uint8_t frame_type = frame->header.frame_type;
-                uint64_t seq_num = _ntohll(frame->header.seq_num);
-                uint32_t session_id = _ntohl(frame->header.session_id);
-
-                inet_ntop(AF_INET, &src_addr->sin_addr, src_ip, INET_ADDRSTRLEN);
-                src_port = _ntohs(src_addr->sin_port);
-
-                if (start_delimiter != FRAME_DELIMITER) {
-                    fprintf(stderr, "DEBUG: Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.\n", 
-                                                    src_ip, src_port, start_delimiter);
-                    continue;
-                }
-
-                if (!is_checksum_valid(frame, frame_size)) {
-                    fprintf(stderr, "DEBUG: Received frame from %s:%d with checksum mismatch. Discarding.\n", 
-                                                    src_ip, src_port);
-                    continue;
-                }
-
-                ServerClient *client = find_client(pool_clients, session_id);
-                if(!client){
-                    fprintf(stderr, "Received frame from unknown client\n");
-                    continue;
-                }
-
-                if (frame_type == FRAME_TYPE_FILE_METADATA){
-                    handle_file_metadata(client, frame);
-                } else if (frame_type == FRAME_TYPE_FILE_FRAGMENT){
-                    handle_file_fragment(client, frame);
-                } else if (frame_type == FRAME_TYPE_FILE_END){
-                    handle_file_end(client, frame);
-                } else {
-                    break;
-                }
-                pool_free(&sspu->pool_data_frame, (void*)frame_buff);
-                break;
-
-             
+            
             case IO_FILE_BLOCK_FLUSH:
 
                 fstream = (ServerFileStream*)lpCompletitionKey;
@@ -1040,6 +935,7 @@ static DWORD WINAPI fthread_scan_for_trailing_sack(LPVOID lpParam){
     _endthreadex(0);
     return 0;
 }
+
 // --- Send frame thread functions ---
 static DWORD WINAPI fthread_send_frame(LPVOID lpParam){
 
@@ -1076,7 +972,7 @@ static DWORD WINAPI fthread_send_prio_frame(LPVOID lpParam){
                 continue;
             }
             send_pool_frame(entry, pool_iocp_send_context);
-            pool_free(pool_send_udp_frame, (void*)entry);
+            pool_free(pool_send_prio_udp_frame, (void*)entry);
         } else {
             fprintf(stderr, "CRITICAL ERROR: Unexpected result 'queue_send_prio_frame->push_semaphore': %lu\n", result);
             continue;
@@ -1098,7 +994,7 @@ static DWORD WINAPI fthread_send_ctrl_frame(LPVOID lpParam){
                 continue;
             }
             send_pool_frame(entry, pool_iocp_send_context);
-            pool_free(pool_send_udp_frame, (void*)entry);
+            pool_free(pool_send_ctrl_udp_frame, (void*)entry);
         } else {
             fprintf(stderr, "CRITICAL ERROR: Unexpected result 'queue_send_ctrl_frame->push_semaphore': %lu\n", result);
             continue;
@@ -1174,220 +1070,6 @@ static DWORD WINAPI fthread_server_command(LPVOID lpParam){
     return 0;
 }
 
-void init_client_pool(ServerClientPool* pool, const uint64_t block_count) {
-
-    pool->block_count = block_count;
-
-    // Allocate memory for 'next' array
-    pool->next = (uint64_t*)_aligned_malloc(sizeof(uint64_t) * pool->block_count, 64);
-    if (!pool->next) {
-        fprintf(stderr, "Memory allocation failed for next indices in init_client_pool().\n");
-        return;
-    }
-    memset(pool->next, 0, pool->block_count * sizeof(uint64_t)); // Initialize to 0
-
-    // Allocate memory for 'used' array
-    pool->used = (uint8_t*)_aligned_malloc(sizeof(uint8_t) * pool->block_count, 64);
-    if (!pool->used) {
-        fprintf(stderr, "Memory allocation failed for used flags in init_client_pool().\n");
-        _aligned_free(pool->next);
-        return;
-    }
-    memset(pool->used, 0, pool->block_count * sizeof(uint8_t)); // Initialize to 0 (unused)
-
-    // Allocate the main memory buffer for the pool
-    pool->client = (ServerClient*)_aligned_malloc(sizeof(ServerClient) * pool->block_count, 64);
-    if (!pool->client) {
-        fprintf(stderr, "Memory allocation failed for fstream in init_client_pool().\n");
-        _aligned_free(pool->next);
-        _aligned_free(pool->used);
-        return; // early return in case of failure
-    }
-    // Initialize memory to zero
-    memset(pool->client, 0, sizeof(ServerClient) * pool->block_count);
-
-    // Initialize the free list: all blocks are initially free
-    pool->free_head = 0;                                        // The first block is the head of the free list
-    // Link all blocks together and mark them as unused
-    uint64_t last_block = pool->block_count - 1;
-    for (uint64_t index = 0; index < last_block; index++) {
-        pool->next[index] = index + 1;                          // Link to the next block
-        pool->used[index] = FREE_BLOCK;                         // Mark as unused
-
-        pool->client[index].connection_status = CLIENT_DISCONNECTED;
-        pool->client[index].last_activity_time = time(NULL);
-
-        InitializeSRWLock(&pool->client[index].lock);
-        InitializeSRWLock(&pool->client[index].sack_buff.lock);
-        init_queue_seq(&pool->client[index].queue_ack_seq, SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ);   
-    }
-    // The last block points to END_BLOCK, indicating the end of the free list
-    pool->next[last_block] = END_BLOCK;              // Use END_BLOCK to indicate end of list
-    pool->used[last_block] = FREE_BLOCK;             // Last block is also unused
-
-    pool->client[last_block].connection_status = CLIENT_DISCONNECTED;
-    pool->client[last_block].last_activity_time = time(NULL);
-
-    InitializeSRWLock(&pool->client[last_block].lock);
-    InitializeSRWLock(&pool->client[last_block].sack_buff.lock);
-    init_queue_seq(&pool->client[last_block].queue_ack_seq, SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ);
-
-    pool->free_blocks = pool->block_count;
-    // Initialize the critical section for thread safety
-    InitializeSRWLock(&pool->lock);
-    return;
-}
-ServerClient* alloc_client(ServerClientPool* pool) {
-    // Enter critical section to protect shared pool data
-    if(!pool) {
-        fprintf(stderr, "ERROR: Attempt to alloc_client() in an unallocated pool!\n");
-        return NULL;
-    }
-    AcquireSRWLockExclusive(&pool->lock);
-    // Check if the pool is exhausted
-    if (pool->free_head == END_BLOCK) { // Check against END_BLOCK
-        ReleaseSRWLockExclusive(&pool->lock);
-        return NULL; // Pool exhausted
-    }
-    // Get the index of the first free block
-    uint64_t index = pool->free_head;
-    // Update the free head to the next free block
-    pool->free_head = pool->next[index];
-    // Mark the allocated block as used
-    pool->used[index] = USED_BLOCK;
-    pool->free_blocks--;
-    ReleaseSRWLockExclusive(&pool->lock);
-    return &pool->client[index];
-}
-ServerClient* find_client(ServerClientPool* pool, const uint32_t sid) {
-
-    ServerClient *client = NULL;
-
-    if(!pool) {
-        fprintf(stderr, "ERROR: Attempt to find_client() in an unallocated pool!\n");
-        return NULL;
-    }
-
-    AcquireSRWLockShared(&pool->lock);
-    for(uint64_t index = 0; index < pool->block_count; index++){
-        if(!pool->used[index]) {
-            continue;
-        }
-        client = &pool->client[index];
-        if(client->sid == sid && client->connection_status == CLIENT_CONNECTED){
-            ReleaseSRWLockShared(&pool->lock);
-            return client;
-        }
-    }
-    ReleaseSRWLockShared(&pool->lock);
-    return NULL;
-}
-int init_client(ServerClient *client, const uint32_t sid, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr){
-
-    if(!client){
-        fprintf(stderr, "Invalid client pointer passed for init!\n");
-        return RET_VAL_ERROR;
-    }
-
-    AcquireSRWLockExclusive(&client->lock);
-
-    memcpy(&client->client_addr, client_addr, sizeof(struct sockaddr_in));
-    client->connection_status = CLIENT_CONNECTED;
-    client->last_activity_time = time(NULL);
-
-    client->cid = _ntohl(recv_frame->payload.connection_request.client_id); 
-    client->sid = sid;
-    client->flags = recv_frame->payload.connection_request.flags;
-
-    snprintf(client->name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, recv_frame->payload.connection_request.client_name);
-
-    inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, INET_ADDRSTRLEN);
-    client->port = _ntohs(client_addr->sin_port);
-
-    memset(&client->sack_buff.payload, 0, sizeof(SAckPayload));
-    client->sack_buff.ack_pending = 0;
-    FILETIME ft;
-    GetSystemTimePreciseAsFileTime(&ft);
-    client->sack_buff.start_timestamp = FILETIME_TO_UINT64(ft);
-    client->sack_buff.start_recorded = FALSE;
-
-    fprintf(stdout, "\n[ADDING NEW CLIENT] %s:%d Session ID:%d\n", client->ip, client->port, client->sid);
-
-    ReleaseSRWLockExclusive(&client->lock);
-
-    return RET_VAL_SUCCESS;
-
-}
-void free_client(ServerClientPool* pool, ServerClient* client) {
-    
-    if (!pool) {
-        fprintf(stderr, "ERROR: Attempt to free_client() in an unallocated pool!\n");
-        return;
-    }
-    if (!client) {
-        fprintf(stderr, "ERROR: Attempt to free a NULL block in client pool!\n");
-        return;
-    }
-    AcquireSRWLockExclusive(&pool->lock);
-    // Calculate the index of the block to be freed
-    uint64_t index = (uint64_t)(((char*)client - (char*)pool->client) / sizeof(ServerClient));
-    // Validate the index and usage flag for safety and debugging
-    if (index >= pool->block_count || pool->used[index] == FREE_BLOCK) {       
-        fprintf(stderr, "CRITICAL ERROR: Attempt to free invalid client from pool!\n");
-        ReleaseSRWLockExclusive(&pool->lock);
-        return;
-    }
-    // Add the freed block back to the head of the free list
-    pool->next[index] = pool->free_head;
-    pool->free_head = index;
-    // Mark the block as unused
-    pool->used[index] = FREE_BLOCK;
-    pool->free_blocks++;
-    ReleaseSRWLockExclusive(&pool->lock);
-    return;
-}
-static void close_client(ServerClient *client){
-    
-    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
-
-    if(!client){
-        fprintf(stdout, "Error: Tried to remove null pointer client!\n");
-        return;
-    }
-
-    AcquireSRWLockExclusive(&client->lock);
-
-    for(int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; i++){
-        ServerFileStream *fstream = &pool_fstreams->fstream[i];
-        //AcquireSRWLockExclusive(&fstream->lock);
-        if(fstream->sid == client->sid){
-            close_fstream(fstream);
-            free_fstream(pool_fstreams, fstream);
-        }
-        //ReleaseSRWLockExclusive(&fstream->lock);
-    }
-
-    ht_remove_all_sid(table_file_id, client->sid);
- 
-    AcquireSRWLockExclusive(&client->sack_buff.lock);
-    client->sack_buff.ack_pending = 0;
-    client->sack_buff.start_recorded = 0;
-    memset(&client->sack_buff.payload, 0, sizeof(SAckPayload));
-    ReleaseSRWLockExclusive(&client->sack_buff.lock);
-
-    memset(&client->client_addr, 0, sizeof(struct sockaddr_in));
-    memset(&client->ip, 0, INET_ADDRSTRLEN);
-    client->port = 0;
-    client->cid = 0;
-    memset(&client->name, 0, MAX_NAME_SIZE);
-    client->flags = 0;
-    client->connection_status = CLIENT_DISCONNECTED;
-    client->last_activity_time = time(NULL);
-    client->sid = 0;
-    free_client(pool_clients, client);
-    ReleaseSRWLockExclusive(&client->lock);
-    return;
-}
 
 
 int main() {

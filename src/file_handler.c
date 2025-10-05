@@ -20,6 +20,222 @@
 #include "include/fileio.h"
 #include "include/folders.h"
 
+void init_client_pool(ServerClientPool* pool, const uint64_t block_count) {
+
+    pool->block_count = block_count;
+
+    // Allocate memory for 'next' array
+    pool->next = (uint64_t*)_aligned_malloc(sizeof(uint64_t) * pool->block_count, 64);
+    if (!pool->next) {
+        fprintf(stderr, "Memory allocation failed for next indices in init_client_pool().\n");
+        return;
+    }
+    memset(pool->next, 0, pool->block_count * sizeof(uint64_t)); // Initialize to 0
+
+    // Allocate memory for 'used' array
+    pool->used = (uint8_t*)_aligned_malloc(sizeof(uint8_t) * pool->block_count, 64);
+    if (!pool->used) {
+        fprintf(stderr, "Memory allocation failed for used flags in init_client_pool().\n");
+        _aligned_free(pool->next);
+        return;
+    }
+    memset(pool->used, 0, pool->block_count * sizeof(uint8_t)); // Initialize to 0 (unused)
+
+    // Allocate the main memory buffer for the pool
+    pool->client = (ServerClient*)_aligned_malloc(sizeof(ServerClient) * pool->block_count, 64);
+    if (!pool->client) {
+        fprintf(stderr, "Memory allocation failed for fstream in init_client_pool().\n");
+        _aligned_free(pool->next);
+        _aligned_free(pool->used);
+        return; // early return in case of failure
+    }
+    // Initialize memory to zero
+    memset(pool->client, 0, sizeof(ServerClient) * pool->block_count);
+
+    // Initialize the free list: all blocks are initially free
+    pool->free_head = 0;                                        // The first block is the head of the free list
+    // Link all blocks together and mark them as unused
+    uint64_t last_block = pool->block_count - 1;
+    for (uint64_t index = 0; index < last_block; index++) {
+        pool->next[index] = index + 1;                          // Link to the next block
+        pool->used[index] = FREE_BLOCK;                         // Mark as unused
+
+        pool->client[index].connection_status = CLIENT_DISCONNECTED;
+        pool->client[index].last_activity_time = time(NULL);
+
+        InitializeSRWLock(&pool->client[index].lock);
+        InitializeSRWLock(&pool->client[index].sack_buff.lock);
+        init_queue_seq(&pool->client[index].queue_ack_seq, SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ);   
+    }
+    // The last block points to END_BLOCK, indicating the end of the free list
+    pool->next[last_block] = END_BLOCK;              // Use END_BLOCK to indicate end of list
+    pool->used[last_block] = FREE_BLOCK;             // Last block is also unused
+
+    pool->client[last_block].connection_status = CLIENT_DISCONNECTED;
+    pool->client[last_block].last_activity_time = time(NULL);
+
+    InitializeSRWLock(&pool->client[last_block].lock);
+    InitializeSRWLock(&pool->client[last_block].sack_buff.lock);
+    init_queue_seq(&pool->client[last_block].queue_ack_seq, SERVER_QUEUE_SIZE_CLIENT_ACK_SEQ);
+
+    pool->free_blocks = pool->block_count;
+    // Initialize the critical section for thread safety
+    InitializeSRWLock(&pool->lock);
+    return;
+}
+ServerClient* alloc_client(ServerClientPool* pool) {
+    // Enter critical section to protect shared pool data
+    if(!pool) {
+        fprintf(stderr, "ERROR: Attempt to alloc_client() in an unallocated pool!\n");
+        return NULL;
+    }
+    AcquireSRWLockExclusive(&pool->lock);
+    // Check if the pool is exhausted
+    if (pool->free_head == END_BLOCK) { // Check against END_BLOCK
+        ReleaseSRWLockExclusive(&pool->lock);
+        return NULL; // Pool exhausted
+    }
+    // Get the index of the first free block
+    uint64_t index = pool->free_head;
+    // Update the free head to the next free block
+    pool->free_head = pool->next[index];
+    // Mark the allocated block as used
+    pool->used[index] = USED_BLOCK;
+    pool->free_blocks--;
+    ReleaseSRWLockExclusive(&pool->lock);
+    return &pool->client[index];
+}
+ServerClient* find_client(ServerClientPool* pool, const uint32_t sid) {
+
+    ServerClient *client = NULL;
+
+    if(!pool) {
+        fprintf(stderr, "ERROR: Attempt to find_client() in an unallocated pool!\n");
+        return NULL;
+    }
+
+    AcquireSRWLockShared(&pool->lock);
+    for(uint64_t index = 0; index < pool->block_count; index++){
+        if(!pool->used[index]) {
+            continue;
+        }
+        client = &pool->client[index];
+        if(client->sid == sid && client->connection_status == CLIENT_CONNECTED){
+            ReleaseSRWLockShared(&pool->lock);
+            return client;
+        }
+    }
+    ReleaseSRWLockShared(&pool->lock);
+    return NULL;
+}
+int init_client(ServerClient *client, const uint32_t sid, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr){
+
+    if(!client){
+        fprintf(stderr, "Invalid client pointer passed for init!\n");
+        return RET_VAL_ERROR;
+    }
+
+    AcquireSRWLockExclusive(&client->lock);
+
+    memcpy(&client->client_addr, client_addr, sizeof(struct sockaddr_in));
+    client->connection_status = CLIENT_CONNECTED;
+    client->last_activity_time = time(NULL);
+
+    client->cid = _ntohl(recv_frame->payload.connection_request.client_id); 
+    client->sid = sid;
+    client->flags = recv_frame->payload.connection_request.flags;
+
+    snprintf(client->name, MAX_NAME_SIZE, "%.*s", MAX_NAME_SIZE - 1, recv_frame->payload.connection_request.client_name);
+
+    inet_ntop(AF_INET, &client_addr->sin_addr, client->ip, INET_ADDRSTRLEN);
+    client->port = _ntohs(client_addr->sin_port);
+
+    memset(&client->sack_buff.payload, 0, sizeof(SAckPayload));
+    client->sack_buff.ack_pending = 0;
+    FILETIME ft;
+    GetSystemTimePreciseAsFileTime(&ft);
+    client->sack_buff.start_timestamp = FILETIME_TO_UINT64(ft);
+    client->sack_buff.start_recorded = FALSE;
+
+    fprintf(stdout, "\n[ADDING NEW CLIENT] %s:%d Session ID:%d\n", client->ip, client->port, client->sid);
+
+    ReleaseSRWLockExclusive(&client->lock);
+
+    return RET_VAL_SUCCESS;
+
+}
+void free_client(ServerClientPool* pool, ServerClient* client) {
+    
+    if (!pool) {
+        fprintf(stderr, "ERROR: Attempt to free_client() in an unallocated pool!\n");
+        return;
+    }
+    if (!client) {
+        fprintf(stderr, "ERROR: Attempt to free a NULL block in client pool!\n");
+        return;
+    }
+    AcquireSRWLockExclusive(&pool->lock);
+    // Calculate the index of the block to be freed
+    uint64_t index = (uint64_t)(((char*)client - (char*)pool->client) / sizeof(ServerClient));
+    // Validate the index and usage flag for safety and debugging
+    if (index >= pool->block_count || pool->used[index] == FREE_BLOCK) {       
+        fprintf(stderr, "CRITICAL ERROR: Attempt to free invalid client from pool!\n");
+        ReleaseSRWLockExclusive(&pool->lock);
+        return;
+    }
+    // Add the freed block back to the head of the free list
+    pool->next[index] = pool->free_head;
+    pool->free_head = index;
+    // Mark the block as unused
+    pool->used[index] = FREE_BLOCK;
+    pool->free_blocks++;
+    ReleaseSRWLockExclusive(&pool->lock);
+    return;
+}
+void close_client(ServerClient *client){
+    
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
+
+    if(!client){
+        fprintf(stdout, "Error: Tried to remove null pointer client!\n");
+        return;
+    }
+
+    AcquireSRWLockExclusive(&client->lock);
+
+    for(int i = 0; i < MAX_SERVER_ACTIVE_FSTREAMS; i++){
+        ServerFileStream *fstream = &pool_fstreams->fstream[i];
+        //AcquireSRWLockExclusive(&fstream->lock);
+        if(fstream->sid == client->sid){
+            close_fstream(fstream);
+            free_fstream(pool_fstreams, fstream);
+        }
+        //ReleaseSRWLockExclusive(&fstream->lock);
+    }
+
+    ht_remove_all_sid(table_file_id, client->sid);
+ 
+    AcquireSRWLockExclusive(&client->sack_buff.lock);
+    client->sack_buff.ack_pending = 0;
+    client->sack_buff.start_recorded = 0;
+    memset(&client->sack_buff.payload, 0, sizeof(SAckPayload));
+    ReleaseSRWLockExclusive(&client->sack_buff.lock);
+
+    memset(&client->client_addr, 0, sizeof(struct sockaddr_in));
+    memset(&client->ip, 0, INET_ADDRSTRLEN);
+    client->port = 0;
+    client->cid = 0;
+    memset(&client->name, 0, MAX_NAME_SIZE);
+    client->flags = 0;
+    client->connection_status = CLIENT_DISCONNECTED;
+    client->last_activity_time = time(NULL);
+    client->sid = 0;
+    free_client(pool_clients, client);
+    ReleaseSRWLockExclusive(&client->lock);
+    return;
+}
+
+
 
 void init_fstream_pool(ServerFstreamPool* pool, const uint64_t block_count) {
 
@@ -59,13 +275,14 @@ void init_fstream_pool(ServerFstreamPool* pool, const uint64_t block_count) {
     for (uint64_t index = 0; index < pool->block_count - 1; index++) {
         pool->next[index] = index + 1;                          // Link to the next block
         pool->used[index] = FREE_BLOCK;                         // Mark as unused
-        //InitializeSRWLock(&pool->fstream[index].lock);
+        InitializeSRWLock(&pool->fstream[index].lock);
     }
     // The last block points to END_BLOCK, indicating the end of the free list
     pool->next[pool->block_count - 1] = END_BLOCK;              // Use END_BLOCK to indicate end of list
     pool->used[pool->block_count - 1] = FREE_BLOCK;             // Last block is also unused
    
-    //InitializeSRWLock(&pool->fstream[pool->block_count - 1].lock);
+    pool->fstream[pool->block_count - 1].fid = pool->block_count - 1;
+    InitializeSRWLock(&pool->fstream[pool->block_count - 1].lock);
     pool->free_blocks = pool->block_count;
     // Initialize the critical section for thread safety
     InitializeSRWLock(&pool->lock);
@@ -188,6 +405,21 @@ void close_fstream(ServerFileStream *fstream) {
         free(fstream->recv_block_status);
         fstream->recv_block_status = NULL;
     }
+
+    // if(check_bitmap(fstream->received_file_bitmap, fstream->fragment_count)){
+    //                     // ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE);
+    
+    //     if (!FlushFileBuffers(fstream->iocp_file_handle)) {
+    //         DWORD error = GetLastError();
+    //         fprintf(stderr, "CRITICAL ERROR: Flush file fail error: %lu\n", error);
+    //     }
+    //     RenameFileByHandle(fstream->iocp_file_handle, fstream->unicode_path);  
+    
+    // } else {
+    //     // Incomplete file transfer, delete the temp file
+    //     DeleteFileByHandle(fstream->iocp_file_handle);
+    // }
+
     if(ht_search_id(table_file_id, fstream->sid, fstream->fid, ID_RECV_COMPLETE)){
         // Flush buffers
         if (!FlushFileBuffers(fstream->iocp_file_handle)) {
@@ -196,16 +428,11 @@ void close_fstream(ServerFileStream *fstream) {
         }
         RenameFileByHandle(fstream->iocp_file_handle, fstream->unicode_path);        
         ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_WRITE_COMPLETE);
-    } else if (ht_search_id(table_file_id, fstream->sid, fstream->fid, ID_STATUS_NONE)){
+    } else {
         ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_TRANSFER_ERROR);
         DeleteFileByHandle(fstream->iocp_file_handle);
         // ht_remove_id(table_file_id, fstream->sid, fstream->fid);
-    } else if (ht_search_id(table_file_id, fstream->sid, fstream->fid, ID_WAITING_FRAGMENTS)){
-        ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_TRANSFER_ERROR);
-        DeleteFileByHandle(fstream->iocp_file_handle);
-    } else if(ht_search_id(table_file_id, fstream->sid, fstream->fid, ID_TRANSFER_ERROR)){
-        DeleteFileByHandle(fstream->iocp_file_handle);
-    }
+    } 
     CloseHandle(fstream->iocp_file_handle);
     fstream->iocp_file_handle = NULL;
     memset(&fstream->ansi_path, 0, MAX_PATH);
@@ -310,6 +537,11 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     // --- End of string copy and validation ---
 
     memcpy(&fstream->client_addr, client_addr, sizeof(struct sockaddr_in));
+
+    fstream->written_bytes_count = 0;       // Total bytes written to disk for this file so far.
+    fstream->end_of_file = FALSE;
+    memset(&fstream->received_sha256, 0, 32);
+    
 
     // Calculate total fragments
     fstream->fragment_count = ((fstream->file_size - 1ULL) / FILE_FRAGMENT_SIZE) + 1ULL;
@@ -486,6 +718,9 @@ void destroy_fstream_pool(ServerFstreamPool* pool) {
     }
     pool->free_blocks = 0;
 }
+
+
+
 // Process received file metadata frame
 void handle_file_metadata(ServerClient *client, UdpFrame *frame) {
 
@@ -514,42 +749,47 @@ void handle_file_metadata(ServerClient *client, UdpFrame *frame) {
         goto exit;
     }
 
-    uint8_t file_status = ht_status_id(table_file_id, recv_session_id, recv_file_id);
-    switch (file_status) {
-        case ID_STATUS_NONE:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for invalid state file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_UNKNOWN_FILE_ID;
-            goto exit;
+    // uint8_t file_status = ht_status_id(table_file_id, recv_session_id, recv_file_id);
+    // switch (file_status) {
+    //     case ID_STATUS_NONE:
+    //         fprintf(stderr, "Received metadata frame Seq: %llu; for invalid state file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_UNKNOWN_FILE_ID;
+    //         goto exit;
 
-        case ID_RECV_COMPLETE:
-        case ID_WRITE_COMPLETE:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_COMPLETED_FILE;
-            goto exit;
+    //     case ID_RECV_COMPLETE:
+    //     case ID_WRITE_COMPLETE:
+    //         fprintf(stderr, "Received metadata frame Seq: %llu; for old completed fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_COMPLETED_FILE;
+    //         goto exit;
 
-        case ID_TRANSFER_ERROR:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_STREAM_ALREADY_FAILED;
-            goto exit;
+    //     case ID_TRANSFER_ERROR:
+    //         fprintf(stderr, "Received metadata frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_STREAM_ALREADY_FAILED;
+    //         goto exit;
 
-        case ID_WAITING_FRAGMENTS:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = STS_WAITING_FILE_FRAGMENTS;
-            goto exit;
+    //     case ID_WAITING_FRAGMENTS:
+    //         op_code = STS_WAITING_FILE_FRAGMENTS;
+    //         goto exit;
         
-        case ID_UNKNOWN:
-            // continue
-            break;
+    //     case ID_UNKNOWN:
+    //         // continue
+    //         break;
 
-        default:
-            break;
+    //     default:
+    //         break;
+    // }
+
+    ServerFileStream *fstream = find_fstream(pool_fstreams, recv_session_id, recv_file_id);
+    if(fstream != NULL){
+        fprintf(stderr, "Received metadata frame Seq: %llu for already opened stream fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
+        op_code = STS_WAITING_FILE_FRAGMENTS;
+        goto exit;
     }
 
-    ServerFileStream *fstream = alloc_fstream(pool_fstreams);
+    fstream = alloc_fstream(pool_fstreams);
     if(!fstream){
         op_code = ERR_ALL_STREAMS_BUSY;
         goto exit;
@@ -566,8 +806,8 @@ exit:
     switch (op_code) {
         // error before stream is initiated
         case ERR_MALFORMED_FRAME:
-        case ERR_COMPLETED_FILE:
-        case ERR_STREAM_ALREADY_FAILED:
+        // case ERR_COMPLETED_FILE:
+        // case ERR_STREAM_ALREADY_FAILED:
         case ERR_ALL_STREAMS_BUSY:
         case ERR_STREAM_INIT:
             break;
@@ -595,14 +835,17 @@ exit:
             break;
     }
 
-    entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
+    entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_prio_udp_frame);
     if(!entry_send_frame){
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for metadata ack error frame\n");
         return;
     }
+
+   
+
     construct_file_metadata_response_frame(entry_send_frame, recv_seq_num, recv_session_id, recv_file_id, op_code, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
-        pool_free(pool_send_udp_frame, entry_send_frame);
+        pool_free(pool_send_prio_udp_frame, entry_send_frame);
         fprintf(stderr, "ERROR: Failed to push file metadata ack error frame to queue\n");
         return;
     }
@@ -646,46 +889,46 @@ void handle_file_fragment(ServerClient *client, UdpFrame *frame){
         goto exit;
     }
 
-    uint8_t file_status = ht_status_id(table_file_id, recv_session_id, recv_file_id);
-    switch (file_status) {
-        case ID_UNKNOWN:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for unknown file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_UNKNOWN_FILE_ID;
-            goto exit;
+    // uint8_t file_status = ht_status_id(table_file_id, recv_session_id, recv_file_id);
+    // switch (file_status) {
+    //     case ID_UNKNOWN:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for unknown file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_UNKNOWN_FILE_ID;
+    //         goto exit;
 
-        case ID_STATUS_NONE:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for invalid state file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_INVALID_FILE_STATUS;
-            goto exit;
+    //     case ID_STATUS_NONE:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for invalid state file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_INVALID_FILE_STATUS;
+    //         goto exit;
 
-        case ID_RECV_COMPLETE:
-        case ID_WRITE_COMPLETE:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_COMPLETED_FILE;
-            goto exit;
+    //     case ID_RECV_COMPLETE:
+    //     case ID_WRITE_COMPLETE:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_COMPLETED_FILE;
+    //         goto exit;
 
-        case ID_TRANSFER_ERROR:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_STREAM_ALREADY_FAILED;
-            goto exit;
+    //     case ID_TRANSFER_ERROR:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_STREAM_ALREADY_FAILED;
+    //         goto exit;
         
-        case ID_WAITING_FRAGMENTS:
-            // continue
-            break;
+    //     case ID_WAITING_FRAGMENTS:
+    //         // continue
+    //         break;
 
-        default:
+    //     default:
             
-            break;
-    }
+    //         break;
+    // }
 
     ServerFileStream *fstream = find_fstream(pool_fstreams, recv_session_id, recv_file_id);
     if(!fstream){
         fprintf(stderr, "Received fragment frame Seq: %llu for unknown fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_ABSOLETE_STREAM;
+        op_code = ERR_INVALID_STREAM;
         goto exit;
     }
 
@@ -745,7 +988,7 @@ void handle_file_fragment(ServerClient *client, UdpFrame *frame){
 
     mark_fragment_received(fstream->received_file_bitmap, recv_fragment_offset, FILE_FRAGMENT_SIZE);
 
-    // if((recv_file_id % 3) == 0){
+    // if((recv_file_id % 100) == 0){
     //     fstream->recv_block_bytes[block_nr] = SERVER_FILE_BLOCK_SIZE + 1;
     // }
 
@@ -788,9 +1031,9 @@ void handle_file_fragment(ServerClient *client, UdpFrame *frame){
 exit:
 
     switch(op_code){
-        case ERR_UNKNOWN_FILE_ID:
-        case ERR_STREAM_ALREADY_FAILED:
-        case ERR_COMPLETED_FILE:
+        // case ERR_UNKNOWN_FILE_ID:
+        // case ERR_STREAM_ALREADY_FAILED:
+        // case ERR_COMPLETED_FILE:
         case ERR_DUPLICATE_FRAME:
             break;
 
@@ -814,7 +1057,7 @@ exit:
             break;
     }
 
-    PoolEntrySendFrame *entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
+    PoolEntrySendFrame *entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_prio_udp_frame);
     if(!entry_send_frame){
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for file fragment ack error frame\n");
         return;
@@ -822,7 +1065,7 @@ exit:
     construct_ack_frame(entry_send_frame, recv_seq_num, recv_session_id, recv_file_id, op_code, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
         fprintf(stderr, "ERROR: Failed to push file fragment ack error frame to queue\n");
-        pool_free(pool_send_udp_frame, entry_send_frame);
+        pool_free(pool_send_prio_udp_frame, entry_send_frame);
         return;
     }
     return;
@@ -849,41 +1092,41 @@ void handle_file_end(ServerClient *client, UdpFrame *frame){
 
     uint8_t op_code = UNDEFINED;
 
-    uint8_t file_status = ht_status_id(table_file_id, recv_session_id, recv_file_id);
+    // uint8_t file_status = ht_status_id(table_file_id, recv_session_id, recv_file_id);
 
-    switch (file_status) {
-        case ID_UNKNOWN:
-        case ID_STATUS_NONE:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for unknown or invalid state file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_UNKNOWN_FILE_ID;
-            goto exit;
+    // switch (file_status) {
+    //     case ID_UNKNOWN:
+    //     case ID_STATUS_NONE:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for unknown or invalid state file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_UNKNOWN_FILE_ID;
+    //         goto exit;
 
-        case ID_RECV_COMPLETE:
-        case ID_WRITE_COMPLETE:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_COMPLETED_FILE;
-            goto exit;
+    //     case ID_RECV_COMPLETE:
+    //     case ID_WRITE_COMPLETE:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for old completed fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_COMPLETED_FILE;
+    //         goto exit;
 
-        case ID_TRANSFER_ERROR:
-            fprintf(stderr, "Received fragment frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
-                    recv_seq_num, recv_file_id, recv_session_id);
-            op_code = ERR_STREAM_ALREADY_FAILED;
-            goto exit;
+    //     case ID_TRANSFER_ERROR:
+    //         fprintf(stderr, "Received fragment frame Seq: %llu; for failed transfer file fID: %u; sID %u;\n",
+    //                 recv_seq_num, recv_file_id, recv_session_id);
+    //         op_code = ERR_STREAM_ALREADY_FAILED;
+    //         goto exit;
         
-        case ID_WAITING_FRAGMENTS:
-            // continue
-            break;
+    //     case ID_WAITING_FRAGMENTS:
+    //         // continue
+    //         break;
 
-        default:
-            break;
-    }
+    //     default:
+    //         break;
+    // }
 
     ServerFileStream *fstream = find_fstream(pool_fstreams, recv_session_id, recv_file_id);
     if(!fstream){
         fprintf(stderr, "Received end frame Seq: %llu for unknown stream fID: %u; sID %u;\n", recv_seq_num, recv_file_id, recv_session_id);
-        op_code = ERR_ABSOLETE_STREAM;
+        op_code = ERR_INVALID_STREAM;
         goto exit;
     }
 
@@ -901,10 +1144,10 @@ exit:
     switch(op_code){
         
         case ID_WAITING_FRAGMENTS:
-        case ERR_UNKNOWN_FILE_ID:
-        case ERR_STREAM_ALREADY_FAILED:
-        case ERR_COMPLETED_FILE:
-        case ERR_ABSOLETE_STREAM:
+        // case ERR_UNKNOWN_FILE_ID:
+        // case ERR_STREAM_ALREADY_FAILED:
+        // case ERR_COMPLETED_FILE:
+        case ERR_INVALID_STREAM:
         case ID_TRANSFER_ERROR:
             break;
         
@@ -921,16 +1164,179 @@ exit:
             break;
     }
 
-    PoolEntrySendFrame *entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_udp_frame);
+    PoolEntrySendFrame *entry_send_frame = (PoolEntrySendFrame*)pool_alloc(pool_send_prio_udp_frame);
     if(!entry_send_frame){
         fprintf(stderr, "ERROR: Failed to allocate memory in the pool for file end ack error frame\n");
         return;
     }
     construct_file_end_response_frame(entry_send_frame, recv_seq_num, recv_session_id, recv_file_id, op_code, server->socket, &client->client_addr);
     if(push_ptr(queue_send_prio_udp_frame, (uintptr_t)entry_send_frame) == RET_VAL_ERROR){
-        pool_free(pool_send_udp_frame, entry_send_frame);
+        pool_free(pool_send_prio_udp_frame, entry_send_frame);
         fprintf(stderr, "ERROR: Failed to push file end ack error frame to queue\n");
         return;
     }
 }
 
+ServerClient *handle_connection_request(PoolEntryRecvFrame *frame_buff){
+    
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+    uint8_t server_status = frame->payload.connection_response.server_status;
+    uint32_t session_timeout = _ntohl(frame->payload.connection_response.session_timeout);
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port);
+
+    PoolEntrySendFrame *pool_send_entry = NULL;
+
+    ServerClient *client = NULL;
+
+    if(session_id == DEFAULT_CONNECT_REQUEST_SID && seq_num == DEFAULT_CONNECT_REQUEST_SEQ){
+        client = alloc_client(pool_clients);
+        if (!client) {
+            fprintf(stderr, "Failed to alloc_client() from %s:%d. Max clients reached or server error.\n", src_ip, src_port);
+            return NULL;
+        }
+        init_client(client, InterlockedIncrement(&server->session_id_counter), frame, src_addr);
+        AcquireSRWLockExclusive(&client->lock);
+        client->last_activity_time = time(NULL);
+        ReleaseSRWLockExclusive(&client->lock);
+
+        pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_ctrl_udp_frame);
+        if(!pool_send_entry){
+            fprintf(stderr, "ERROR: Failed to allocate memory in the pool for connect response frame\n");
+            close_client(client);
+            return NULL;
+        }
+        construct_connect_response_frame(pool_send_entry,
+                                DEFAULT_CONNECT_REQUEST_SEQ, 
+                                client->sid, 
+                                server->session_timeout, 
+                                server->server_status, 
+                                server->name, 
+                                server->socket, &client->client_addr);
+
+        if(push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
+            fprintf(stderr, "ERROR: Failed to push connect response frame to queue.\n");
+            pool_free(pool_send_ctrl_udp_frame, pool_send_entry);
+            close_client(client);
+            return NULL;
+        }
+
+        fprintf(stdout, "DEBUG: Client %s:%d Requested connection. Responding to connect request with Session ID: %u\n", 
+                                                client->ip, client->port, client->sid);
+
+        return client;
+
+    } else if (session_id != DEFAULT_CONNECT_REQUEST_SID && seq_num == DEFAULT_CONNECT_REQUEST_SEQ) {
+        // This is a re-connect request from an existing client.
+        fprintf(stdout, "DEBUG: Client %s:%d requested re-connection with Session ID: %u\n", 
+                                                src_ip, src_port, session_id);
+        client = find_client(pool_clients, session_id);
+        if(client == NULL){
+            fprintf(stderr, "ERROR: Unknown client (invalid DEFAULT_CONNECT_REQUEST_SID)\n");
+            return NULL;
+        }
+        AcquireSRWLockExclusive(&client->lock);
+        client->last_activity_time = time(NULL);
+        ReleaseSRWLockExclusive(&client->lock);
+
+        pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_ctrl_udp_frame);
+        if(!pool_send_entry){
+            fprintf(stderr, "ERROR: failed to allocate memory for connect response frame\n");
+            close_client(client);
+            return NULL;
+        }
+        construct_connect_response_frame(pool_send_entry,
+                                DEFAULT_CONNECT_REQUEST_SEQ, 
+                                client->sid, 
+                                server->session_timeout, 
+                                server->server_status, 
+                                server->name, 
+                                server->socket, &client->client_addr);
+
+        if(push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
+            fprintf(stderr, "ERROR: Failed to push connect response frame to queue.\n");
+            pool_free(pool_send_ctrl_udp_frame, pool_send_entry);
+            close_client(client);
+            return NULL;
+        }
+
+        fprintf(stdout, "DEBUG: Client %s:%d Requested re-connection. Responding to re-connect request with Session ID: %u\n", 
+                                                client->ip, client->port, client->sid);
+        return client;
+    } else {
+        fprintf(stdout, "DEBUG: Client %s:%d Invalid connection request\n", 
+                                        client->ip, client->port, client->sid);
+    }
+    return NULL;
+}
+
+void handle_keep_alive(ServerClient *client, UdpFrame *frame){
+
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
+
+    PoolEntrySendFrame *pool_send_entry = NULL;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+
+    AcquireSRWLockExclusive(&client->lock);
+    client->last_activity_time = time(NULL);
+    ReleaseSRWLockExclusive(&client->lock);
+
+    pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_ctrl_udp_frame);
+    if(!pool_send_entry){
+        fprintf(stderr, "ERROR: Failed to allocate memory in the pool for keep_alive ack frame\n");
+        return;
+    }
+
+    uint32_t file_id = _ntohl(frame->payload.ack.file_id);
+
+    construct_keep_alive_response_frame(pool_send_entry, seq_num, session_id, STS_KEEP_ALIVE, server->socket, &client->client_addr);
+    if (push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
+        pool_free(pool_send_ctrl_udp_frame, pool_send_entry);
+        fprintf(stderr, "ERROR: Failed to push to queue priority.\n");
+    }
+
+    return;
+}
+void handle_disconnect(ServerClient *client, UdpFrame *frame){
+
+    PARSE_SERVER_GLOBAL_DATA(Server, Buffers, Threads) // this macro is defined in server header file (server.h)
+
+    PoolEntrySendFrame *pool_send_entry = NULL;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+
+    fprintf(stdout, "DEBUG: Client %s:%d with session ID: %d requested disconnect...\n", client->ip, client->port, client->sid);
+    pool_send_entry = (PoolEntrySendFrame*)pool_alloc(pool_send_ctrl_udp_frame);
+    if(!pool_send_entry){
+        fprintf(stderr, "ERROR: Failed to allocate memory in the pool for disconnect ack frame\n");
+        return;
+    }
+    construct_ack_frame(pool_send_entry, seq_num, session_id, 0, STS_CONFIRM_DISCONNECT, server->socket, &client->client_addr);
+    if (push_ptr(queue_send_ctrl_udp_frame, (uintptr_t)pool_send_entry) == RET_VAL_ERROR) {
+        pool_free(pool_send_ctrl_udp_frame, pool_send_entry);
+        fprintf(stderr, "ERROR: Failed to push to queue priority.\n");
+    }
+    // TODO: if client is closed immediately then the server can crash since another worker thread will try to access
+    // clear client memory in the pool. it is safe to close the client after no more frames are being send (timeout).
+    // need to think of a strategy to safely close the client with frame request!
+    // One ideea is to send a disconnect response and stop processing frames from this client and 
+    // let the timeout disconnect the client naturally (probably need to introduce separate timeout with lower time value)
+    AcquireSRWLockExclusive(&client->lock);
+    client->connection_status = CLIENT_DISCONNECTED;
+    ReleaseSRWLockExclusive(&client->lock);
+    // close_client(client);
+    return;
+}

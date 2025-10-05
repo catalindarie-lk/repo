@@ -43,5 +43,11 @@ int construct_file_end_response_frame(PoolEntrySendFrame *entry,
                     const uint8_t op_code, 
                     const SOCKET src_socket, const struct sockaddr_in *dest_addr);
 
+int construct_keep_alive_response_frame(PoolEntrySendFrame *entry,
+                    const uint64_t seq_num, 
+                    const uint32_t session_id, 
+                    const uint8_t op_code, 
+                    const SOCKET src_socket, const struct sockaddr_in *dest_addr);
+
 
 #endif

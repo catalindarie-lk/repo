@@ -37,7 +37,6 @@ const char *client_ip = "192.168.0.240";
 // const char *server_ip = "127.0.0.1";
 // const char *client_ip = "127.0.0.1";
 
-
 int init_client_session(){
 
     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
@@ -327,6 +326,16 @@ static void client_shutdown(){
 }
 
 // --- Cleanup functions for streams ---
+static inline void clear_frame(TableSendFrame *table, s_MemPool *pool, const uint64_t seq_num){
+    uintptr_t entry = remove_table_send_frame(table, seq_num);
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+    if(!entry){
+        LOG_TO_FILE("WARNING: Fail to remove frame seq_num: %llu. Not found in TableSendFrame - most likely double acked frame", seq_num);
+        return;
+    }
+    s_pool_free(pool, (void*)entry);
+    return;
+}
 static inline void close_fstream(ClientFileStream *fstream){
 
     PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
@@ -351,11 +360,10 @@ static inline void close_fstream(ClientFileStream *fstream){
     return;
 }
 static inline ClientFileStream *get_fstream(ClientData *client, const uint32_t file_id){
-    // ClientFileStream *fstream = NULL;
+    
     for (size_t i = 0; i < CLIENT_MAX_ACTIVE_FSTREAMS; i++) {
         AcquireSRWLockExclusive(&client->fstream[i].lock);
         if(client->fstream[i].fstream_busy && client->fstream[i].fid == file_id){
-            // fstream = &client->fstream[i];
             ReleaseSRWLockExclusive(&client->fstream[i].lock);
             return &client->fstream[i];
         } else {
@@ -364,34 +372,6 @@ static inline ClientFileStream *get_fstream(ClientData *client, const uint32_t f
         }                    
     }
     return NULL;
-}
-static inline bool is_frame_valid(PoolEntryRecvFrame *frame_buff){
-        
-    char log_message[CLIENT_LOG_MESSAGE_LEN];
-
-    char src_ip[INET_ADDRSTRLEN] = {0};
-    uint16_t src_port = 0;
-
-    UdpFrame *frame = &frame_buff->frame;
-    struct sockaddr_in *src_addr = &frame_buff->src_addr;
-
-    uint16_t recv_delimiter = _ntohs(frame->header.start_delimiter);
-    uint32_t frame_size = frame_buff->frame_size;
-
-    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
-    src_port = _ntohs(src_addr->sin_port);
-
-    if (recv_delimiter != FRAME_DELIMITER) {
-        LOG_TO_FILE("ERROR: Received frame from %s:%d with invalid delimiter: 0x%X. Discarding.", 
-                    src_ip, src_port, recv_delimiter);
-        return false;
-    }        
-    if (!is_checksum_valid(frame, frame_size)) {
-        LOG_TO_FILE("ERROR: Received frame from %s:%d with checksum mismatch. Discarding.", 
-                    src_ip, src_port);
-        return false;
-    }
-    return true;
 }
 static inline void handle_connect_response(PoolEntryRecvFrame *frame_buff){
 
@@ -455,8 +435,6 @@ static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff){
     uint64_t seq_num = _ntohll(frame->header.seq_num);
     uint32_t session_id = _ntohl(frame->header.session_id);
 
-    uintptr_t entry;
-
     inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
     src_port = _ntohs(src_addr->sin_port);
 
@@ -469,15 +447,9 @@ static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff){
     
     ClientFileStream *fstream = get_fstream(client, file_id);
  
-    if(!fstream){
-        LOG_TO_FILE("ERROR: Received FRAME_TYPE_FILE_METADATA_RESPONSE for unknown client fstream CODE: %u", op_code);
-        
-        uintptr_t entry = remove_table_send_frame(table_send_udp_frame, seq_num);
-        if(!entry){
-            LOG_TO_FILE("WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-        } else {
-            s_pool_free(pool_send_udp_frame, (void*)entry);
-        }
+    if(!fstream){       
+        LOG_TO_FILE("ERROR: Received -FRAME_TYPE_FILE_METADATA_RESPONSE- with op_code: %u, for unknown file_id: %lu", op_code, file_id);
+        clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
         return;
     }
 
@@ -485,71 +457,72 @@ static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff){
     switch (op_code) {
         case STS_CONFIRM_FILE_METADATA:
         case STS_WAITING_FILE_FRAGMENTS:
+            fstream->fid = file_id;
             SetEvent(fstream->hevent_metadata_response_ok);
             remove_frame = true;
-            // LOG_TO_FILE("DEBUG: Received metadata response [STS_CONFIRM_FILE_METADATA] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            // LOG_TO_FILE("DEBUG: Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [STS_CONFIRM_FILE_METADATA] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
-//============================================================RETRY FILE TRANSFER==================================================================================================
+        //=====RETRY FILE TRANSFER======
         case ERR_INVALID_FRAME_DATA:
             SetEvent(fstream->hevent_metadata_err_retry_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (retry file transfer): Received metadata response [ERR_INVALID_FRAME_DATA] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (retry file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_INVALID_FRAME_DATA] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
     
         case ERR_STREAM_MEMORY_ALLOCATION:
             SetEvent(fstream->hevent_metadata_err_retry_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (retry file transfer): Received metadata response [ERR_INVALID_FRAME_DATA] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (retry file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_INVALID_FRAME_DATA] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
-//============================================================ABORT FILE TRANSFER==================================================================================================
-        case ERR_COMPLETED_FILE:
-            SetEvent(fstream->hevent_metadata_err_abort_transfer);
-            remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_COMPLETED_FILE sid] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
-            break;
+        //=====ABORT FILE TRANSFER======
+        // case ERR_COMPLETED_FILE:
+        //     SetEvent(fstream->hevent_metadata_err_abort_transfer);
+        //     remove_frame = true;
+        //     LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_COMPLETED_FILE sid] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
+        //     break;
 
-        case ERR_STREAM_ALREADY_FAILED:
-            SetEvent(fstream->hevent_metadata_err_abort_transfer);
-            remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_STREAM_ALREADY_FAILED] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
-            break;
+        // case ERR_STREAM_ALREADY_FAILED:
+        //     SetEvent(fstream->hevent_metadata_err_abort_transfer);
+        //     remove_frame = true;
+        //     LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_STREAM_ALREADY_FAILED] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
+        //     break;
 
-        case ERR_UNKNOWN_FILE_ID:
-            SetEvent(fstream->hevent_metadata_err_abort_transfer);
-            remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_UNKNOWN_FILE_ID] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
-            break;
+        // case ERR_UNKNOWN_FILE_ID:
+        //     SetEvent(fstream->hevent_metadata_err_abort_transfer);
+        //     remove_frame = true;
+        //     LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_UNKNOWN_FILE_ID] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
+        //     break;
 
         case ERR_EXISTING_DISK_FILE:
             SetEvent(fstream->hevent_metadata_err_abort_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_EXISTING_DISK_FILE] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_EXISTING_DISK_FILE] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
 
         case ERR_EXISTING_DISK_TEMP_FILE:
             SetEvent(fstream->hevent_metadata_err_abort_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_EXISTING_DISK_TEMP_FILE] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_EXISTING_DISK_TEMP_FILE] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
 
         case ERR_INVALID_DRIVE_PARTITION:
             SetEvent(fstream->hevent_metadata_err_abort_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_INVALID_DRIVE_PARTITION] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_INVALID_DRIVE_PARTITION] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
 
         case ERR_CREATE_FILE_PATH:
             SetEvent(fstream->hevent_metadata_err_abort_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_CREATE_FILE_PATH] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_CREATE_FILE_PATH] file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
 
         case ERR_CREATE_FILE:
             SetEvent(fstream->hevent_metadata_err_abort_transfer);
             remove_frame = true;
-            LOG_TO_FILE("ERROR (abort file transfer): Received metadata response [ERR_CREATE_FILE] session_id: %lu, file_id: %lu, file: %s%s", session_id, file_id, fstream->dirpath, fstream->fname);
+            LOG_TO_FILE("ERROR (abort file transfer): Received -FRAME_TYPE_FILE_METADATA_RESPONSE- [ERR_CREATE_FILE], file_id: %lu, file: %s%s", file_id, fstream->dirpath, fstream->fname);
             break;
-//========================================================================================================================================================================================
+        //=====NO ACTION======
         case ERR_MALFORMED_FRAME:
         case ERR_STREAM_INIT:
         case ERR_ALL_STREAMS_BUSY:
@@ -558,20 +531,13 @@ static inline void handle_metadata_response(PoolEntryRecvFrame *frame_buff){
         
         default:
             remove_frame = false;
-            LOG_TO_FILE("-----CRITICAL ERROR-----: Received metadata response with invalid code type: %u", op_code);
+            LOG_TO_FILE("-----CRITICAL ERROR-----: Received frame -FRAME_TYPE_FILE_METADATA_RESPONSE- file_id: %lu, with invalid code: %u", file_id, op_code);
             break;
     }
-
     if(!remove_frame){
         return;
     }
-
-    entry = remove_table_send_frame(table_send_udp_frame, seq_num);
-    if(!entry){
-        LOG_TO_FILE("WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-    } else {
-        s_pool_free(pool_send_udp_frame, (void*)entry);
-    }
+    clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
     return;
 }
 static inline void handle_ack(PoolEntryRecvFrame *frame_buff){
@@ -589,8 +555,6 @@ static inline void handle_ack(PoolEntryRecvFrame *frame_buff){
     uint64_t seq_num = _ntohll(frame->header.seq_num);
     uint32_t session_id = _ntohl(frame->header.session_id);
  
-    uintptr_t entry;
-
     inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
     src_port = _ntohs(src_addr->sin_port);
 
@@ -603,26 +567,21 @@ static inline void handle_ack(PoolEntryRecvFrame *frame_buff){
 
     ClientFileStream *fstream = get_fstream(client, file_id);
 
-    if(!fstream){                   
-        entry = remove_table_send_frame(table_send_udp_frame, seq_num);
-        if(!entry){
-            // snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-            // log_to_file(log_message);
-        } else {
-            s_pool_free(pool_send_udp_frame, (void*)entry);
-        }
+    if(!fstream){
+        LOG_TO_FILE("ERROR: Received -FRAME_TYPE_ACK- with op_code: %u, for unknown file_id: %lu", op_code, file_id);
+        clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
         return;
     }
 
     bool remove_frame = false;
     switch (op_code) {
 
-        case ERR_UNKNOWN_FILE_ID:
-        case ERR_INVALID_FILE_STATUS:
-        case ERR_STREAM_ALREADY_FAILED:
-        case ERR_COMPLETED_FILE:
+        // case ERR_UNKNOWN_FILE_ID:
+        // case ERR_INVALID_FILE_STATUS:
+        // case ERR_STREAM_ALREADY_FAILED:
+        // case ERR_COMPLETED_FILE:
         case ERR_DUPLICATE_FRAME:
-        case ERR_ABSOLETE_STREAM:
+        case ERR_INVALID_STREAM:
             remove_frame = true;
             break;
 
@@ -643,29 +602,19 @@ static inline void handle_ack(PoolEntryRecvFrame *frame_buff){
             break;
 
         default:
-            snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_ACK frame CODE: %u", op_code);
-            log_to_file(log_message);
+            LOG_TO_FILE("ERROR: Received invalid -FRAME_TYPE_ACK- frame op_code: %u", op_code);
             remove_frame = false;
             break;
     }
-
     if(!remove_frame){
         return;
     }
-        
-    entry = remove_table_send_frame(table_send_udp_frame, seq_num);
-    if(!entry){
-        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-        log_to_file(log_message);
-        return;
-    }
-    s_pool_free(pool_send_udp_frame, (void*)entry);
+    clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
 
     if(seq_num == DEFAULT_DISCONNECT_REQUEST_SEQ && op_code == STS_CONFIRM_DISCONNECT){
         SetEvent(client->hevent_connection_closed);
         client->session_status = CONNECTION_CLOSED;
-        snprintf(log_message, sizeof(log_message), "DEBUG: Received ack STS_CONFIRM_DISCONNECT - code: %lu; seq num: %llx.", op_code, seq_num);
-        log_to_file(log_message);
+        LOG_TO_FILE("DEBUG: Received -STS_CONFIRM_DISCONNECT- code: %u; seq num: %llu.", op_code, seq_num);
         return;
     }
 
@@ -686,8 +635,6 @@ static inline void handle_file_end_response(PoolEntryRecvFrame *frame_buff){
     uint64_t seq_num = _ntohll(frame->header.seq_num);
     uint32_t session_id = _ntohl(frame->header.session_id);
  
-    uintptr_t entry;
-
     inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
     src_port = _ntohs(src_addr->sin_port); 
     
@@ -702,21 +649,12 @@ static inline void handle_file_end_response(PoolEntryRecvFrame *frame_buff){
     ClientFileStream *fstream = get_fstream(client, file_id);
 
     if(!fstream){
-        snprintf(log_message, sizeof(log_message), "ERROR: Received FRAME_TYPE_FILE_END_RESPONSE for unknown client fstream CODE: %u", op_code);
-        log_to_file(log_message);
-        
-        entry = remove_table_send_frame(table_send_udp_frame, seq_num);
-        if(!entry){
-            snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-            log_to_file(log_message);
-        } else {
-            s_pool_free(pool_send_udp_frame, (void*)entry);
-        }
+        LOG_TO_FILE("ERROR: Received -FRAME_TYPE_FILE_END_RESPONSE- for unknown file_id: %lu", file_id);
+        clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
         return;
     }
 
     bool remove_frame = false;
-
     switch (op_code) {
         case STS_CONFIRM_FILE_END:
             // snprintf(log_message, sizeof(log_message), "ERROR: Received STS_CONFIRM_FILE_END for file end seq_num: %llu FILE: %s%s", recv_seq_num, fstream->dirpath, fstream->fname);
@@ -725,36 +663,26 @@ static inline void handle_file_end_response(PoolEntryRecvFrame *frame_buff){
             remove_frame = true;
             break;
 
-        case ERR_STREAM_ALREADY_FAILED:
+        case ERR_INVALID_STREAM:
             SetEvent(fstream->hevent_file_end_err_retry_transfer);
             remove_frame = true;
             break;
         
-        case ERR_UNKNOWN_FILE_ID:
-        case ERR_COMPLETED_FILE:
-        case ERR_ABSOLETE_STREAM:
-            SetEvent(fstream->hevent_file_end_response_nok);
-            remove_frame = true;
-            break;
+        // case ERR_UNKNOWN_FILE_ID:
+        // // case ERR_COMPLETED_FILE:
+        //     SetEvent(fstream->hevent_file_end_response_nok);
+        //     remove_frame = true;
+        //     break;
 
         default:
-            snprintf(log_message, sizeof(log_message), "ERROR: Received invalid FRAME_TYPE_FILE_END_RESPONSE frame CODE: %u", op_code);
-            log_to_file(log_message);
+            LOG_TO_FILE("ERROR: Received invalid -FRAME_TYPE_FILE_END_RESPONSE- frame op_code: %u", op_code);
             remove_frame = FALSE;
             break;               
     }
-    
     if(!remove_frame){
         return;
     }
-
-    entry = remove_table_send_frame(table_send_udp_frame, seq_num);
-    if(!entry){
-        snprintf(log_message, sizeof(log_message), "WARNING: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-        log_to_file(log_message);
-    } else {
-        s_pool_free(pool_send_udp_frame, (void*)entry);
-    }
+    clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
     return;
 }
 static inline void handle_sack(PoolEntryRecvFrame *frame_buff){
@@ -772,35 +700,67 @@ static inline void handle_sack(PoolEntryRecvFrame *frame_buff){
     // uint64_t seq_num = _ntohll(frame->header.seq_num);
     uint32_t session_id = _ntohl(frame->header.session_id);
  
-    uintptr_t entry;
-
     inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
     src_port = _ntohs(src_addr->sin_port); 
     
     if(session_id != client->sid){
-        snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with invalid session ID: %d. Discarding.", session_id);
-        log_to_file(log_message);
         return;
     }
     // Process SACK frame logic here
     // snprintf(log_message, sizeof(log_message), "DEBUG: Received SACK frame from %s:%d with seq num: %llu, ack count: %u, sid: %lu", src_ip, src_port, recv_seq_num, frame->payload.sack.ack_count, recv_session_id);
     // log_to_file(log_message);
     int ack_count = frame->payload.sack.ack_count;
-    if(ack_count > 0){
-        for(int i = 0; i < ack_count; i++){
-            uint64_t ack_seq_num = _ntohll(frame->payload.sack.seq_num[i]);
-            entry = remove_table_send_frame(table_send_udp_frame, ack_seq_num);
-            if(!entry){
-                snprintf(log_message, sizeof(log_message), "CRITICAL ERROR: fail to remove from send frame from hash table? - null pointer returned - most likely double acked frame.");
-                log_to_file(log_message);
-                continue;
-            }
-            s_pool_free(pool_send_udp_frame, (void*)entry);
-        }
-    } else {
-        snprintf(log_message, sizeof(log_message), "ERROR: Received SACK frame with zero ACK count. Discarding.");
-        log_to_file(log_message);
+    if(ack_count == 0){
+        LOG_TO_FILE("ERROR: Received -FRAME_TYPE_SACK- with zero ACK count. Discarding.");
+        return;
     }
+    for(int i = 0; i < ack_count; i++){
+        uint64_t ack_seq_num = _ntohll(frame->payload.sack.seq_num[i]);
+        if(ack_seq_num == 0){
+            continue;
+        }
+        clear_frame(table_send_udp_frame, pool_send_udp_frame, ack_seq_num);
+    }
+    return;
+}
+static inline void handle_keep_alive_response(PoolEntryRecvFrame *frame_buff){
+
+    PARSE_CLIENT_GLOBAL_DATA(Client, Queues, Buffers, Threads) // this macro is defined in client header file (client.h)
+
+    char log_message[CLIENT_LOG_MESSAGE_LEN];
+
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint64_t seq_num = _ntohll(frame->header.seq_num);
+    uint32_t session_id = _ntohl(frame->header.session_id);
+ 
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port); 
+
+    uint8_t op_code = frame->payload.keep_alive_response.op_code;
+    
+    if(session_id != client->sid){
+        return;              
+    }
+    if(seq_num != DEFAULT_KEEP_ALIVE_SEQ){
+        LOG_TO_FILE("ERROR: Received -FRAME_TYPE_KEEP_ALIVE_RESPONSE- with invalid seq num: %llu. Discarding.", seq_num);
+        clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
+        return;
+    }
+    if(op_code != STS_KEEP_ALIVE){
+        LOG_TO_FILE("ERROR: Received -FRAME_TYPE_KEEP_ALIVE_RESPONSE- with invalid op code: %u. Discarding.", op_code);
+        clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
+        return;  
+    }
+
+    client->last_active_time = time(NULL);
+    // snprintf(log_message, sizeof(log_message), "DEBUG: Received -FRAME_TYPE_KEEP_ALIVE_RESPONSE- from %s:%d with seq num: %llu, sid: %lu", src_ip, src_port, seq_num, session_id);
+    // log_to_file(log_message);
+    // clear_frame(table_send_udp_frame, pool_send_udp_frame, seq_num);
     return;
 }
 
@@ -1044,29 +1004,23 @@ static DWORD WINAPI fthread_process_frame(LPVOID lpParam) {
             case FRAME_TYPE_CONNECT_RESPONSE:
                 handle_connect_response(frame_buff);
                 break;
-
             case FRAME_TYPE_FILE_METADATA_RESPONSE:
                 handle_metadata_response(frame_buff);
                 break;
-
             case FRAME_TYPE_ACK:
                 handle_ack(frame_buff);
                 break;
-
             case FRAME_TYPE_FILE_END_RESPONSE:
                 handle_file_end_response(frame_buff);
                 break;
-
             case FRAME_TYPE_CONNECT_REQUEST:
-                break;
-                
-            case FRAME_TYPE_KEEP_ALIVE:
-                break;
-            
+                break;                
+            case FRAME_TYPE_KEEP_ALIVE_RESPONSE:
+                handle_keep_alive_response(frame_buff);
+                break;            
             case FRAME_TYPE_SACK:
                 handle_sack(frame_buff);
                 break;
-
             default:
                 snprintf(log_message, sizeof(log_message), "ERROR: RECEIVED UNKNOWN TYPE FRAME");
                 log_to_file(log_message);
@@ -1371,7 +1325,7 @@ static DWORD WINAPI fthread_process_fstream(LPVOID lpParam){
             log_to_file(log_message);
             goto clean;
         }
-        
+
         frame_fragment_offset = 0;
 
         while(fstream->pending_bytes > 0){

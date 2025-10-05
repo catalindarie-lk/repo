@@ -86,6 +86,8 @@ typedef struct {
 typedef struct{
     struct sockaddr_in client_addr;
 
+    uint8_t status;
+    
     uint32_t sid;                       // Session ID associated with this file stream.
     uint32_t fid;                       // File ID, unique identifier for the file associated with this file stream.
     uint64_t file_size;                     // Total size of the file being transferred.
@@ -171,43 +173,6 @@ typedef struct {
 
 
 
-
-// __declspec(align(64))typedef struct NodeTableFileBlock{
-//     OVERLAPPED overlapped;
-//     uint64_t key;
-//     uint32_t fid;
-//     uint32_t sid;
-//     size_t block_size;
-//     char* block_data;
-//     uint8_t op_type;
-//     struct NodeTableFileBlock *next;
-// }NodeTableFileBlock;
-
-// typedef enum {
-//     COMPLETION_STREAM,
-//     COMPLETION_SHUTDOWN,
-//     COMPLETION_TRANSFER
-// } CompletionType;
-
-// typedef struct {
-//     CompletionType type;
-// } CompletionPacket;
-
-// typedef struct {
-//     CompletionPacket packet;
-//     NodeTableFileBlock *block_ctx;
-// } FileBlockPacket;
-
-// typedef struct {
-//     CompletionPacket packet;
-//     PoolEntryRecvFrame *frame_ctx;
-// } FramePacket;
-
-// typedef struct {
-//     CompletionPacket packet;
-    
-// } ErrorPacket;
-
 //--------------------------------------------------------------------------------------------------------------------------
 //--------------------------------------------------------------------------------------------------------------------------
 void init_socket_context(SocketContext *socket_context, uint8_t type);
@@ -218,5 +183,5 @@ int send_pool_frame(PoolEntrySendFrame *entry, MemPool *mem_pool);
 void wait_usec(const long long time_usec);
 uint64_t calculate_period_usec(const double speed_mbps, const int bytes_per_packet);
 
-
+bool is_frame_valid(PoolEntryRecvFrame *frame_buff);
 #endif

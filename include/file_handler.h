@@ -12,6 +12,13 @@
 #define RET_VAL_ERROR -1
 #endif
 
+void init_client_pool(ServerClientPool* pool, const uint64_t block_count);
+ServerClient* alloc_client(ServerClientPool* pool);
+ServerClient* find_client(ServerClientPool* pool, const uint32_t sid);
+int init_client(ServerClient *client, const uint32_t sid, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
+void free_client(ServerClientPool* pool, ServerClient* client);
+void close_client(ServerClient *client);
+
 void init_fstream_pool(ServerFstreamPool* pool, const uint64_t block_count);
 ServerFileStream* find_fstream(ServerFstreamPool* pool, const uint32_t sid, const uint32_t fid);
 ServerFileStream* alloc_fstream(ServerFstreamPool* pool);
@@ -23,5 +30,8 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
 void handle_file_metadata(ServerClient *client, UdpFrame *frame);
 void handle_file_fragment(ServerClient *client, UdpFrame *frame);
 void handle_file_end(ServerClient *client, UdpFrame *frame);
+ServerClient *handle_connection_request(PoolEntryRecvFrame *frame_buff);
+void handle_keep_alive(ServerClient *client, UdpFrame *frame);
+void handle_disconnect(ServerClient *client, UdpFrame *frame);
 
 #endif // FRAME_HANDLERS_H

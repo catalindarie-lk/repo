@@ -125,3 +125,23 @@ int construct_file_end_response_frame(PoolEntrySendFrame *entry,
     memcpy(&entry->dest_addr, dest_addr, sizeof(struct sockaddr_in));
     return RET_VAL_SUCCESS;
 }
+
+int construct_keep_alive_response_frame(PoolEntrySendFrame *entry,
+                    const uint64_t seq_num, 
+                    const uint32_t session_id, 
+                    const uint8_t op_code, 
+                    const SOCKET src_socket, const struct sockaddr_in *dest_addr){
+
+     UdpFrame *frame = (UdpFrame*)&entry->frame;
+
+    frame->header.start_delimiter = _htons(FRAME_DELIMITER);
+    frame->header.frame_type = FRAME_TYPE_KEEP_ALIVE_RESPONSE;
+    frame->header.seq_num = _htonll(seq_num);
+    frame->header.session_id = _htonl(session_id);
+    frame->payload.keep_alive_response.op_code = op_code;
+    frame->header.checksum = _htonl(calculate_crc32(frame, sizeof(FrameHeader) + sizeof(KeepAliveResponsePayload)));
+    
+    entry->src_socket = src_socket;
+    memcpy(&entry->dest_addr, dest_addr, sizeof(struct sockaddr_in));
+    return RET_VAL_SUCCESS;
+}

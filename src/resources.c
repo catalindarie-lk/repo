@@ -150,6 +150,9 @@ int send_pool_frame(PoolEntrySendFrame *pool_entry, MemPool *mem_pool){
         case FRAME_TYPE_TRANSFER_ERROR:
             frame_size = sizeof(FrameHeader) + sizeof(TransferErrorPayload); // Or header + payload_len + related metadata
             break;
+        case FRAME_TYPE_KEEP_ALIVE_RESPONSE:
+            frame_size = sizeof(FrameHeader) + sizeof(KeepAliveResponsePayload); // Acknowledgment frame
+            break;
         case FRAME_TYPE_ACK:
             frame_size = sizeof(FrameHeader) + sizeof(AckPayload); // Acknowledgment frame
             break;
@@ -220,4 +223,31 @@ uint64_t calculate_period_usec(const double speed_mbps, const int bytes_per_pack
     uint64_t time_per_packet_usec = (uint64_t)(time_per_packet_sec * 1000000.0);
     
     return time_per_packet_usec;
+}
+
+bool is_frame_valid(PoolEntryRecvFrame *frame_buff){
+        
+    char src_ip[INET_ADDRSTRLEN] = {0};
+    uint16_t src_port = 0;
+
+    UdpFrame *frame = &frame_buff->frame;
+    struct sockaddr_in *src_addr = &frame_buff->src_addr;
+
+    uint16_t recv_delimiter = _ntohs(frame->header.start_delimiter);
+    uint32_t frame_size = frame_buff->frame_size;
+
+    inet_ntop(AF_INET, &(src_addr->sin_addr), src_ip, INET_ADDRSTRLEN);
+    src_port = _ntohs(src_addr->sin_port);
+
+    if (recv_delimiter != FRAME_DELIMITER) {
+        fprintf(stderr, "ERROR: Received frame from %s:%d with invalid delimiter: 0x%u. Discarding.", 
+                    src_ip, src_port, recv_delimiter);
+        return false;
+    }        
+    if (!is_checksum_valid(frame, frame_size)) {
+        fprintf(stderr, "ERROR: Received frame from %s:%d with checksum mismatch. Discarding.", 
+                    src_ip, src_port);
+        return false;
+    }
+    return true;
 }

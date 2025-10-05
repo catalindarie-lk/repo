@@ -64,6 +64,7 @@ enum FrameType{
     FRAME_TYPE_ACK = 4,                         // Acknowledgment for a received frame
     FRAME_TYPE_SACK = 5,                        // Selective Acknowledgment for multiple frames
     FRAME_TYPE_KEEP_ALIVE = 6,
+    FRAME_TYPE_KEEP_ALIVE_RESPONSE = 7,
 
     FRAME_TYPE_FILE_METADATA = 20,       // Client requests to send a file (includes filename, size, hash)
     FRAME_TYPE_FILE_METADATA_RESPONSE = 21,
@@ -87,13 +88,13 @@ enum AckErrorCode {
     STS_CONFIRM_DISCONNECT = 24,
 
     ERR_MALFORMED_FRAME = 25,          //server->NO && client->drop_frame
-    ERR_COMPLETED_FILE = 26,            //server->NO && client->drop_frame
+    // ERR_COMPLETED_FILE = 26,            //server->NO && client->drop_frame
     ERR_STREAM_INIT = 27,               //server->NO && client->requeue_stream
-    ERR_STREAM_ALREADY_FAILED = 28,    //server->NO && client->drop_frame
-    ERR_UNKNOWN_FILE_ID = 29,          //server->NO && client->drop_frame
-    ERR_INVALID_FILE_STATUS = 30,
+    // ERR_STREAM_ALREADY_FAILED = 28,    //server->NO && client->drop_frame
+    // ERR_UNKNOWN_FILE_ID = 29,          //server->NO && client->drop_frame
+    // ERR_INVALID_FILE_STATUS = 30,
     ERR_ALL_STREAMS_BUSY = 31,         //server->NO && client->NO
-    ERR_ABSOLETE_STREAM = 32,
+    ERR_INVALID_STREAM = 32,
 
     ERR_EXISTING_DISK_FILE = 33,        //server->close_stream && client->drop_frame
     ERR_EXISTING_DISK_TEMP_FILE = 34,   //server->close_stream && client->drop_frame
@@ -114,7 +115,6 @@ enum AckErrorCode {
 typedef struct {
     uint16_t start_delimiter;                               // Magic number (e.g., 0xAABB)
     uint8_t frame_type;                                    // Discriminator: what kind of payload is in the union
-    uint8_t padding_0;
     uint64_t seq_num;                                       // Global sequence number for this frame from the sender
     uint32_t session_id;                                    // Unique identifier for the session (e.g., client ID or session ID)
     uint32_t checksum;                                      // Checksum for this frame's header + active union member (CRC32 recommended)
@@ -131,6 +131,10 @@ typedef struct {
     uint8_t  server_status;                                 // BUSY (0) READY (1) or ERR (x), etc
     char     server_name[MAX_NAME_SIZE];                    // Optional: human-readable identifier
 } ConnectResponsePayload;
+
+typedef struct {
+    uint8_t op_code;
+} KeepAliveResponsePayload;
 
 typedef struct {
     uint32_t file_id;                                       // Unique identifier for the file transfer session
@@ -205,6 +209,7 @@ typedef struct {
         AckPayload ack;
         RttPayload rtt;
         SAckPayload sack;
+        KeepAliveResponsePayload keep_alive_response;
         FileMetadataPayload file_metadata;                  // File metadata request/response
         FileMetadataResponsePayload file_metadata_response;                  // File metadata request/response
         FileFragmentPayload file_fragment;                  // File data fragment

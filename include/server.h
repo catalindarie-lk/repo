@@ -36,12 +36,11 @@
 
 //---------------------------------------------------------------------------------------------------------
 // --- Server Stream Configuration ---
-#define MAX_SERVER_ACTIVE_FSTREAMS                  (13) // 5 file streams per client + 5 extra for safety
+#define MAX_SERVER_ACTIVE_FSTREAMS                  (10) // 5 file streams per client + 5 extra for safety
 #define MAX_SERVER_ACTIVE_MSTREAMS                  10
 
 // --- Server Worker Thread Configuration ---
 #define SERVER_MAX_THREADS_RECV_SEND_FRAME          1
-// #define SERVER_MAX_THREADS_PROCESS_FRAME            17
 #define SERVER_MAX_THREADS_PROCESS_FSTREAM          1
 
 #define SERVER_MAX_THREADS_SEND_FILE_SACK_FRAMES    1
@@ -83,7 +82,9 @@
     TableIDs *table_message_id = &((buffers_obj).table_message_id); \
     MemPool *pool_send_udp_frame = &((buffers_obj).pool_send_udp_frame); \
     QueuePtr *queue_send_udp_frame = &((buffers_obj).queue_send_udp_frame); \
+    MemPool *pool_send_prio_udp_frame = &((buffers_obj).pool_send_prio_udp_frame); \
     QueuePtr *queue_send_prio_udp_frame = &((buffers_obj).queue_send_prio_udp_frame); \
+    MemPool *pool_send_ctrl_udp_frame = &((buffers_obj).pool_send_ctrl_udp_frame); \
     QueuePtr *queue_send_ctrl_udp_frame = &((buffers_obj).queue_send_ctrl_udp_frame); \
     QueuePtr *queue_client_ptr = &((buffers_obj).queue_client_ptr); \
     ServerFstreamPool *pool_fstreams = &((server_obj).pool_fstreams); \
@@ -177,11 +178,15 @@ typedef struct {
     s_MemPool pool_iocp_operation;
 
     HANDLE thread_process_ctrl_frame;
+    HANDLE thread_process_data_frame[SERVER_MAX_THREADS_PROCESS_FSTREAM];
     
     MemPool pool_ctrl_frame;
+    QueuePtr queue_ctrl_frame;
+    
     MemPool pool_data_frame;
+    QueuePtr queue_data_frame;
 
-    HANDLE process_fstream[SERVER_MAX_THREADS_PROCESS_FSTREAM];
+    HANDLE thread_process_fstream[SERVER_MAX_THREADS_PROCESS_FSTREAM];
     size_t process_fstream_uid[SERVER_MAX_THREADS_PROCESS_FSTREAM];
 
 } ServerStreamProcessingUnit;
@@ -216,13 +221,14 @@ typedef struct {
     MemPool pool_iocp_send_context;
     MemPool pool_iocp_recv_context;
 
-    // MemPool pool_recv_udp_frame;
-    // QueuePtr queue_recv_udp_frame;
-    // QueuePtr queue_recv_prio_udp_frame;
 
     MemPool pool_send_udp_frame;
     QueuePtr queue_send_udp_frame;          // For SACK frames
+
+    MemPool pool_send_prio_udp_frame;
     QueuePtr queue_send_prio_udp_frame;     // For ACK frames
+    
+    MemPool pool_send_ctrl_udp_frame;
     QueuePtr queue_send_ctrl_udp_frame;     // For Request/Keep alive frames
 
     QueuePtr queue_client_ptr;
@@ -260,6 +266,7 @@ extern ServerThreads Threads;
 static DWORD WINAPI func_thread_recv_send_frame(LPVOID lpParam);
 // static DWORD WINAPI func_thread_process_frame(LPVOID lpParam);
 static DWORD WINAPI func_thread_process_ctrl_frame(LPVOID lpParam);
+static DWORD WINAPI func_thread_process_data_frame(LPVOID lpParam);
 static DWORD WINAPI func_thread_process_fstream(LPVOID lpParam);
 
 static DWORD WINAPI fthread_send_sack_frame(LPVOID lpParam);
@@ -277,12 +284,7 @@ static DWORD WINAPI fthread_server_command(LPVOID lpParam);
 static BOOL validate_file_hash(ServerFileStream *fstream);
 static void check_open_file_stream();
 
-void init_client_pool(ServerClientPool* pool, const uint64_t block_count);
-ServerClient* alloc_client(ServerClientPool* pool);
-ServerClient* find_client(ServerClientPool* pool, const uint32_t sid);
-int init_client(ServerClient *client, const uint32_t sid, const UdpFrame *recv_frame, const struct sockaddr_in *client_addr);
-void free_client(ServerClientPool* pool, ServerClient* client);
-static void close_client(ServerClient *client);
+ 
 
  
 #endif
