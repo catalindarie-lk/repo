@@ -468,7 +468,8 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
 
     if(!fstream || !frame || !client_addr){
         fprintf(stderr, "ERROR: init_fstream - Invalid NULL parameter(s)!\n");
-        return ERR_STREAM_INIT;
+        op_code = ERR_STREAM_INIT;
+        goto exit;
     }
     
     uint64_t recv_seq_num = _ntohll(frame->header.seq_num);
@@ -478,7 +479,6 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
 
     // size_t thread_id = hash_stream(fstream->sid, fstream->fid, SERVER_MAX_THREADS_PROCESS_FSTREAM);
 
-    // --- Proper string copy and validation for rpath ---
     uint32_t received_rpath_len = _ntohl(frame->payload.file_metadata.rpath_len);
 
     // Validate the received length against the destination buffer's capacity (MAX_PATH - 1 for content + null)
@@ -488,7 +488,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
         fstream->rpath_len = 0;
         fstream->rpath[0] = '\0';
         op_code = ERR_INVALID_FRAME_DATA;
-        goto exit_err; // Exit function on critical error
+        goto exit; // Exit function on critical error
     } else {
         // Use snprintf with precision to copy exactly 'received_rpath_len' characters.
         // snprintf will null-terminate the buffer as long as `received_rpath_len < MAX_PATH`.
@@ -502,14 +502,13 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
             fstream->rpath_len = 0;
             fstream->rpath[0] = '\0';
             op_code = ERR_INVALID_FRAME_DATA;
-            goto exit_err;
+            goto exit;
         } else {
             // Copy successful, store the actual content length
             fstream->rpath_len = received_rpath_len;
         }
     }
 
-    // --- Proper string copy and validation for fname ---
     uint32_t received_fname_len = _ntohl(frame->payload.file_metadata.fname_len);
 
     if (received_fname_len >= MAX_PATH) {
@@ -518,7 +517,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
         fstream->fname_len = 0;
         fstream->fname[0] = '\0';
         op_code = ERR_INVALID_FRAME_DATA;
-        goto exit_err;
+        goto exit;
     } else {
         int result = snprintf(fstream->fname, sizeof(fstream->fname),
                               "%.*s", (int)received_fname_len, frame->payload.file_metadata.fname);
@@ -529,7 +528,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
             fstream->fname_len = 0;
             fstream->fname[0] = '\0';
             op_code = ERR_INVALID_FRAME_DATA;
-            goto exit_err;
+            goto exit;
         } else {
             fstream->fname_len = received_fname_len;
         }
@@ -558,7 +557,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if(fstream->received_file_bitmap == NULL){
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file bitmap mem!!!\n");
         op_code = ERR_STREAM_MEMORY_ALLOCATION;
-        goto exit_err;
+        goto exit;
     }
     memset(fstream->received_file_bitmap, 0, fstream->file_bitmap_size * sizeof(uint64_t));
 
@@ -566,7 +565,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if(fstream->file_block == NULL){
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file block mem!!!\n");
         op_code = ERR_STREAM_MEMORY_ALLOCATION;
-        goto exit_err;
+        goto exit;
     }
     memset(fstream->file_block, 0, fstream->block_count * sizeof(ServerFileBlock*));
 
@@ -574,7 +573,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if(fstream->recv_block_bytes == NULL){
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file recv block bytes!!!\n");
         op_code = ERR_STREAM_MEMORY_ALLOCATION;
-        goto exit_err;
+        goto exit;
     }
     memset(fstream->recv_block_bytes, 0, fstream->block_count * sizeof(uint64_t));
 
@@ -582,14 +581,14 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if(fstream->recv_block_status == NULL){
         fprintf(stderr, "ERROR: init_fstream - Memory allocation fail for file recv block status!!!\n");
         op_code = ERR_STREAM_MEMORY_ALLOCATION;
-        goto exit_err;
+        goto exit;
     }
     memset(fstream->recv_block_status, 0, fstream->block_count * sizeof(uint64_t));
 
     if(!DriveExists(SERVER_PARTITION_DRIVE)){
         fprintf(stderr, "ERROR: init_fstream - Drive Partition \"%s\" doesn't exit\n", SERVER_PARTITION_DRIVE);
         op_code = ERR_INVALID_DRIVE_PARTITION;
-        goto exit_err;
+        goto exit;
     }
 
     // creating root folder\\session_folder
@@ -599,13 +598,13 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if (CreateAbsoluteFolderRecursive(rootFolder) == FALSE) {
         fprintf(stderr, "ERROR: init_fstream - Failed to create recursive path for root folder: \"%s\". Error code: %lu\n", rootFolder, GetLastError());
         op_code = ERR_CREATE_FILE_PATH;
-        goto exit_err;
+        goto exit;
     }
 
     if (CreateRelativeFolderRecursive(rootFolder, fstream->rpath) == FALSE) {
         fprintf(stderr, "ERROR: init_fstream - Failed to create recursive path for root folder: \"%s\", relative path \"%s\". Error code: %lu\n", rootFolder, fstream->rpath, GetLastError());
         op_code = ERR_CREATE_FILE_PATH;
-        goto exit_err;
+        goto exit;
     }
 
     // ANSI PATH
@@ -624,7 +623,7 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if (result == 0) {
         fprintf(stderr, "Path conversion from ansi to unicode failed: %lu\n", GetLastError());
         op_code = ERR_CREATE_FILE_PATH;
-        goto exit_err;
+        goto exit;
     }
     
     // TEMP ANSI PATH
@@ -643,19 +642,19 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if (result == 0) {
         fprintf(stderr, "Temp path conversion from ansi to unicode failed: %lu\n", GetLastError());
         op_code = ERR_CREATE_FILE_PATH;
-        goto exit_err;
+        goto exit;
     }
 
     if(FileExists(fstream->ansi_path)){
         fprintf(stderr, "ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->ansi_path);
         op_code = ERR_EXISTING_DISK_FILE;
-        goto exit_err;
+        goto exit;
     }
     
     if(FileExists(fstream->temp_ansi_path)){
         fprintf(stderr, "CRITICAL ERROR: init_fstream - File \"%s\" already exits! Skipping...\n", fstream->temp_ansi_path);
         op_code = ERR_EXISTING_DISK_TEMP_FILE;
-        goto exit_err;
+        goto exit;
     }
 
     // CREATE FILE AT TEMP UNICODE PATH
@@ -672,23 +671,25 @@ uint8_t init_fstream(ServerFileStream *fstream, UdpFrame *frame, const struct so
     if (fstream->iocp_file_handle == INVALID_HANDLE_VALUE) {
         fprintf(stderr, "ERROR: init_fstream - Failed to create file \"%ls\". Error code: %lu\n", fstream->temp_unicode_path, GetLastError());
         op_code = ERR_CREATE_FILE;
-        goto exit_err;
+        goto exit;
     }
 
     if (!CreateIoCompletionPort(fstream->iocp_file_handle, server->iocp_process_fstream_handle, (uintptr_t)fstream, 0)) {
         fprintf(stderr, "Failed to associate file_test with IOCP: %lu\n", GetLastError());
         op_code = ERR_CREATE_FILE;
-        goto exit_err;
+        goto exit;
     }
     
     if(ht_insert_id(table_file_id, fstream->sid, fstream->fid, ID_WAITING_FRAGMENTS) == RET_VAL_ERROR){
         fprintf(stderr, "ERROR: init_fstream - Error updating status of file in hash table!!!\n");
         op_code = ERR_CREATE_FILE;
-        goto exit_err;
+        goto exit;
     }
-    return STS_CONFIRM_FILE_METADATA;
 
-exit_err:
+    op_code = STS_CONFIRM_FILE_METADATA;
+    goto exit;
+
+exit:
     ht_update_id_status(table_file_id, fstream->sid, fstream->fid, ID_TRANSFER_ERROR);
     return op_code;
 }
